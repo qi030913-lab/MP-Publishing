@@ -1,0 +1,23 @@
+{
+  "name": "@mp-publishing/web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "next build",
+    "dev": "next dev",
+    "lint": "tsc --project tsconfig.json --noEmit",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "format": "echo web has no formatter configured yet"
+  },
+  "dependencies": {
+    "@mp-publishing/adapter-core": "workspace:*",
+    "@mp-publishing/content-model": "workspace:*",
+    "next": "^16.2.6",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@types/react": "19.2.15",
+    "@types/react-dom": "^19.2.3"
+  }
+}

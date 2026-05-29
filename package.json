@@ -1,0 +1,21 @@
+{
+  "name": "mp-publishing",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.33.0",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev --parallel",
+    "lint": "turbo run lint",
+    "typecheck": "turbo run typecheck",
+    "format": "turbo run format"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.1",
+    "turbo": "^2.9.16",
+    "typescript": "^6.0.3"
+  }
+}

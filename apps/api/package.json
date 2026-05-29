@@ -1,0 +1,24 @@
+{
+  "name": "@mp-publishing/api",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "dev": "tsx watch src/main.ts",
+    "lint": "tsc --project tsconfig.json --noEmit",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "format": "echo api has no formatter configured yet"
+  },
+  "dependencies": {
+    "@mp-publishing/adapter-core": "workspace:*",
+    "@mp-publishing/content-model": "workspace:*",
+    "@nestjs/common": "^11.1.24",
+    "@nestjs/core": "^11.1.24",
+    "@nestjs/platform-express": "^11.1.24",
+    "reflect-metadata": "^0.2.2",
+    "rxjs": "^7.8.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.22.3"
+  }
+}

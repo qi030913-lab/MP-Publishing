@@ -1,0 +1,20 @@
+{
+  "name": "@mp-publishing/worker",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "dev": "tsx watch src/main.ts",
+    "lint": "tsc --project tsconfig.json --noEmit",
+    "typecheck": "tsc --project tsconfig.json --noEmit",
+    "format": "echo worker has no formatter configured yet"
+  },
+  "dependencies": {
+    "@mp-publishing/adapter-core": "workspace:*",
+    "@mp-publishing/content-model": "workspace:*",
+    "bullmq": "^5.77.6"
+  },
+  "devDependencies": {
+    "tsx": "^4.22.3"
+  }
+}
