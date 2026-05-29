@@ -1,4 +1,4 @@
-import type { PlatformName } from "@mp-publishing/platform-sdk";
+import type { PlatformName, ValidationIssue } from "@mp-publishing/platform-sdk";
 
 export type PlatformAccountRecord = {
   id: string;
@@ -8,6 +8,48 @@ export type PlatformAccountRecord = {
   authMode: "official-api" | "cookie-session" | "hybrid";
   health: "healthy" | "expiring" | "needs-login";
   lastCheckedAt: string;
+};
+
+export type PublishTaskMode = "simulate" | "mock-publish";
+
+export type PublishTaskTargetStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "needs_retry"
+  | "failed";
+
+export type PublishTaskStatus = "queued" | "running" | "succeeded" | "partial" | "failed";
+
+export type PublishTaskLog = {
+  id: string;
+  timestamp: string;
+  level: "info" | "warning" | "error";
+  message: string;
+};
+
+export type PublishTaskTargetRecord = {
+  platform: PlatformName;
+  account: PlatformAccountRecord | null;
+  status: PublishTaskTargetStatus;
+  attemptCount: number;
+  remoteId?: string;
+  url?: string;
+  screenshots?: string[];
+  issues: ValidationIssue[];
+  logs: PublishTaskLog[];
+  startedAt?: string;
+  completedAt?: string;
+};
+
+export type PublishTaskRecord = {
+  id: string;
+  mode: PublishTaskMode;
+  status: PublishTaskStatus;
+  documentTitle: string;
+  createdAt: string;
+  updatedAt: string;
+  targets: PublishTaskTargetRecord[];
 };
 
 export const platformAccounts: PlatformAccountRecord[] = [
@@ -48,3 +90,5 @@ export const platformAccounts: PlatformAccountRecord[] = [
     lastCheckedAt: "2026-05-29T21:50:00+08:00",
   },
 ];
+
+export const publishTasks: PublishTaskRecord[] = [];

@@ -1,11 +1,25 @@
-import { Body, Controller, Inject, Post } from "@nestjs/common";
+import { Body, Controller, Get, Inject, Param, Post } from "@nestjs/common";
 
-import type { PublishMockDto, SimulatePublishDto } from "./publish.dto.js";
+import type {
+  PublishMockDto,
+  RetryPublishTaskDto,
+  SimulatePublishDto,
+} from "./publish.dto.js";
 import { PublishService } from "./publish.service.js";
 
 @Controller("publish")
 export class PublishController {
   constructor(@Inject(PublishService) private readonly publishService: PublishService) {}
+
+  @Get("tasks")
+  listTasks() {
+    return this.publishService.listTasks();
+  }
+
+  @Get("tasks/:taskId")
+  getTask(@Param("taskId") taskId: string) {
+    return this.publishService.getTask(taskId);
+  }
 
   @Post("simulate")
   simulate(@Body() body: SimulatePublishDto) {
@@ -15,5 +29,10 @@ export class PublishController {
   @Post("mock")
   mockPublish(@Body() body: PublishMockDto) {
     return this.publishService.publishMock(body);
+  }
+
+  @Post("tasks/:taskId/retry")
+  retryTask(@Param("taskId") taskId: string, @Body() body: RetryPublishTaskDto) {
+    return this.publishService.retryTask(taskId, body);
   }
 }

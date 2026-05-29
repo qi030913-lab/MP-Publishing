@@ -7,9 +7,12 @@ import {
   Bot,
   CheckCircle2,
   Eye,
+  History,
   LayoutTemplate,
+  ListRestart,
   MessageSquare,
   Radio,
+  ScrollText,
   Send,
   Sparkles,
   SquarePen,
@@ -57,18 +60,43 @@ type PlatformAccount = {
   lastCheckedAt: string;
 };
 
-type SimulationReport = {
+type TaskResult = {
+  platform: PlatformName;
+  account: PlatformAccount | null;
+  ok: boolean;
+  screenshots?: string[];
+  remoteId?: string;
+  url?: string;
+  issues: ValidationIssue[];
+  status: "queued" | "running" | "succeeded" | "needs_retry" | "failed";
+  attemptCount: number;
+  logs: Array<{
+    id: string;
+    timestamp: string;
+    level: "info" | "warning" | "error";
+    message: string;
+  }>;
+};
+
+type PublishTaskDetail = {
+  id: string;
   mode: "simulate" | "mock-publish";
   overallStatus: "ready" | "needs_attention" | "published" | "partial";
-  results: Array<{
-    platform: PlatformName;
-    account: PlatformAccount | null;
-    ok: boolean;
-    screenshots?: string[];
-    remoteId?: string;
-    url?: string;
-    issues: ValidationIssue[];
-  }>;
+  documentTitle: string;
+  createdAt: string;
+  updatedAt: string;
+  results: TaskResult[];
+};
+
+type PublishTaskSummary = {
+  id: string;
+  mode: "simulate" | "mock-publish";
+  status: "queued" | "running" | "succeeded" | "partial" | "failed";
+  documentTitle: string;
+  createdAt: string;
+  updatedAt: string;
+  targetCount: number;
+  issueCount: number;
 };
 
 const platformMeta: Record<
@@ -148,11 +176,27 @@ function statusLabel(status: PlatformAccount["health"]) {
   return "需要重新登录";
 }
 
-function reportStatusLabel(status: SimulationReport["overallStatus"]) {
+function reportStatusLabel(status: PublishTaskDetail["overallStatus"]) {
   if (status === "ready") return "可进入发布";
   if (status === "needs_attention") return "需要处理";
   if (status === "published") return "模拟发布成功";
   return "部分平台待确认";
+}
+
+function taskSummaryStatusLabel(status: PublishTaskSummary["status"]) {
+  if (status === "queued") return "排队中";
+  if (status === "running") return "执行中";
+  if (status === "succeeded") return "已完成";
+  if (status === "failed") return "已失败";
+  return "部分完成";
+}
+
+function targetStatusLabel(status: TaskResult["status"]) {
+  if (status === "queued") return "排队中";
+  if (status === "running") return "执行中";
+  if (status === "succeeded") return "已完成";
+  if (status === "failed") return "失败";
+  return "待重试";
 }
 
 function EmptyPreview() {
@@ -166,12 +210,12 @@ function EmptyPreview() {
   );
 }
 
-function EmptyReport() {
+function EmptyTasks() {
   return (
     <div className="empty-state report-empty">
       <div>
-        <strong>暂无发布报告</strong>
-        <p>完成预览后，可在这里运行模拟发布或 mock 一键发布，查看逐平台的结果回执。</p>
+        <strong>暂无任务记录</strong>
+        <p>运行模拟发布或 mock 一键发布后，这里会沉淀任务、日志和平台级状态，便于后续重试与追踪。</p>
       </div>
     </div>
   );
@@ -194,10 +238,13 @@ export default function HomePage() {
   const [capabilities, setCapabilities] = useState<PlatformCapability[]>([]);
   const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([]);
-  const [report, setReport] = useState<SimulationReport | null>(null);
+  const [taskSummaries, setTaskSummaries] = useState<PublishTaskSummary[]>([]);
+  const [activeTask, setActiveTask] = useState<PublishTaskDetail | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
   const [isSimulationLoading, setIsSimulationLoading] = useState(false);
   const [isMockPublishLoading, setIsMockPublishLoading] = useState(false);
+  const [isTasksLoading, setIsTasksLoading] = useState(false);
+  const [isRetryingTaskId, setIsRetryingTaskId] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const editor = useEditor({
@@ -216,7 +263,30 @@ export default function HomePage() {
   const currentCapability = capabilities.find((item) => item.platform === activePlatform);
   const selectedAccounts = accounts.filter((account) => selectedAccountIds.includes(account.id));
   const totalWarnings = previewResults.reduce((count, preview) => count + preview.warnings.length, 0);
-  const totalIssues = report?.results.reduce((count, item) => count + item.issues.length, 0) ?? 0;
+  const totalIssues = activeTask?.results.reduce((count, item) => count + item.issues.length, 0) ?? 0;
+
+  async function refreshTasks(selectTaskId?: string) {
+    setIsTasksLoading(true);
+
+    try {
+      const response = await fetch("http://localhost:3001/publish/tasks");
+      const payload = (await response.json()) as { items: PublishTaskSummary[] };
+      setTaskSummaries(payload.items);
+
+      const nextTaskId = selectTaskId ?? payload.items[0]?.id;
+      if (nextTaskId) {
+        const detailResponse = await fetch(`http://localhost:3001/publish/tasks/${nextTaskId}`);
+        const detailPayload = (await detailResponse.json()) as PublishTaskDetail;
+        setActiveTask(detailPayload);
+      } else {
+        setActiveTask(null);
+      }
+    } catch {
+      setError("任务中心刷新失败，请确认 API 服务可用后重试。");
+    } finally {
+      setIsTasksLoading(false);
+    }
+  }
 
   useEffect(() => {
     async function bootstrapData() {
@@ -232,6 +302,7 @@ export default function HomePage() {
         setCapabilities(platformPayload.capabilities);
         setAccounts(accountPayload.items);
         setSelectedAccountIds(accountPayload.items.map((item) => item.id));
+        await refreshTasks();
       } catch {
         setError("无法连接到本地 API，请确认 http://localhost:3001 已启动。");
       }
@@ -240,10 +311,19 @@ export default function HomePage() {
     void bootstrapData();
   }, []);
 
+  async function openTask(taskId: string) {
+    try {
+      const response = await fetch(`http://localhost:3001/publish/tasks/${taskId}`);
+      const payload = (await response.json()) as PublishTaskDetail;
+      setActiveTask(payload);
+    } catch {
+      setError("读取任务详情失败，请稍后重试。");
+    }
+  }
+
   async function generatePreview() {
     setIsPreviewLoading(true);
     setError(null);
-    setReport(null);
 
     try {
       const response = await fetch("http://localhost:3001/preview", {
@@ -342,13 +422,41 @@ export default function HomePage() {
         throw new Error("publish request failed");
       }
 
-      const payload = (await response.json()) as SimulationReport;
-      setReport(payload);
+      const payload = (await response.json()) as PublishTaskDetail;
+      setActiveTask(payload);
+      await refreshTasks(payload.id);
     } catch {
       setError(mode === "simulate" ? "模拟发布失败，请稍后重试。" : "mock 发布失败，请稍后重试。");
     } finally {
       setIsSimulationLoading(false);
       setIsMockPublishLoading(false);
+    }
+  }
+
+  async function retryTask(taskId: string, platform?: PlatformName) {
+    setIsRetryingTaskId(taskId);
+    setError(null);
+
+    try {
+      const response = await fetch(`http://localhost:3001/publish/tasks/${taskId}/retry`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(platform ? { platform } : {}),
+      });
+
+      if (!response.ok) {
+        throw new Error("retry request failed");
+      }
+
+      const payload = (await response.json()) as PublishTaskDetail;
+      setActiveTask(payload);
+      await refreshTasks(payload.id);
+    } catch {
+      setError("重试任务失败，请稍后重试。");
+    } finally {
+      setIsRetryingTaskId(null);
     }
   }
 
@@ -400,9 +508,9 @@ export default function HomePage() {
           <div className="hero-band">
             <div>
               <p className="eyebrow">MP-Publishing</p>
-              <h1>多平台创作、确认与模拟发布工作台</h1>
+              <h1>多平台创作、确认与任务中心工作台</h1>
               <p className="hero-copy">
-                先写原稿，再自动适配平台风格；确认账号后即可运行模拟发布，最后再进入真实发布链路。
+                先写原稿，再自动适配平台风格；确认账号后运行模拟发布，所有结果会沉淀到任务中心，支持查看日志和逐平台重试。
               </p>
             </div>
             <div className="hero-metrics">
@@ -415,7 +523,7 @@ export default function HomePage() {
                 <strong>{selectedAccounts.length}</strong>
               </div>
               <div className="metric-tile">
-                <span>报告问题</span>
+                <span>任务问题</span>
                 <strong>{totalIssues}</strong>
               </div>
             </div>
@@ -551,11 +659,7 @@ export default function HomePage() {
 
                 return (
                   <label key={account.id} className={`account-card ${selected ? "selected" : ""}`}>
-                    <input
-                      type="checkbox"
-                      checked={selected}
-                      onChange={() => toggleAccount(account.id)}
-                    />
+                    <input type="checkbox" checked={selected} onChange={() => toggleAccount(account.id)} />
                     <div className="account-copy">
                       <div className="account-line">
                         <strong>{account.displayName}</strong>
@@ -684,72 +788,157 @@ export default function HomePage() {
             )}
           </div>
 
-          <div className="panel report-shell">
+          <div className="panel task-shell">
             <div className="panel-header">
               <div>
                 <p className="section-kicker">Step 3</p>
-                <h2>模拟发布报告</h2>
+                <h2>发布任务中心</h2>
               </div>
-              {report ? (
-                <div className={`status-pill ${report.overallStatus === "needs_attention" ? "warning" : "success"}`}>
-                  <CheckCircle2 size={16} />
-                  {reportStatusLabel(report.overallStatus)}
-                </div>
-              ) : null}
+              <button type="button" className="secondary-button compact-button" onClick={() => refreshTasks()} disabled={isTasksLoading}>
+                <History size={16} />
+                {isTasksLoading ? "刷新中..." : "刷新任务"}
+              </button>
             </div>
 
-            {report ? (
-              <div className="report-list">
-                {report.results.map((item) => {
-                  const meta = platformMeta[item.platform];
-                  return (
-                    <article key={item.platform} className="report-card">
-                      <div className="report-card-head">
-                        <div>
-                          <strong>{meta.label}</strong>
-                          <p>{item.account ? `${item.account.displayName} / ${item.account.handle}` : "未选择账号"}</p>
+            {activeTask ? (
+              <div className="task-overview">
+                <div className="task-header">
+                  <div>
+                    <strong>{activeTask.documentTitle}</strong>
+                    <p>
+                      {activeTask.mode === "simulate" ? "模拟发布任务" : "mock 一键发布任务"} / 最近更新时间 {new Date(
+                        activeTask.updatedAt,
+                      ).toLocaleString("zh-CN")}
+                    </p>
+                  </div>
+                  <div className={`status-pill ${activeTask.overallStatus === "needs_attention" ? "warning" : "success"}`}>
+                    <CheckCircle2 size={16} />
+                    {reportStatusLabel(activeTask.overallStatus)}
+                  </div>
+                </div>
+
+                <div className="task-actions">
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => retryTask(activeTask.id)}
+                    disabled={isRetryingTaskId === activeTask.id}
+                  >
+                    <ListRestart size={16} />
+                    {isRetryingTaskId === activeTask.id ? "重试中..." : "重试未完成项"}
+                  </button>
+                </div>
+
+                <div className="task-result-list">
+                  {activeTask.results.map((item) => {
+                    const meta = platformMeta[item.platform];
+                    return (
+                      <article key={`${activeTask.id}-${item.platform}`} className="report-card">
+                        <div className="report-card-head">
+                          <div>
+                            <strong>{meta.label}</strong>
+                            <p>{item.account ? `${item.account.displayName} / ${item.account.handle}` : "未选择账号"}</p>
+                          </div>
+                          <span className={`report-pill ${item.ok ? "ok" : "attention"}`}>
+                            {targetStatusLabel(item.status)}
+                          </span>
                         </div>
-                        <span className={`report-pill ${item.ok ? "ok" : "attention"}`}>
-                          {item.ok ? "通过" : "待处理"}
-                        </span>
-                      </div>
 
-                      {item.url ? (
-                        <a className="report-link" href={item.url} target="_blank" rel="noreferrer">
-                          mock 发布回执：{item.url}
-                        </a>
-                      ) : null}
+                        <div className="task-meta-row">
+                          <span>尝试次数：{item.attemptCount}</span>
+                          {item.remoteId ? <span>回执 ID：{item.remoteId}</span> : null}
+                        </div>
 
-                      {item.screenshots?.length ? (
-                        <div className="screenshot-list">
-                          {item.screenshots.map((shot) => (
-                            <span key={shot}>{shot}</span>
+                        {item.url ? (
+                          <a className="report-link" href={item.url} target="_blank" rel="noreferrer">
+                            mock 发布回执：{item.url}
+                          </a>
+                        ) : null}
+
+                        {item.screenshots?.length ? (
+                          <div className="screenshot-list">
+                            {item.screenshots.map((shot) => (
+                              <span key={shot}>{shot}</span>
+                            ))}
+                          </div>
+                        ) : null}
+
+                        <div className="warning-list compact">
+                          {item.issues.length > 0 ? (
+                            item.issues.map((issue) => (
+                              <div key={`${item.platform}-${issue.code}`} className={`warning-item ${issue.severity}`}>
+                                <span>{issue.severity.toUpperCase()}</span>
+                                <p>{issue.message}</p>
+                              </div>
+                            ))
+                          ) : (
+                            <div className="warning-item info">
+                              <span>PASS</span>
+                              <p>本平台当前无额外阻塞项，可继续进入真实发布链路。</p>
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="log-list">
+                          {item.logs.map((log) => (
+                            <div key={log.id} className={`log-item ${log.level}`}>
+                              <span>{new Date(log.timestamp).toLocaleTimeString("zh-CN")}</span>
+                              <p>{log.message}</p>
+                            </div>
                           ))}
                         </div>
-                      ) : null}
 
-                      <div className="warning-list compact">
-                        {item.issues.length > 0 ? (
-                          item.issues.map((issue) => (
-                            <div key={`${item.platform}-${issue.code}`} className={`warning-item ${issue.severity}`}>
-                              <span>{issue.severity.toUpperCase()}</span>
-                              <p>{issue.message}</p>
-                            </div>
-                          ))
-                        ) : (
-                          <div className="warning-item info">
-                            <span>PASS</span>
-                            <p>本平台当前无额外阻塞项，可继续进入真实发布链路。</p>
-                          </div>
-                        )}
-                      </div>
-                    </article>
-                  );
-                })}
+                        <button
+                          type="button"
+                          className="secondary-button compact-button"
+                          onClick={() => retryTask(activeTask.id, item.platform)}
+                          disabled={isRetryingTaskId === activeTask.id}
+                        >
+                          <ListRestart size={16} />
+                          重试 {meta.label}
+                        </button>
+                      </article>
+                    );
+                  })}
+                </div>
               </div>
             ) : (
-              <EmptyReport />
+              <EmptyTasks />
             )}
+
+            <div className="task-list-panel">
+              <div className="list-header">
+                <div className="list-title">
+                  <ScrollText size={16} />
+                  最近任务
+                </div>
+              </div>
+
+              {taskSummaries.length > 0 ? (
+                <div className="task-summary-list">
+                  {taskSummaries.map((task) => (
+                    <button
+                      key={task.id}
+                      type="button"
+                      className={`task-summary-card ${activeTask?.id === task.id ? "selected" : ""}`}
+                      onClick={() => openTask(task.id)}
+                    >
+                      <div className="task-summary-head">
+                        <strong>{task.documentTitle}</strong>
+                        <span className={`summary-pill ${task.status}`}>{taskSummaryStatusLabel(task.status)}</span>
+                      </div>
+                      <div className="task-summary-meta">
+                        <span>{task.mode === "simulate" ? "模拟发布" : "mock 发布"}</span>
+                        <span>{task.targetCount} 平台</span>
+                        <span>{task.issueCount} 问题</span>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              ) : (
+                <EmptyTasks />
+              )}
+            </div>
           </div>
         </section>
       </div>
@@ -761,10 +950,10 @@ export default function HomePage() {
         }
 
         .workspace-grid {
-          max-width: 1520px;
+          max-width: 1560px;
           margin: 0 auto;
           display: grid;
-          grid-template-columns: minmax(0, 1.12fr) minmax(420px, 0.88fr);
+          grid-template-columns: minmax(0, 1.08fr) minmax(460px, 0.92fr);
           gap: 20px;
         }
 
@@ -819,7 +1008,6 @@ export default function HomePage() {
         }
 
         .metric-tile,
-        .insight-card,
         .meta-grid > div {
           padding: 16px;
           border-radius: 8px;
@@ -848,7 +1036,9 @@ export default function HomePage() {
         .panel-header,
         .preview-header,
         .preview-card-header,
-        .report-card-head {
+        .report-card-head,
+        .task-header,
+        .list-header {
           display: flex;
           justify-content: space-between;
           gap: 16px;
@@ -857,7 +1047,8 @@ export default function HomePage() {
 
         .status-pill,
         .preview-mode,
-        .report-pill {
+        .report-pill,
+        .summary-pill {
           display: inline-flex;
           align-items: center;
           gap: 8px;
@@ -876,17 +1067,32 @@ export default function HomePage() {
         }
 
         .status-pill.warning,
-        .report-pill.attention {
+        .report-pill.attention,
+        .summary-pill.partial {
           background: rgba(217, 119, 6, 0.14);
           border-color: rgba(217, 119, 6, 0.24);
           color: #fed7aa;
         }
 
         .status-pill.success,
-        .report-pill.ok {
+        .report-pill.ok,
+        .summary-pill.succeeded {
           background: rgba(22, 163, 74, 0.14);
           border-color: rgba(22, 163, 74, 0.24);
           color: #bbf7d0;
+        }
+
+        .summary-pill.failed {
+          background: rgba(220, 38, 38, 0.16);
+          border-color: rgba(220, 38, 38, 0.22);
+          color: #fecaca;
+        }
+
+        .summary-pill.queued,
+        .summary-pill.running {
+          background: rgba(37, 99, 235, 0.14);
+          border-color: rgba(37, 99, 235, 0.24);
+          color: #bfdbfe;
         }
 
         .field-grid,
@@ -981,7 +1187,8 @@ export default function HomePage() {
         .tab-row button,
         .primary-button,
         .secondary-button,
-        .platform-chip {
+        .platform-chip,
+        .task-summary-card {
           border: none;
           cursor: pointer;
         }
@@ -1047,7 +1254,11 @@ export default function HomePage() {
         .report-card-head p,
         .preview-card-header p,
         .warning-item p,
-        .empty-state p {
+        .empty-state p,
+        .task-header p,
+        .task-meta-row span,
+        .task-summary-meta span,
+        .log-item span {
           color: #94a3b8;
           font-size: 13px;
           line-height: 1.6;
@@ -1055,8 +1266,10 @@ export default function HomePage() {
         }
 
         .account-list,
-        .report-list,
-        .warning-list {
+        .warning-list,
+        .task-result-list,
+        .task-summary-list,
+        .log-list {
           display: grid;
           gap: 12px;
         }
@@ -1065,20 +1278,38 @@ export default function HomePage() {
           margin-top: 18px;
         }
 
-        .account-card {
+        .account-card,
+        .task-summary-card {
           display: grid;
-          grid-template-columns: 20px minmax(0, 1fr);
           gap: 14px;
           padding: 14px;
           border-radius: 8px;
           border: 1px solid rgba(148, 163, 184, 0.14);
           background: rgba(15, 23, 42, 0.7);
+        }
+
+        .account-card {
+          grid-template-columns: 20px minmax(0, 1fr);
           cursor: pointer;
         }
 
-        .account-card.selected {
+        .account-card.selected,
+        .task-summary-card.selected {
           border-color: rgba(37, 99, 235, 0.4);
           background: rgba(15, 23, 42, 0.92);
+        }
+
+        .task-summary-card {
+          text-align: left;
+        }
+
+        .task-summary-head,
+        .task-summary-meta,
+        .task-meta-row {
+          display: flex;
+          flex-wrap: wrap;
+          justify-content: space-between;
+          gap: 8px 12px;
         }
 
         .account-copy {
@@ -1115,7 +1346,8 @@ export default function HomePage() {
           background: rgba(220, 38, 38, 0.14);
         }
 
-        .action-row {
+        .action-row,
+        .task-actions {
           display: flex;
           flex-wrap: wrap;
           gap: 12px;
@@ -1130,6 +1362,10 @@ export default function HomePage() {
           padding: 12px 16px;
           border-radius: 8px;
           color: white;
+        }
+
+        .compact-button {
+          padding: 10px 12px;
         }
 
         .primary-button {
@@ -1156,7 +1392,7 @@ export default function HomePage() {
         }
 
         .preview-shell,
-        .report-shell {
+        .task-shell {
           min-height: 340px;
         }
 
@@ -1167,7 +1403,7 @@ export default function HomePage() {
         }
 
         .preview-card,
-        .report-list {
+        .task-overview {
           display: grid;
           gap: 22px;
           padding-top: 22px;
@@ -1240,12 +1476,14 @@ export default function HomePage() {
           color: #fed7aa;
         }
 
-        .warning-item.error span {
+        .warning-item.error span,
+        .log-item.error span {
           background: rgba(220, 38, 38, 0.16);
           color: #fecaca;
         }
 
-        .report-card {
+        .report-card,
+        .task-list-panel {
           padding: 18px;
           border-radius: 8px;
           border: 1px solid rgba(148, 163, 184, 0.14);
@@ -1260,8 +1498,36 @@ export default function HomePage() {
           word-break: break-all;
         }
 
-        .compact .warning-item {
-          grid-template-columns: 72px minmax(0, 1fr);
+        .log-list {
+          padding-top: 8px;
+          border-top: 1px solid rgba(148, 163, 184, 0.12);
+        }
+
+        .log-item {
+          display: grid;
+          grid-template-columns: 92px minmax(0, 1fr);
+          gap: 12px;
+          align-items: start;
+        }
+
+        .log-item p {
+          margin: 0;
+          line-height: 1.7;
+        }
+
+        .log-item.warning span {
+          color: #fed7aa;
+        }
+
+        .task-list-panel {
+          margin-top: 18px;
+        }
+
+        .list-title {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          color: #cbd5e1;
         }
 
         .empty-state {
@@ -1307,7 +1573,12 @@ export default function HomePage() {
           .preview-card-header,
           .control-group,
           .account-line,
-          .report-card-head {
+          .report-card-head,
+          .task-header,
+          .task-summary-head,
+          .task-summary-meta,
+          .task-meta-row,
+          .log-item {
             display: grid;
           }
 
