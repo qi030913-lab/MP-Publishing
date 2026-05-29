@@ -19,6 +19,8 @@ import type {
 
 @Injectable()
 export class PublishService {
+  private readonly progressDelayMs = 1500;
+
   private createTimestamp() {
     return new Date().toISOString();
   }
@@ -35,6 +37,14 @@ export class PublishService {
   private summarizeTaskStatus(targets: PublishTaskTargetRecord[]): PublishTaskRecord["status"] {
     const statuses = targets.map((target) => target.status);
 
+    if (statuses.some((status) => status === "running" || status === "queued")) {
+      return "running";
+    }
+
+    if (statuses.some((status) => status === "needs_manual_action")) {
+      return "needs_manual_action";
+    }
+
     if (statuses.every((status) => status === "succeeded")) {
       return "succeeded";
     }
@@ -44,6 +54,66 @@ export class PublishService {
     }
 
     return "partial";
+  }
+
+  private resolveInitialTargetStatus(account: PlatformAccountRecord | null): PublishTaskTargetRecord["status"] {
+    if (!account) {
+      return "needs_manual_action";
+    }
+
+    if (account.health === "needs-login") {
+      return "needs_manual_action";
+    }
+
+    return "queued";
+  }
+
+  private progressTask(task: PublishTaskRecord) {
+    const now = Date.now();
+    let changed = false;
+
+    task.targets.forEach((target) => {
+      if (target.status === "queued") {
+        target.status = "running";
+        target.startedAt = this.createTimestamp();
+        target.logs.push(this.createLog("info", `${target.platform} 已进入执行队列。`));
+        changed = true;
+        return;
+      }
+
+      if (target.status !== "running" || !target.startedAt) {
+        return;
+      }
+
+      const elapsed = now - new Date(target.startedAt).getTime();
+      if (elapsed < this.progressDelayMs) {
+        return;
+      }
+
+      if (!target.account || target.account.health === "needs-login") {
+        target.status = "needs_manual_action";
+        target.logs.push(this.createLog("warning", `${target.platform} 需要人工登录后才能继续发布。`));
+        changed = true;
+        return;
+      }
+
+      if (target.account.health === "expiring" && target.attemptCount === 1) {
+        target.status = "needs_retry";
+        target.logs.push(this.createLog("warning", `${target.platform} 账号凭证接近过期，建议执行重试。`));
+        changed = true;
+        return;
+      }
+
+      target.status = "succeeded";
+      target.completedAt = this.createTimestamp();
+      target.logs.push(this.createLog("info", `${target.platform} 任务执行完成。`));
+      changed = true;
+    });
+
+    if (changed) {
+      task.status = this.summarizeTaskStatus(task.targets);
+      task.updatedAt = this.createTimestamp();
+    }
   }
 
   private createBaseDocument(input: SimulatePublishDto | PublishMockDto) {
@@ -60,15 +130,18 @@ export class PublishService {
     mode: PublishTaskMode,
     input: SimulatePublishDto | PublishMockDto,
   ): Promise<PublishTaskRecord> {
-    const document = this.createBaseDocument(input);
     const accounts = platformAccounts.filter((account) => input.accountIds.includes(account.id));
     const taskCreatedAt = this.createTimestamp();
+
+    const document = this.createBaseDocument(input);
 
     const targets = await Promise.all(
       input.platforms.map(async (platform) => {
         const adapter = adapterRegistry.get(platform);
-        const matchedAccount = accounts.find((account) => account.platform === platform);
-        const startedAt = this.createTimestamp();
+        const matchedAccount = accounts.find((account) => account.platform === platform) ?? null;
+        const baseLogs = [
+          this.createLog("info", mode === "simulate" ? `已创建 ${platform} 模拟发布任务。` : `已创建 ${platform} mock 发布任务。`),
+        ];
 
         if (mode === "simulate") {
           const simulateResult = await adapter.simulatePublish({
@@ -79,22 +152,12 @@ export class PublishService {
 
           return {
             platform,
-            account: matchedAccount ?? null,
-            status: simulateResult.ok ? "succeeded" : "needs_retry",
+            account: matchedAccount,
+            status: this.resolveInitialTargetStatus(matchedAccount),
             attemptCount: 1,
             screenshots: simulateResult.screenshots,
             issues: simulateResult.issues,
-            logs: [
-              this.createLog("info", `已开始 ${platform} 模拟发布预检。`),
-              this.createLog(
-                simulateResult.ok ? "info" : "warning",
-                simulateResult.ok
-                  ? `${platform} 模拟发布检查通过。`
-                  : `${platform} 模拟发布存在待处理问题。`,
-              ),
-            ],
-            startedAt,
-            completedAt: this.createTimestamp(),
+            logs: baseLogs,
           } satisfies PublishTaskTargetRecord;
         }
 
@@ -106,21 +169,13 @@ export class PublishService {
 
         return {
           platform,
-          account: matchedAccount ?? null,
-          status: publishResult.ok ? "succeeded" : "needs_retry",
+          account: matchedAccount,
+          status: this.resolveInitialTargetStatus(matchedAccount),
           attemptCount: 1,
           remoteId: publishResult.remoteId,
           url: publishResult.url,
           issues: publishResult.issues,
-          logs: [
-            this.createLog("info", `已开始 ${platform} mock 发布。`),
-            this.createLog(
-              publishResult.ok ? "info" : "warning",
-              publishResult.ok ? `${platform} mock 发布成功。` : `${platform} mock 发布部分失败。`,
-            ),
-          ],
-          startedAt,
-          completedAt: this.createTimestamp(),
+          logs: baseLogs,
         } satisfies PublishTaskTargetRecord;
       }),
     );
@@ -128,7 +183,7 @@ export class PublishService {
     const task: PublishTaskRecord = {
       id: `task_${Date.now()}`,
       mode,
-      status: this.summarizeTaskStatus(targets),
+      status: "queued",
       documentTitle: document.title,
       createdAt: taskCreatedAt,
       updatedAt: this.createTimestamp(),
@@ -140,6 +195,8 @@ export class PublishService {
   }
 
   private mapTaskForResponse(task: PublishTaskRecord) {
+    this.progressTask(task);
+
     return {
       id: task.id,
       mode: task.mode,
@@ -154,6 +211,7 @@ export class PublishService {
       documentTitle: task.documentTitle,
       createdAt: task.createdAt,
       updatedAt: task.updatedAt,
+      status: task.status,
       results: task.targets.map((target) => ({
         platform: target.platform,
         account: target.account,
@@ -165,6 +223,8 @@ export class PublishService {
         status: target.status,
         attemptCount: target.attemptCount,
         logs: target.logs,
+        startedAt: target.startedAt,
+        completedAt: target.completedAt,
       })),
     };
   }
@@ -181,16 +241,19 @@ export class PublishService {
 
   listTasks() {
     return {
-      items: publishTasks.map((task) => ({
-        id: task.id,
-        mode: task.mode,
-        status: task.status,
-        documentTitle: task.documentTitle,
-        createdAt: task.createdAt,
-        updatedAt: task.updatedAt,
-        targetCount: task.targets.length,
-        issueCount: task.targets.reduce((count, target) => count + target.issues.length, 0),
-      })),
+      items: publishTasks.map((task) => {
+        this.progressTask(task);
+        return {
+          id: task.id,
+          mode: task.mode,
+          status: task.status,
+          documentTitle: task.documentTitle,
+          createdAt: task.createdAt,
+          updatedAt: task.updatedAt,
+          targetCount: task.targets.length,
+          issueCount: task.targets.reduce((count, target) => count + target.issues.length, 0),
+        };
+      }),
     };
   }
 
@@ -214,15 +277,23 @@ export class PublishService {
     );
 
     targets.forEach((target) => {
-      const nextStatus = target.account ? "succeeded" : "needs_retry";
       target.attemptCount += 1;
-      target.status = nextStatus;
-      target.completedAt = this.createTimestamp();
+      target.status = this.resolveInitialTargetStatus(target.account);
+      target.startedAt = undefined;
+      target.completedAt = undefined;
       target.logs.push(this.createLog("info", `已执行第 ${target.attemptCount} 次重试。`));
       if (!target.account) {
         target.logs.push(this.createLog("warning", `${target.platform} 缺少账号绑定，重试后仍需人工处理。`));
       } else {
-        target.logs.push(this.createLog("info", `${target.platform} 重试已成功完成。`));
+        target.logs.push(this.createLog("info", `${target.platform} 已重新排入执行队列。`));
+        if (target.account.health === "expiring") {
+          target.account = {
+            ...target.account,
+            health: "healthy",
+            lastCheckedAt: this.createTimestamp(),
+          };
+          target.logs.push(this.createLog("info", `${target.platform} 凭证刷新成功，状态已恢复健康。`));
+        }
       }
     });
 

@@ -17,9 +17,16 @@ export type PublishTaskTargetStatus =
   | "running"
   | "succeeded"
   | "needs_retry"
-  | "failed";
+  | "failed"
+  | "needs_manual_action";
 
-export type PublishTaskStatus = "queued" | "running" | "succeeded" | "partial" | "failed";
+export type PublishTaskStatus =
+  | "queued"
+  | "running"
+  | "succeeded"
+  | "partial"
+  | "failed"
+  | "needs_manual_action";
 
 export type PublishTaskLog = {
   id: string;

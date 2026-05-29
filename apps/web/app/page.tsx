@@ -68,8 +68,10 @@ type TaskResult = {
   remoteId?: string;
   url?: string;
   issues: ValidationIssue[];
-  status: "queued" | "running" | "succeeded" | "needs_retry" | "failed";
+  status: "queued" | "running" | "succeeded" | "needs_retry" | "failed" | "needs_manual_action";
   attemptCount: number;
+  startedAt?: string;
+  completedAt?: string;
   logs: Array<{
     id: string;
     timestamp: string;
@@ -82,6 +84,7 @@ type PublishTaskDetail = {
   id: string;
   mode: "simulate" | "mock-publish";
   overallStatus: "ready" | "needs_attention" | "published" | "partial";
+  status: "queued" | "running" | "succeeded" | "partial" | "failed" | "needs_manual_action";
   documentTitle: string;
   createdAt: string;
   updatedAt: string;
@@ -91,7 +94,7 @@ type PublishTaskDetail = {
 type PublishTaskSummary = {
   id: string;
   mode: "simulate" | "mock-publish";
-  status: "queued" | "running" | "succeeded" | "partial" | "failed";
+  status: "queued" | "running" | "succeeded" | "partial" | "failed" | "needs_manual_action";
   documentTitle: string;
   createdAt: string;
   updatedAt: string;
@@ -188,6 +191,7 @@ function taskSummaryStatusLabel(status: PublishTaskSummary["status"]) {
   if (status === "running") return "执行中";
   if (status === "succeeded") return "已完成";
   if (status === "failed") return "已失败";
+  if (status === "needs_manual_action") return "待人工处理";
   return "部分完成";
 }
 
@@ -196,6 +200,7 @@ function targetStatusLabel(status: TaskResult["status"]) {
   if (status === "running") return "执行中";
   if (status === "succeeded") return "已完成";
   if (status === "failed") return "失败";
+  if (status === "needs_manual_action") return "待人工处理";
   return "待重试";
 }
 
@@ -310,6 +315,26 @@ export default function HomePage() {
 
     void bootstrapData();
   }, []);
+
+  useEffect(() => {
+    if (!activeTask) {
+      return;
+    }
+
+    const hasLiveTargets = activeTask.results.some(
+      (item) => item.status === "queued" || item.status === "running",
+    );
+
+    if (!hasLiveTargets) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      void refreshTasks(activeTask.id);
+    }, 2000);
+
+    return () => window.clearInterval(timer);
+  }, [activeTask]);
 
   async function openTask(taskId: string) {
     try {
@@ -811,7 +836,11 @@ export default function HomePage() {
                       ).toLocaleString("zh-CN")}
                     </p>
                   </div>
-                  <div className={`status-pill ${activeTask.overallStatus === "needs_attention" ? "warning" : "success"}`}>
+                  <div
+                    className={`status-pill ${
+                      activeTask.overallStatus === "needs_attention" ? "warning" : "success"
+                    }`}
+                  >
                     <CheckCircle2 size={16} />
                     {reportStatusLabel(activeTask.overallStatus)}
                   </div>
@@ -847,6 +876,12 @@ export default function HomePage() {
                         <div className="task-meta-row">
                           <span>尝试次数：{item.attemptCount}</span>
                           {item.remoteId ? <span>回执 ID：{item.remoteId}</span> : null}
+                          {item.startedAt ? (
+                            <span>开始：{new Date(item.startedAt).toLocaleTimeString("zh-CN")}</span>
+                          ) : null}
+                          {item.completedAt ? (
+                            <span>完成：{new Date(item.completedAt).toLocaleTimeString("zh-CN")}</span>
+                          ) : null}
                         </div>
 
                         {item.url ? (
@@ -1068,7 +1103,8 @@ export default function HomePage() {
 
         .status-pill.warning,
         .report-pill.attention,
-        .summary-pill.partial {
+        .summary-pill.partial,
+        .summary-pill.needs_manual_action {
           background: rgba(217, 119, 6, 0.14);
           border-color: rgba(217, 119, 6, 0.24);
           color: #fed7aa;
