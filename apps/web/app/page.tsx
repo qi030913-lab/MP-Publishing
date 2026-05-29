@@ -4,6 +4,8 @@ import { useEditor, EditorContent } from "@tiptap/react";
 import StarterKit from "@tiptap/starter-kit";
 import {
   BookOpen,
+  Bot,
+  CheckCircle2,
   Eye,
   LayoutTemplate,
   MessageSquare,
@@ -11,10 +13,18 @@ import {
   Send,
   Sparkles,
   SquarePen,
+  WandSparkles,
 } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
 type PlatformName = "wechat" | "zhihu" | "bilibili" | "xiaohongshu";
+type ToneMode = "keep" | "platform-optimized";
+
+type ValidationIssue = {
+  code: string;
+  message: string;
+  severity: "info" | "warning" | "error";
+};
 
 type PreviewResult = {
   platform: PlatformName;
@@ -22,11 +32,7 @@ type PreviewResult = {
   summary?: string;
   body: string;
   hashtags: string[];
-  warnings: Array<{
-    code: string;
-    message: string;
-    severity: "info" | "warning" | "error";
-  }>;
+  warnings: ValidationIssue[];
 };
 
 type PlatformCapability = {
@@ -39,6 +45,30 @@ type PlatformCapability = {
   supportsHashtags: boolean;
   supportsScheduling: boolean;
   publishMode: "official-api" | "automation" | "hybrid";
+};
+
+type PlatformAccount = {
+  id: string;
+  platform: PlatformName;
+  displayName: string;
+  handle: string;
+  authMode: "official-api" | "cookie-session" | "hybrid";
+  health: "healthy" | "expiring" | "needs-login";
+  lastCheckedAt: string;
+};
+
+type SimulationReport = {
+  mode: "simulate" | "mock-publish";
+  overallStatus: "ready" | "needs_attention" | "published" | "partial";
+  results: Array<{
+    platform: PlatformName;
+    account: PlatformAccount | null;
+    ok: boolean;
+    screenshots?: string[];
+    remoteId?: string;
+    url?: string;
+    issues: ValidationIssue[];
+  }>;
 };
 
 const platformMeta: Record<
@@ -54,25 +84,25 @@ const platformMeta: Record<
     label: "公众号",
     icon: LayoutTemplate,
     tint: "#2563eb",
-    description: "图文排版、导语、卡片信息密度更高。",
+    description: "图文排版、导语和信息密度都更偏编辑后台。",
   },
   zhihu: {
     label: "知乎",
     icon: MessageSquare,
     tint: "#0f766e",
-    description: "适合问题拆解、观点前置和层次表达。",
+    description: "强调观点前置、论证结构和问题拆解。",
   },
   bilibili: {
     label: "B站",
     icon: Radio,
     tint: "#db2777",
-    description: "偏口语表达、节奏感和话题标签。",
+    description: "更偏口语表达、节奏感和用户互动氛围。",
   },
   xiaohongshu: {
     label: "小红书",
     icon: Sparkles,
     tint: "#ea580c",
-    description: "强调标题吸引力、体验感和标签氛围。",
+    description: "更强调标题吸引力、体验感和标签氛围。",
   },
 };
 
@@ -112,22 +142,36 @@ function formatBody(body: string) {
   ));
 }
 
+function statusLabel(status: PlatformAccount["health"]) {
+  if (status === "healthy") return "健康";
+  if (status === "expiring") return "即将过期";
+  return "需要重新登录";
+}
+
+function reportStatusLabel(status: SimulationReport["overallStatus"]) {
+  if (status === "ready") return "可进入发布";
+  if (status === "needs_attention") return "需要处理";
+  if (status === "published") return "模拟发布成功";
+  return "部分平台待确认";
+}
+
 function EmptyPreview() {
   return (
-    <div
-      style={{
-        border: "1px dashed rgba(148, 163, 184, 0.4)",
-        borderRadius: "8px",
-        padding: "28px",
-        minHeight: "240px",
-        display: "grid",
-        placeItems: "center",
-        color: "#94a3b8",
-        background: "rgba(15, 23, 42, 0.3)",
-      }}
-    >
-      <div style={{ textAlign: "center", maxWidth: "260px", lineHeight: 1.6 }}>
-        填写标题和正文后，系统会在这里生成各平台预览、风格差异和风险提示。
+    <div className="empty-state">
+      <div>
+        <strong>先生成平台预览</strong>
+        <p>填写标题和正文后，系统会在这里展示不同平台的适配结果、风险提示和发布建议。</p>
+      </div>
+    </div>
+  );
+}
+
+function EmptyReport() {
+  return (
+    <div className="empty-state report-empty">
+      <div>
+        <strong>暂无发布报告</strong>
+        <p>完成预览后，可在这里运行模拟发布或 mock 一键发布，查看逐平台的结果回执。</p>
       </div>
     </div>
   );
@@ -137,7 +181,7 @@ export default function HomePage() {
   const [title, setTitle] = useState("一篇内容，如何高效同步到多个创作平台");
   const [summary, setSummary] = useState("统一内容模型是多平台发布系统的第一块基石。");
   const [tags, setTags] = useState("内容运营, 创作者工具, 多平台发布");
-  const [toneMode, setToneMode] = useState<"keep" | "platform-optimized">("platform-optimized");
+  const [toneMode, setToneMode] = useState<ToneMode>("platform-optimized");
   const [preserveOriginal, setPreserveOriginal] = useState(false);
   const [selectedPlatforms, setSelectedPlatforms] = useState<PlatformName[]>([
     "wechat",
@@ -148,7 +192,12 @@ export default function HomePage() {
   const [activePlatform, setActivePlatform] = useState<PlatformName>("wechat");
   const [previewResults, setPreviewResults] = useState<PreviewResult[]>([]);
   const [capabilities, setCapabilities] = useState<PlatformCapability[]>([]);
-  const [isLoading, setIsLoading] = useState(false);
+  const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
+  const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([]);
+  const [report, setReport] = useState<SimulationReport | null>(null);
+  const [isPreviewLoading, setIsPreviewLoading] = useState(false);
+  const [isSimulationLoading, setIsSimulationLoading] = useState(false);
+  const [isMockPublishLoading, setIsMockPublishLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const editor = useEditor({
@@ -163,27 +212,38 @@ export default function HomePage() {
   });
 
   const body = useMemo(() => extractPlainText(editor?.getHTML() ?? ""), [editor]);
-
   const activePreview = previewResults.find((item) => item.platform === activePlatform);
   const currentCapability = capabilities.find((item) => item.platform === activePlatform);
+  const selectedAccounts = accounts.filter((account) => selectedAccountIds.includes(account.id));
+  const totalWarnings = previewResults.reduce((count, preview) => count + preview.warnings.length, 0);
+  const totalIssues = report?.results.reduce((count, item) => count + item.issues.length, 0) ?? 0;
 
   useEffect(() => {
-    async function loadPlatforms() {
+    async function bootstrapData() {
       try {
-        const response = await fetch("http://localhost:3001/platforms");
-        const payload = (await response.json()) as { capabilities: PlatformCapability[] };
-        setCapabilities(payload.capabilities);
+        const [platformResponse, accountResponse] = await Promise.all([
+          fetch("http://localhost:3001/platforms"),
+          fetch("http://localhost:3001/accounts"),
+        ]);
+
+        const platformPayload = (await platformResponse.json()) as { capabilities: PlatformCapability[] };
+        const accountPayload = (await accountResponse.json()) as { items: PlatformAccount[] };
+
+        setCapabilities(platformPayload.capabilities);
+        setAccounts(accountPayload.items);
+        setSelectedAccountIds(accountPayload.items.map((item) => item.id));
       } catch {
-        setCapabilities([]);
+        setError("无法连接到本地 API，请确认 http://localhost:3001 已启动。");
       }
     }
 
-    void loadPlatforms();
+    void bootstrapData();
   }, []);
 
   async function generatePreview() {
-    setIsLoading(true);
+    setIsPreviewLoading(true);
     setError(null);
+    setReport(null);
 
     try {
       const response = await fetch("http://localhost:3001/preview", {
@@ -213,9 +273,9 @@ export default function HomePage() {
         setActivePlatform(payload.previews[0].platform);
       }
     } catch {
-      setError("预览接口暂时不可用，请确认 API 服务已启动在 http://localhost:3001。");
+      setError("生成预览失败，请确认 API 服务可用后重试。");
     } finally {
-      setIsLoading(false);
+      setIsPreviewLoading(false);
     }
   }
 
@@ -229,15 +289,68 @@ export default function HomePage() {
         return next.length > 0 ? next : current;
       }
 
-      const next = [...current, platform];
-      if (!current.includes(activePlatform)) {
-        setActivePlatform(platform);
-      }
-      return next;
+      return [...current, platform];
     });
   }
 
-  const totalWarnings = previewResults.reduce((count, preview) => count + preview.warnings.length, 0);
+  function toggleAccount(accountId: string) {
+    setSelectedAccountIds((current) => {
+      if (current.includes(accountId)) {
+        const next = current.filter((item) => item !== accountId);
+        return next.length > 0 ? next : current;
+      }
+
+      return [...current, accountId];
+    });
+  }
+
+  async function runPublishAction(mode: "simulate" | "mock") {
+    if (previewResults.length === 0) {
+      setError("请先生成平台预览，再进入发布确认。");
+      return;
+    }
+
+    if (mode === "simulate") {
+      setIsSimulationLoading(true);
+    } else {
+      setIsMockPublishLoading(true);
+    }
+
+    setError(null);
+
+    try {
+      const response = await fetch(`http://localhost:3001/publish/${mode}`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          document: {
+            title,
+            summary,
+            body,
+            tags: splitTags(tags),
+          },
+          platforms: selectedPlatforms,
+          accountIds: selectedAccountIds,
+          toneMode,
+          preserveOriginal,
+        }),
+      });
+
+      if (!response.ok) {
+        throw new Error("publish request failed");
+      }
+
+      const payload = (await response.json()) as SimulationReport;
+      setReport(payload);
+    } catch {
+      setError(mode === "simulate" ? "模拟发布失败，请稍后重试。" : "mock 发布失败，请稍后重试。");
+    } finally {
+      setIsSimulationLoading(false);
+      setIsMockPublishLoading(false);
+    }
+  }
 
   return (
     <main className="workspace-shell">
@@ -283,34 +396,46 @@ export default function HomePage() {
       `}</style>
 
       <div className="workspace-grid">
-        <section className="left-rail">
+        <section className="main-column">
           <div className="hero-band">
-            <p className="eyebrow">MP-Publishing</p>
-            <h1>多平台创作与适配工作台</h1>
-            <p className="hero-copy">
-              先专注表达，再把同一篇内容分发为公众号、知乎、B站和小红书各自合适的版本。
-            </p>
+            <div>
+              <p className="eyebrow">MP-Publishing</p>
+              <h1>多平台创作、确认与模拟发布工作台</h1>
+              <p className="hero-copy">
+                先写原稿，再自动适配平台风格；确认账号后即可运行模拟发布，最后再进入真实发布链路。
+              </p>
+            </div>
+            <div className="hero-metrics">
+              <div className="metric-tile">
+                <span>目标平台</span>
+                <strong>{selectedPlatforms.length}</strong>
+              </div>
+              <div className="metric-tile">
+                <span>已选账号</span>
+                <strong>{selectedAccounts.length}</strong>
+              </div>
+              <div className="metric-tile">
+                <span>报告问题</span>
+                <strong>{totalIssues}</strong>
+              </div>
+            </div>
           </div>
 
           <div className="panel">
             <div className="panel-header">
               <div>
-                <p className="section-kicker">创作输入</p>
-                <h2>原稿编辑器</h2>
+                <p className="section-kicker">Step 1</p>
+                <h2>创作原稿</h2>
               </div>
               <div className="status-pill">
                 <SquarePen size={16} />
-                正在编辑
+                草稿编辑中
               </div>
             </div>
 
             <label className="field">
               <span>标题</span>
-              <input
-                value={title}
-                onChange={(event) => setTitle(event.target.value)}
-                placeholder="输入内容标题"
-              />
+              <input value={title} onChange={(event) => setTitle(event.target.value)} placeholder="输入文章标题" />
             </label>
 
             <div className="field-grid">
@@ -320,7 +445,7 @@ export default function HomePage() {
                   rows={3}
                   value={summary}
                   onChange={(event) => setSummary(event.target.value)}
-                  placeholder="补充导语或摘要"
+                  placeholder="用两三句话概括内容重点"
                 />
               </label>
               <label className="field">
@@ -337,12 +462,7 @@ export default function HomePage() {
             <div className="editor-panel">
               <div className="editor-toolbar">
                 <div className="toolbar-group">
-                  <button
-                    type="button"
-                    className="toolbar-button"
-                    onClick={() => editor?.chain().focus().toggleBold().run()}
-                    title="加粗"
-                  >
+                  <button type="button" className="toolbar-button" onClick={() => editor?.chain().focus().toggleBold().run()} title="加粗">
                     B
                   </button>
                   <button
@@ -354,7 +474,7 @@ export default function HomePage() {
                     •
                   </button>
                 </div>
-                <div className="toolbar-hint">输入原稿，系统将自动拆分为平台预览。</div>
+                <div className="toolbar-hint">正文会被自动转换为统一内容模型，再生成不同平台预览。</div>
               </div>
               <EditorContent editor={editor} />
             </div>
@@ -370,11 +490,7 @@ export default function HomePage() {
                   >
                     平台优化
                   </button>
-                  <button
-                    type="button"
-                    className={toneMode === "keep" ? "active" : ""}
-                    onClick={() => setToneMode("keep")}
-                  >
+                  <button type="button" className={toneMode === "keep" ? "active" : ""} onClick={() => setToneMode("keep")}>
                     保持原文
                   </button>
                 </div>
@@ -386,78 +502,117 @@ export default function HomePage() {
                   checked={preserveOriginal}
                   onChange={(event) => setPreserveOriginal(event.target.checked)}
                 />
-                <span>尽量保留原标题，不主动裁剪平台标题</span>
+                <span>尽量保留原标题，不主动为平台裁剪标题</span>
               </label>
+            </div>
+          </div>
+
+          <div className="panel">
+            <div className="panel-header">
+              <div>
+                <p className="section-kicker">Step 2</p>
+                <h2>发布确认</h2>
+              </div>
+              <div className="status-pill subtle">
+                <Bot size={16} />
+                模拟优先
+              </div>
+            </div>
+
+            <div className="platform-grid">
+              {(Object.keys(platformMeta) as PlatformName[]).map((platform) => {
+                const meta = platformMeta[platform];
+                const Icon = meta.icon;
+                const selected = selectedPlatforms.includes(platform);
+
+                return (
+                  <button
+                    key={platform}
+                    type="button"
+                    className={`platform-chip ${selected ? "selected" : ""}`}
+                    onClick={() => togglePlatform(platform)}
+                  >
+                    <div className="platform-icon" style={{ background: `${meta.tint}20`, color: meta.tint }}>
+                      <Icon size={18} />
+                    </div>
+                    <div className="platform-copy">
+                      <strong>{meta.label}</strong>
+                      <span>{meta.description}</span>
+                    </div>
+                  </button>
+                );
+              })}
+            </div>
+
+            <div className="account-list">
+              {accounts.map((account) => {
+                const selected = selectedAccountIds.includes(account.id);
+                const meta = platformMeta[account.platform];
+
+                return (
+                  <label key={account.id} className={`account-card ${selected ? "selected" : ""}`}>
+                    <input
+                      type="checkbox"
+                      checked={selected}
+                      onChange={() => toggleAccount(account.id)}
+                    />
+                    <div className="account-copy">
+                      <div className="account-line">
+                        <strong>{account.displayName}</strong>
+                        <span className={`account-health ${account.health}`}>{statusLabel(account.health)}</span>
+                      </div>
+                      <div className="account-line secondary">
+                        <span>
+                          {meta.label} / {account.handle}
+                        </span>
+                        <span>{account.authMode}</span>
+                      </div>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+
+            <div className="action-row">
+              <button type="button" className="primary-button" onClick={generatePreview} disabled={isPreviewLoading}>
+                <Eye size={16} />
+                {isPreviewLoading ? "生成中..." : "更新平台预览"}
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => runPublishAction("simulate")}
+                disabled={isSimulationLoading}
+              >
+                <WandSparkles size={16} />
+                {isSimulationLoading ? "模拟发布中..." : "运行模拟发布"}
+              </button>
+              <button
+                type="button"
+                className="secondary-button"
+                onClick={() => runPublishAction("mock")}
+                disabled={isMockPublishLoading}
+              >
+                <Send size={16} />
+                {isMockPublishLoading ? "提交中..." : "执行 mock 一键发布"}
+              </button>
             </div>
           </div>
         </section>
 
-        <section className="right-rail">
-          <div className="topbar panel">
-            <div>
-              <p className="section-kicker">适配设置</p>
-              <h2>选择目标平台</h2>
-            </div>
-            <button type="button" className="primary-button" onClick={generatePreview} disabled={isLoading}>
-              <Eye size={16} />
-              {isLoading ? "生成中..." : "生成预览"}
-            </button>
-          </div>
-
-          <div className="platform-grid">
-            {(Object.keys(platformMeta) as PlatformName[]).map((platform) => {
-              const meta = platformMeta[platform];
-              const Icon = meta.icon;
-              const selected = selectedPlatforms.includes(platform);
-
-              return (
-                <button
-                  key={platform}
-                  type="button"
-                  className={`platform-chip ${selected ? "selected" : ""}`}
-                  onClick={() => togglePlatform(platform)}
-                >
-                  <div
-                    className="platform-icon"
-                    style={{ background: `${meta.tint}20`, color: meta.tint }}
-                  >
-                    <Icon size={18} />
-                  </div>
-                  <div className="platform-copy">
-                    <strong>{meta.label}</strong>
-                    <span>{meta.description}</span>
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-
-          <div className="panel insights-panel">
-            <div className="insight-card">
-              <span className="insight-label">目标平台</span>
-              <strong>{selectedPlatforms.length}</strong>
-            </div>
-            <div className="insight-card">
-              <span className="insight-label">正文段落</span>
-              <strong>{body ? body.split(/\n{2,}/).filter(Boolean).length : 0}</strong>
-            </div>
-            <div className="insight-card">
-              <span className="insight-label">风险提示</span>
-              <strong>{totalWarnings}</strong>
-            </div>
-          </div>
-
+        <section className="side-column">
           {error ? <div className="error-banner">{error}</div> : null}
 
           <div className="panel preview-shell">
             <div className="preview-header">
               <div>
                 <p className="section-kicker">平台预览</p>
-                <h2>逐平台查看差异</h2>
+                <h2>查看适配差异</h2>
               </div>
               <div className="tab-row">
                 {selectedPlatforms.map((platform) => {
                   const meta = platformMeta[platform];
+
                   return (
                     <button
                       key={platform}
@@ -519,13 +674,81 @@ export default function HomePage() {
                   ) : (
                     <div className="warning-item info">
                       <span>READY</span>
-                      <p>当前平台预览没有明显风险项，可以继续进入模拟发布或一键发布流程。</p>
+                      <p>当前平台预览没有明显风险项，可以进入模拟发布或 mock 发布阶段。</p>
                     </div>
                   )}
                 </div>
               </div>
             ) : (
               <EmptyPreview />
+            )}
+          </div>
+
+          <div className="panel report-shell">
+            <div className="panel-header">
+              <div>
+                <p className="section-kicker">Step 3</p>
+                <h2>模拟发布报告</h2>
+              </div>
+              {report ? (
+                <div className={`status-pill ${report.overallStatus === "needs_attention" ? "warning" : "success"}`}>
+                  <CheckCircle2 size={16} />
+                  {reportStatusLabel(report.overallStatus)}
+                </div>
+              ) : null}
+            </div>
+
+            {report ? (
+              <div className="report-list">
+                {report.results.map((item) => {
+                  const meta = platformMeta[item.platform];
+                  return (
+                    <article key={item.platform} className="report-card">
+                      <div className="report-card-head">
+                        <div>
+                          <strong>{meta.label}</strong>
+                          <p>{item.account ? `${item.account.displayName} / ${item.account.handle}` : "未选择账号"}</p>
+                        </div>
+                        <span className={`report-pill ${item.ok ? "ok" : "attention"}`}>
+                          {item.ok ? "通过" : "待处理"}
+                        </span>
+                      </div>
+
+                      {item.url ? (
+                        <a className="report-link" href={item.url} target="_blank" rel="noreferrer">
+                          mock 发布回执：{item.url}
+                        </a>
+                      ) : null}
+
+                      {item.screenshots?.length ? (
+                        <div className="screenshot-list">
+                          {item.screenshots.map((shot) => (
+                            <span key={shot}>{shot}</span>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      <div className="warning-list compact">
+                        {item.issues.length > 0 ? (
+                          item.issues.map((issue) => (
+                            <div key={`${item.platform}-${issue.code}`} className={`warning-item ${issue.severity}`}>
+                              <span>{issue.severity.toUpperCase()}</span>
+                              <p>{issue.message}</p>
+                            </div>
+                          ))
+                        ) : (
+                          <div className="warning-item info">
+                            <span>PASS</span>
+                            <p>本平台当前无额外阻塞项，可继续进入真实发布链路。</p>
+                          </div>
+                        )}
+                      </div>
+                    </article>
+                  );
+                })}
+              </div>
+            ) : (
+              <EmptyReport />
             )}
           </div>
         </section>
@@ -538,15 +761,15 @@ export default function HomePage() {
         }
 
         .workspace-grid {
-          max-width: 1480px;
+          max-width: 1520px;
           margin: 0 auto;
           display: grid;
-          grid-template-columns: minmax(0, 1.08fr) minmax(420px, 0.92fr);
+          grid-template-columns: minmax(0, 1.12fr) minmax(420px, 0.88fr);
           gap: 20px;
         }
 
-        .left-rail,
-        .right-rail {
+        .main-column,
+        .side-column {
           display: grid;
           gap: 20px;
           align-content: start;
@@ -562,6 +785,9 @@ export default function HomePage() {
 
         .hero-band {
           padding: 28px;
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) 320px;
+          gap: 20px;
         }
 
         .eyebrow,
@@ -584,7 +810,35 @@ export default function HomePage() {
           margin: 14px 0 0;
           color: #cbd5e1;
           line-height: 1.7;
-          max-width: 780px;
+          max-width: 760px;
+        }
+
+        .hero-metrics {
+          display: grid;
+          gap: 12px;
+        }
+
+        .metric-tile,
+        .insight-card,
+        .meta-grid > div {
+          padding: 16px;
+          border-radius: 8px;
+          background: rgba(2, 6, 23, 0.34);
+          border: 1px solid rgba(148, 163, 184, 0.14);
+          display: grid;
+          gap: 8px;
+        }
+
+        .metric-tile span,
+        .field span,
+        .control-label,
+        .meta-label {
+          font-size: 13px;
+          color: #94a3b8;
+        }
+
+        .metric-tile strong {
+          font-size: 24px;
         }
 
         .panel {
@@ -592,9 +846,9 @@ export default function HomePage() {
         }
 
         .panel-header,
-        .topbar,
         .preview-header,
-        .preview-card-header {
+        .preview-card-header,
+        .report-card-head {
           display: flex;
           justify-content: space-between;
           gap: 16px;
@@ -602,22 +856,42 @@ export default function HomePage() {
         }
 
         .status-pill,
-        .preview-mode {
+        .preview-mode,
+        .report-pill {
           display: inline-flex;
           align-items: center;
           gap: 8px;
           padding: 10px 12px;
-          background: rgba(37, 99, 235, 0.12);
-          border: 1px solid rgba(37, 99, 235, 0.28);
           border-radius: 8px;
-          color: #bfdbfe;
           white-space: nowrap;
+          border: 1px solid rgba(37, 99, 235, 0.28);
+          background: rgba(37, 99, 235, 0.12);
+          color: #bfdbfe;
+        }
+
+        .status-pill.subtle {
+          background: rgba(148, 163, 184, 0.1);
+          border-color: rgba(148, 163, 184, 0.16);
+          color: #cbd5e1;
+        }
+
+        .status-pill.warning,
+        .report-pill.attention {
+          background: rgba(217, 119, 6, 0.14);
+          border-color: rgba(217, 119, 6, 0.24);
+          color: #fed7aa;
+        }
+
+        .status-pill.success,
+        .report-pill.ok {
+          background: rgba(22, 163, 74, 0.14);
+          border-color: rgba(22, 163, 74, 0.24);
+          color: #bbf7d0;
         }
 
         .field-grid,
         .meta-grid,
-        .platform-grid,
-        .insights-panel {
+        .platform-grid {
           display: grid;
           gap: 16px;
         }
@@ -631,14 +905,6 @@ export default function HomePage() {
           display: grid;
           gap: 8px;
           margin-top: 18px;
-        }
-
-        .field span,
-        .control-label,
-        .meta-label,
-        .insight-label {
-          font-size: 13px;
-          color: #94a3b8;
         }
 
         .field input,
@@ -714,6 +980,7 @@ export default function HomePage() {
         .segmented button,
         .tab-row button,
         .primary-button,
+        .secondary-button,
         .platform-chip {
           border: none;
           cursor: pointer;
@@ -740,28 +1007,9 @@ export default function HomePage() {
           color: #cbd5e1;
         }
 
-        .topbar {
-          display: flex;
-          align-items: center;
-        }
-
-        .primary-button {
-          display: inline-flex;
-          align-items: center;
-          gap: 8px;
-          padding: 12px 16px;
-          border-radius: 8px;
-          background: #2563eb;
-          color: white;
-        }
-
-        .primary-button:disabled {
-          opacity: 0.65;
-          cursor: wait;
-        }
-
         .platform-grid {
           grid-template-columns: repeat(2, minmax(0, 1fr));
+          margin-top: 18px;
         }
 
         .platform-chip {
@@ -794,27 +1042,109 @@ export default function HomePage() {
           gap: 6px;
         }
 
-        .platform-copy span {
+        .platform-copy span,
+        .account-line.secondary,
+        .report-card-head p,
+        .preview-card-header p,
+        .warning-item p,
+        .empty-state p {
           color: #94a3b8;
           font-size: 13px;
           line-height: 1.6;
+          margin: 0;
         }
 
-        .insights-panel {
-          grid-template-columns: repeat(3, minmax(0, 1fr));
+        .account-list,
+        .report-list,
+        .warning-list {
+          display: grid;
+          gap: 12px;
         }
 
-        .insight-card {
-          padding: 18px;
+        .account-list {
+          margin-top: 18px;
+        }
+
+        .account-card {
+          display: grid;
+          grid-template-columns: 20px minmax(0, 1fr);
+          gap: 14px;
+          padding: 14px;
           border-radius: 8px;
           border: 1px solid rgba(148, 163, 184, 0.14);
-          background: rgba(15, 23, 42, 0.84);
-          display: grid;
-          gap: 10px;
+          background: rgba(15, 23, 42, 0.7);
+          cursor: pointer;
         }
 
-        .insight-card strong {
-          font-size: 24px;
+        .account-card.selected {
+          border-color: rgba(37, 99, 235, 0.4);
+          background: rgba(15, 23, 42, 0.92);
+        }
+
+        .account-copy {
+          display: grid;
+          gap: 8px;
+        }
+
+        .account-line {
+          display: flex;
+          justify-content: space-between;
+          gap: 12px;
+          align-items: center;
+        }
+
+        .account-health {
+          padding: 4px 8px;
+          border-radius: 999px;
+          font-size: 12px;
+          border: 1px solid rgba(148, 163, 184, 0.16);
+        }
+
+        .account-health.healthy {
+          color: #bbf7d0;
+          background: rgba(22, 163, 74, 0.14);
+        }
+
+        .account-health.expiring {
+          color: #fed7aa;
+          background: rgba(217, 119, 6, 0.14);
+        }
+
+        .account-health.needs-login {
+          color: #fecaca;
+          background: rgba(220, 38, 38, 0.14);
+        }
+
+        .action-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 12px;
+          margin-top: 20px;
+        }
+
+        .primary-button,
+        .secondary-button {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          padding: 12px 16px;
+          border-radius: 8px;
+          color: white;
+        }
+
+        .primary-button {
+          background: #2563eb;
+        }
+
+        .secondary-button {
+          background: rgba(30, 41, 59, 0.92);
+          border: 1px solid rgba(148, 163, 184, 0.2);
+        }
+
+        .primary-button:disabled,
+        .secondary-button:disabled {
+          opacity: 0.65;
+          cursor: wait;
         }
 
         .error-banner {
@@ -825,8 +1155,9 @@ export default function HomePage() {
           color: #fecaca;
         }
 
-        .preview-shell {
-          min-height: 620px;
+        .preview-shell,
+        .report-shell {
+          min-height: 340px;
         }
 
         .tab-row {
@@ -835,7 +1166,8 @@ export default function HomePage() {
           gap: 8px;
         }
 
-        .preview-card {
+        .preview-card,
+        .report-list {
           display: grid;
           gap: 22px;
           padding-top: 22px;
@@ -844,12 +1176,6 @@ export default function HomePage() {
         .preview-card-header h3 {
           margin: 0;
           font-size: 24px;
-        }
-
-        .preview-card-header p {
-          margin: 8px 0 0;
-          color: #94a3b8;
-          line-height: 1.6;
         }
 
         .preview-body {
@@ -863,13 +1189,15 @@ export default function HomePage() {
           border: 1px solid rgba(148, 163, 184, 0.12);
         }
 
-        .hashtag-row {
+        .hashtag-row,
+        .screenshot-list {
           display: flex;
           flex-wrap: wrap;
           gap: 10px;
         }
 
-        .hashtag-row span {
+        .hashtag-row span,
+        .screenshot-list span {
           padding: 8px 10px;
           border-radius: 999px;
           background: rgba(37, 99, 235, 0.12);
@@ -879,20 +1207,6 @@ export default function HomePage() {
 
         .meta-grid {
           grid-template-columns: repeat(3, minmax(0, 1fr));
-        }
-
-        .meta-grid > div {
-          padding: 14px;
-          border-radius: 8px;
-          border: 1px solid rgba(148, 163, 184, 0.14);
-          background: rgba(15, 23, 42, 0.72);
-          display: grid;
-          gap: 8px;
-        }
-
-        .warning-list {
-          display: grid;
-          gap: 12px;
         }
 
         .warning-item {
@@ -931,14 +1245,48 @@ export default function HomePage() {
           color: #fecaca;
         }
 
-        .warning-item p {
-          margin: 0;
-          line-height: 1.7;
-          color: #cbd5e1;
+        .report-card {
+          padding: 18px;
+          border-radius: 8px;
+          border: 1px solid rgba(148, 163, 184, 0.14);
+          background: rgba(15, 23, 42, 0.72);
+          display: grid;
+          gap: 14px;
         }
 
-        @media (max-width: 1180px) {
-          .workspace-grid {
+        .report-link {
+          color: #93c5fd;
+          text-decoration: none;
+          word-break: break-all;
+        }
+
+        .compact .warning-item {
+          grid-template-columns: 72px minmax(0, 1fr);
+        }
+
+        .empty-state {
+          min-height: 220px;
+          display: grid;
+          place-items: center;
+          border-radius: 8px;
+          border: 1px dashed rgba(148, 163, 184, 0.28);
+          background: rgba(15, 23, 42, 0.38);
+          padding: 24px;
+          text-align: center;
+        }
+
+        .empty-state strong {
+          display: block;
+          margin-bottom: 8px;
+        }
+
+        .report-empty {
+          min-height: 260px;
+        }
+
+        @media (max-width: 1240px) {
+          .workspace-grid,
+          .hero-band {
             grid-template-columns: 1fr;
           }
         }
@@ -950,25 +1298,17 @@ export default function HomePage() {
 
           .field-grid,
           .platform-grid,
-          .insights-panel,
           .meta-grid {
             grid-template-columns: 1fr;
           }
 
           .panel-header,
-          .topbar,
           .preview-header,
           .preview-card-header,
-          .control-group {
+          .control-group,
+          .account-line,
+          .report-card-head {
             display: grid;
-          }
-
-          .tab-row {
-            width: 100%;
-          }
-
-          .tab-row button {
-            flex: 1 1 auto;
           }
 
           .warning-item {
