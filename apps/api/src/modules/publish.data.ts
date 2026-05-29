@@ -1,12 +1,14 @@
 import type { PlatformName, ValidationIssue } from "@mp-publishing/platform-sdk";
 
+export type PlatformAccountHealth = "healthy" | "expiring" | "needs-login";
+
 export type PlatformAccountRecord = {
   id: string;
   platform: PlatformName;
   displayName: string;
   handle: string;
   authMode: "official-api" | "cookie-session" | "hybrid";
-  health: "healthy" | "expiring" | "needs-login";
+  health: PlatformAccountHealth;
   lastCheckedAt: string;
 };
 
@@ -99,3 +101,20 @@ export const platformAccounts: PlatformAccountRecord[] = [
 ];
 
 export const publishTasks: PublishTaskRecord[] = [];
+
+export function findPlatformAccountById(accountId: string) {
+  return platformAccounts.find((account) => account.id === accountId) ?? null;
+}
+
+export function updatePlatformAccount(
+  accountId: string,
+  patch: Partial<PlatformAccountRecord>,
+) {
+  const account = findPlatformAccountById(accountId);
+  if (!account) {
+    return null;
+  }
+
+  Object.assign(account, patch);
+  return account;
+}

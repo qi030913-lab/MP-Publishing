@@ -3,6 +3,7 @@ import { adapterRegistry } from "@mp-publishing/adapter-core";
 import { createDocumentFromInput } from "@mp-publishing/content-model";
 
 import {
+  findPlatformAccountById,
   platformAccounts,
   publishTasks,
   type PlatformAccountRecord,
@@ -32,6 +33,14 @@ export class PublishService {
       level,
       message,
     };
+  }
+
+  private resolveRuntimeAccount(target: PublishTaskTargetRecord) {
+    if (!target.account) {
+      return null;
+    }
+
+    return findPlatformAccountById(target.account.id) ?? target.account;
   }
 
   private summarizeTaskStatus(targets: PublishTaskTargetRecord[]): PublishTaskRecord["status"] {
@@ -73,6 +82,8 @@ export class PublishService {
     let changed = false;
 
     task.targets.forEach((target) => {
+      target.account = this.resolveRuntimeAccount(target);
+
       if (target.status === "queued") {
         target.status = "running";
         target.startedAt = this.createTimestamp();
@@ -183,7 +194,7 @@ export class PublishService {
     const task: PublishTaskRecord = {
       id: `task_${Date.now()}`,
       mode,
-      status: "queued",
+      status: this.summarizeTaskStatus(targets),
       documentTitle: document.title,
       createdAt: taskCreatedAt,
       updatedAt: this.createTimestamp(),
@@ -214,7 +225,7 @@ export class PublishService {
       status: task.status,
       results: task.targets.map((target) => ({
         platform: target.platform,
-        account: target.account,
+        account: this.resolveRuntimeAccount(target),
         ok: target.status === "succeeded",
         screenshots: target.screenshots,
         remoteId: target.remoteId,
@@ -277,6 +288,7 @@ export class PublishService {
     );
 
     targets.forEach((target) => {
+      target.account = this.resolveRuntimeAccount(target);
       target.attemptCount += 1;
       target.status = this.resolveInitialTargetStatus(target.account);
       target.startedAt = undefined;

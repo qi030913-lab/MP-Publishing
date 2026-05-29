@@ -6,12 +6,15 @@ import {
   BookOpen,
   Bot,
   CheckCircle2,
+  CircleAlert,
   Eye,
   History,
   LayoutTemplate,
   ListRestart,
+  LoaderCircle,
   MessageSquare,
   Radio,
+  RefreshCcw,
   ScrollText,
   Send,
   Sparkles,
@@ -100,6 +103,13 @@ type PublishTaskSummary = {
   updatedAt: string;
   targetCount: number;
   issueCount: number;
+};
+
+type AccountSummary = {
+  total: number;
+  healthy: number;
+  expiring: number;
+  needsLogin: number;
 };
 
 const platformMeta: Record<
@@ -204,6 +214,15 @@ function targetStatusLabel(status: TaskResult["status"]) {
   return "待重试";
 }
 
+function taskStatusLabel(status: PublishTaskDetail["status"]) {
+  if (status === "queued") return "排队中";
+  if (status === "running") return "执行中";
+  if (status === "succeeded") return "已完成";
+  if (status === "failed") return "已失败";
+  if (status === "needs_manual_action") return "待人工处理";
+  return "部分完成";
+}
+
 function EmptyPreview() {
   return (
     <div className="empty-state">
@@ -242,6 +261,12 @@ export default function HomePage() {
   const [previewResults, setPreviewResults] = useState<PreviewResult[]>([]);
   const [capabilities, setCapabilities] = useState<PlatformCapability[]>([]);
   const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
+  const [accountSummary, setAccountSummary] = useState<AccountSummary>({
+    total: 0,
+    healthy: 0,
+    expiring: 0,
+    needsLogin: 0,
+  });
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([]);
   const [taskSummaries, setTaskSummaries] = useState<PublishTaskSummary[]>([]);
   const [activeTask, setActiveTask] = useState<PublishTaskDetail | null>(null);
@@ -250,6 +275,7 @@ export default function HomePage() {
   const [isMockPublishLoading, setIsMockPublishLoading] = useState(false);
   const [isTasksLoading, setIsTasksLoading] = useState(false);
   const [isRetryingTaskId, setIsRetryingTaskId] = useState<string | null>(null);
+  const [isAccountActionLoading, setIsAccountActionLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const editor = useEditor({
@@ -293,6 +319,20 @@ export default function HomePage() {
     }
   }
 
+  async function refreshAccounts() {
+    const response = await fetch("http://localhost:3001/accounts");
+    const payload = (await response.json()) as { items: PlatformAccount[]; summary: AccountSummary };
+    setAccounts(payload.items);
+    setAccountSummary(payload.summary);
+    setSelectedAccountIds((current) => {
+      if (current.length === 0) {
+        return payload.items.map((item) => item.id);
+      }
+
+      return current.filter((id) => payload.items.some((item) => item.id === id));
+    });
+  }
+
   useEffect(() => {
     async function bootstrapData() {
       try {
@@ -302,10 +342,14 @@ export default function HomePage() {
         ]);
 
         const platformPayload = (await platformResponse.json()) as { capabilities: PlatformCapability[] };
-        const accountPayload = (await accountResponse.json()) as { items: PlatformAccount[] };
+        const accountPayload = (await accountResponse.json()) as {
+          items: PlatformAccount[];
+          summary: AccountSummary;
+        };
 
         setCapabilities(platformPayload.capabilities);
         setAccounts(accountPayload.items);
+        setAccountSummary(accountPayload.summary);
         setSelectedAccountIds(accountPayload.items.map((item) => item.id));
         await refreshTasks();
       } catch {
@@ -482,6 +526,33 @@ export default function HomePage() {
       setError("重试任务失败，请稍后重试。");
     } finally {
       setIsRetryingTaskId(null);
+    }
+  }
+
+  async function runAccountAction(
+    accountId: string,
+    action: "check" | "refresh" | "mark-needs-login",
+  ) {
+    setIsAccountActionLoading(`${accountId}:${action}`);
+    setError(null);
+
+    try {
+      const response = await fetch(`http://localhost:3001/accounts/${accountId}/${action}`, {
+        method: "POST",
+      });
+
+      if (!response.ok) {
+        throw new Error("account action failed");
+      }
+
+      await refreshAccounts();
+      if (activeTask) {
+        await refreshTasks(activeTask.id);
+      }
+    } catch {
+      setError("账号操作失败，请稍后重试。");
+    } finally {
+      setIsAccountActionLoading(null);
     }
   }
 
@@ -683,8 +754,10 @@ export default function HomePage() {
                 const meta = platformMeta[account.platform];
 
                 return (
-                  <label key={account.id} className={`account-card ${selected ? "selected" : ""}`}>
-                    <input type="checkbox" checked={selected} onChange={() => toggleAccount(account.id)} />
+                  <div key={account.id} className={`account-card ${selected ? "selected" : ""}`}>
+                    <label className="account-selector">
+                      <input type="checkbox" checked={selected} onChange={() => toggleAccount(account.id)} />
+                    </label>
                     <div className="account-copy">
                       <div className="account-line">
                         <strong>{account.displayName}</strong>
@@ -696,8 +769,41 @@ export default function HomePage() {
                         </span>
                         <span>{account.authMode}</span>
                       </div>
+                      <div className="account-actions">
+                        <button
+                          type="button"
+                          className="secondary-button compact-button"
+                          onClick={() => runAccountAction(account.id, "check")}
+                          disabled={isAccountActionLoading === `${account.id}:check`}
+                        >
+                          {isAccountActionLoading === `${account.id}:check` ? <LoaderCircle size={16} /> : <RefreshCcw size={16} />}
+                          检查状态
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary-button compact-button"
+                          onClick={() => runAccountAction(account.id, "refresh")}
+                          disabled={isAccountActionLoading === `${account.id}:refresh`}
+                        >
+                          {isAccountActionLoading === `${account.id}:refresh` ? <LoaderCircle size={16} /> : <CheckCircle2 size={16} />}
+                          恢复凭证
+                        </button>
+                        <button
+                          type="button"
+                          className="secondary-button compact-button danger-button"
+                          onClick={() => runAccountAction(account.id, "mark-needs-login")}
+                          disabled={isAccountActionLoading === `${account.id}:mark-needs-login`}
+                        >
+                          {isAccountActionLoading === `${account.id}:mark-needs-login` ? (
+                            <LoaderCircle size={16} />
+                          ) : (
+                            <CircleAlert size={16} />
+                          )}
+                          标记需登录
+                        </button>
+                      </div>
                     </div>
-                  </label>
+                  </div>
                 );
               })}
             </div>
@@ -813,6 +919,45 @@ export default function HomePage() {
             )}
           </div>
 
+          <div className="panel account-shell">
+            <div className="panel-header">
+              <div>
+                <p className="section-kicker">Step 2.5</p>
+                <h2>账号工作台</h2>
+              </div>
+              <button type="button" className="secondary-button compact-button" onClick={() => void refreshAccounts()}>
+                <RefreshCcw size={16} />
+                刷新账号
+              </button>
+            </div>
+
+            <div className="account-summary-grid">
+              <div className="metric-tile">
+                <span>账号总数</span>
+                <strong>{accountSummary.total}</strong>
+              </div>
+              <div className="metric-tile">
+                <span>健康</span>
+                <strong>{accountSummary.healthy}</strong>
+              </div>
+              <div className="metric-tile">
+                <span>即将过期</span>
+                <strong>{accountSummary.expiring}</strong>
+              </div>
+              <div className="metric-tile">
+                <span>需重新登录</span>
+                <strong>{accountSummary.needsLogin}</strong>
+              </div>
+            </div>
+
+            <div className="warning-list compact">
+              <div className="warning-item info">
+                <span>FLOW</span>
+                <p>先做健康检查，再恢复异常凭证；任务中心里的待人工处理和待重试会自动同步账号状态。</p>
+              </div>
+            </div>
+          </div>
+
           <div className="panel task-shell">
             <div className="panel-header">
               <div>
@@ -835,6 +980,7 @@ export default function HomePage() {
                         activeTask.updatedAt,
                       ).toLocaleString("zh-CN")}
                     </p>
+                    <p>任务状态：{taskStatusLabel(activeTask.status)}</p>
                   </div>
                   <div
                     className={`status-pill ${
@@ -1326,7 +1472,11 @@ export default function HomePage() {
 
         .account-card {
           grid-template-columns: 20px minmax(0, 1fr);
-          cursor: pointer;
+        }
+
+        .account-selector {
+          display: grid;
+          align-items: start;
         }
 
         .account-card.selected,
@@ -1383,11 +1533,20 @@ export default function HomePage() {
         }
 
         .action-row,
-        .task-actions {
+        .task-actions,
+        .account-actions {
           display: flex;
           flex-wrap: wrap;
           gap: 12px;
+        }
+
+        .action-row,
+        .task-actions {
           margin-top: 20px;
+        }
+
+        .account-actions {
+          margin-top: 4px;
         }
 
         .primary-button,
@@ -1413,6 +1572,11 @@ export default function HomePage() {
           border: 1px solid rgba(148, 163, 184, 0.2);
         }
 
+        .danger-button {
+          border-color: rgba(248, 113, 113, 0.22);
+          color: #fecaca;
+        }
+
         .primary-button:disabled,
         .secondary-button:disabled {
           opacity: 0.65;
@@ -1428,8 +1592,16 @@ export default function HomePage() {
         }
 
         .preview-shell,
-        .task-shell {
+        .task-shell,
+        .account-shell {
           min-height: 340px;
+        }
+
+        .account-summary-grid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 12px;
+          margin-top: 22px;
         }
 
         .tab-row {
@@ -1600,7 +1772,8 @@ export default function HomePage() {
 
           .field-grid,
           .platform-grid,
-          .meta-grid {
+          .meta-grid,
+          .account-summary-grid {
             grid-template-columns: 1fr;
           }
 
