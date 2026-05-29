@@ -19,7 +19,11 @@
     "format": "echo adapter-core has no formatter configured yet"
   },
   "dependencies": {
+    "@mp-publishing/adapter-bilibili": "workspace:*",
+    "@mp-publishing/adapter-wechat": "workspace:*",
     "@mp-publishing/adapter-xiaohongshu": "workspace:*",
-    "@mp-publishing/content-model": "workspace:*"
+    "@mp-publishing/adapter-zhihu": "workspace:*",
+    "@mp-publishing/content-model": "workspace:*",
+    "@mp-publishing/platform-sdk": "workspace:*"
   }
 }

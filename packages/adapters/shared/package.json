@@ -1,5 +1,5 @@
 {
-  "name": "@mp-publishing/adapter-xiaohongshu",
+  "name": "@mp-publishing/adapter-shared",
   "version": "0.1.0",
   "private": true,
   "type": "module",
@@ -16,10 +16,10 @@
     "dev": "tsc --project tsconfig.json --watch",
     "lint": "tsc --project tsconfig.json --noEmit",
     "typecheck": "tsc --project tsconfig.json --noEmit",
-    "format": "echo xiaohongshu adapter has no formatter configured yet"
+    "format": "echo adapter-shared has no formatter configured yet"
   },
   "dependencies": {
-    "@mp-publishing/adapter-shared": "workspace:*",
+    "@mp-publishing/content-model": "workspace:*",
     "@mp-publishing/platform-sdk": "workspace:*"
   }
 }

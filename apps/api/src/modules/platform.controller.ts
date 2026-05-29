@@ -9,6 +9,11 @@ import {
 export class PlatformController {
   @Get()
   listPlatforms() {
-    return summarizeCapabilities(adapterRegistry.listCapabilities());
+    const capabilities = adapterRegistry.listCapabilities();
+
+    return {
+      items: summarizeCapabilities(capabilities),
+      capabilities,
+    };
   }
 }

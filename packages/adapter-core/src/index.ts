@@ -1,83 +1,18 @@
 import type { CanonicalDocument } from "@mp-publishing/content-model";
 import { exampleDocument } from "@mp-publishing/content-model";
-
+import type {
+  AdaptOptions,
+  PlatformAdapter,
+  PlatformCapabilities,
+  PlatformDraft,
+  PlatformName,
+} from "@mp-publishing/platform-sdk";
+import { bilibiliAdapter } from "@mp-publishing/adapter-bilibili";
+import { wechatAdapter } from "@mp-publishing/adapter-wechat";
 import { xiaohongshuAdapter } from "@mp-publishing/adapter-xiaohongshu";
+import { zhihuAdapter } from "@mp-publishing/adapter-zhihu";
 
-export type PlatformName = "wechat" | "zhihu" | "bilibili" | "xiaohongshu";
-
-export type PlatformCapabilities = {
-  platform: PlatformName;
-  titleMaxLength?: number;
-  summaryMaxLength?: number;
-  supportedBlocks: string[];
-  supportsHtml: boolean;
-  supportsMarkdown: boolean;
-  supportsHashtags: boolean;
-  supportsScheduling: boolean;
-  publishMode: "official-api" | "automation" | "hybrid";
-};
-
-export type ValidationIssue = {
-  code: string;
-  message: string;
-  severity: "info" | "warning" | "error";
-};
-
-export type AdaptOptions = {
-  toneMode: "keep" | "platform-optimized";
-  preserveOriginal: boolean;
-};
-
-export type PlatformDraft = {
-  platform: PlatformName;
-  title: string;
-  summary?: string;
-  body: string;
-  hashtags: string[];
-  warnings: ValidationIssue[];
-};
-
-export type PublishInput = {
-  accountId: string;
-  document: CanonicalDocument;
-  dryRun?: boolean;
-};
-
-export type SimulationResult = {
-  ok: boolean;
-  screenshots: string[];
-  issues: ValidationIssue[];
-};
-
-export type PublishResult = {
-  ok: boolean;
-  remoteId?: string;
-  url?: string;
-  issues: ValidationIssue[];
-};
-
-export type PublishStatus = {
-  state:
-    | "draft"
-    | "adapting"
-    | "ready"
-    | "publishing"
-    | "partially_succeeded"
-    | "succeeded"
-    | "failed"
-    | "needs_manual_action";
-  detail?: string;
-};
-
-export interface PlatformAdapter {
-  platform: PlatformName;
-  getCapabilities(): PlatformCapabilities;
-  validate(document: CanonicalDocument): Promise<ValidationIssue[]>;
-  adapt(document: CanonicalDocument, options: AdaptOptions): Promise<PlatformDraft>;
-  simulatePublish(input: PublishInput): Promise<SimulationResult>;
-  publish(input: PublishInput): Promise<PublishResult>;
-  getPublishStatus?(remoteId: string): Promise<PublishStatus>;
-}
+export type { AdaptOptions, PlatformCapabilities, PlatformDraft, PlatformName } from "@mp-publishing/platform-sdk";
 
 export class AdapterRegistry {
   private readonly adapters = new Map<PlatformName, PlatformAdapter>();
@@ -97,10 +32,23 @@ export class AdapterRegistry {
   listCapabilities(): PlatformCapabilities[] {
     return Array.from(this.adapters.values()).map((adapter) => adapter.getCapabilities());
   }
+
+  async adaptDocument(
+    document: CanonicalDocument,
+    options: AdaptOptions,
+    platforms?: PlatformName[],
+  ): Promise<PlatformDraft[]> {
+    const targets = platforms && platforms.length > 0 ? platforms : Array.from(this.adapters.keys());
+
+    return Promise.all(targets.map((platform) => this.get(platform).adapt(document, options)));
+  }
 }
 
 export const adapterRegistry = new AdapterRegistry();
 
+adapterRegistry.register(wechatAdapter);
+adapterRegistry.register(zhihuAdapter);
+adapterRegistry.register(bilibiliAdapter);
 adapterRegistry.register(xiaohongshuAdapter);
 
 export function summarizeCapabilities(capabilities: PlatformCapabilities[]) {
@@ -111,7 +59,7 @@ export function summarizeCapabilities(capabilities: PlatformCapabilities[]) {
 }
 
 export async function buildPreviewSample() {
-  return xiaohongshuAdapter.adapt(exampleDocument, {
+  return adapterRegistry.adaptDocument(exampleDocument, {
     toneMode: "platform-optimized",
     preserveOriginal: false,
   });

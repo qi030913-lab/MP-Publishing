@@ -10,8 +10,11 @@
     "format": "echo web has no formatter configured yet"
   },
   "dependencies": {
+    "@tiptap/react": "^3.23.6",
+    "@tiptap/starter-kit": "^3.23.6",
     "@mp-publishing/adapter-core": "workspace:*",
     "@mp-publishing/content-model": "workspace:*",
+    "lucide-react": "^0.511.0",
     "next": "^16.2.6",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
