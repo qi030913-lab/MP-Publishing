@@ -48,9 +48,22 @@ function connectorLabel(status: RuntimeStatus["draftConnector"]["status"]) {
 
 const connectorDraftPlatforms = new Set<PlatformName>(["zhihu", "bilibili", "xiaohongshu"]);
 
-function isConnectorDraftReady(platform: PlatformName, runtime: RuntimeStatus | null) {
+type DraftConnectorPlatformRuntime = RuntimeStatus["draftConnector"]["platforms"][number];
+
+function getCredentialReadinessIssue(
+  platformStatus: DraftConnectorPlatformRuntime | undefined,
+  account: PlatformAccount | undefined,
+) {
+  if (!platformStatus?.draftCredentialRequired || account?.credentialStatus === "configured") {
+    return null;
+  }
+
+  return `Set credentials for ${account?.credentialRef ?? platformLabel(platformStatus.platform)} before creating a credentialed ${platformStatus.platform} draft.`;
+}
+
+function isConnectorDraftReady(platform: PlatformName, runtime: RuntimeStatus | null, account?: PlatformAccount) {
   const platformStatus = runtime?.draftConnector.platforms.find((item) => item.platform === platform);
-  return platformStatus?.draftReady === true;
+  return platformStatus?.draftReady === true && !getCredentialReadinessIssue(platformStatus, account);
 }
 
 export default function PublishPage() {
@@ -81,9 +94,10 @@ export default function PublishPage() {
 
   const readyConnectorDraftPlatforms = useMemo(
     () =>
-      selectedConnectorDraftPlatforms.filter(
-        (platform) => accountsByPlatform.has(platform) && isConnectorDraftReady(platform, runtime),
-      ),
+      selectedConnectorDraftPlatforms.filter((platform) => {
+        const account = accountsByPlatform.get(platform);
+        return Boolean(account && isConnectorDraftReady(platform, runtime, account));
+      }),
     [accountsByPlatform, runtime, selectedConnectorDraftPlatforms],
   );
 
@@ -142,10 +156,10 @@ export default function PublishPage() {
     }
 
     const realDraftPlatforms = draft.platforms.filter(
-      (platform) =>
-        connectorDraftPlatforms.has(platform) &&
-        selectedAccounts.some((account) => account.platform === platform) &&
-        isConnectorDraftReady(platform, runtime),
+      (platform) => {
+        const account = selectedAccounts.find((item) => item.platform === platform);
+        return connectorDraftPlatforms.has(platform) && Boolean(account && isConnectorDraftReady(platform, runtime, account));
+      },
     );
     const realDraftAccountIds = selectedAccounts
       .filter((account) => realDraftPlatforms.includes(account.platform))
@@ -242,7 +256,13 @@ export default function PublishPage() {
               </div>
               <div className="issue-list">
                 {runtime?.draftConnector.platforms.map((platformStatus) => {
-                  const connectorReady = isConnectorDraftReady(platformStatus.platform, runtime);
+                  const account = accountsByPlatform.get(platformStatus.platform);
+                  const credentialReadinessIssue = getCredentialReadinessIssue(platformStatus, account);
+                  const readinessMessages = [
+                    ...platformStatus.draftReadinessIssues.map((issue) => issue.message),
+                    ...(credentialReadinessIssue ? [credentialReadinessIssue] : []),
+                  ];
+                  const connectorReady = isConnectorDraftReady(platformStatus.platform, runtime, account);
 
                   return (
                     <div key={platformStatus.platform} className={connectorReady ? "issue-item info" : "issue-item warning"}>
@@ -253,6 +273,7 @@ export default function PublishPage() {
                           {connectorReady ? "可创建连接器草稿" : "暂不可创建连接器草稿"} /{" "}
                           {platformStatus.realPublishEnabled ? "真实草稿已启用" : "真实草稿未启用"} /{" "}
                           {platformStatus.draftEndpoint ? "draft endpoint 已配置" : "缺少 draft endpoint"}
+                          {platformStatus.draftCredentialRequired ? " / 需要凭证转发" : ""}
                           {platformStatus.statusEndpoint ? " / status endpoint 已配置" : ""}
                           {platformStatus.upstreamDraftEndpointConfigured !== undefined ? (
                             <>
@@ -262,9 +283,9 @@ export default function PublishPage() {
                             </>
                           ) : null}
                         </p>
-                        {!connectorReady && platformStatus.draftReadinessIssues.length > 0 ? (
+                        {!connectorReady && readinessMessages.length > 0 ? (
                           <p className="page-description">
-                            Action: {platformStatus.draftReadinessIssues.map((issue) => issue.message).join(" ")}
+                            Action: {readinessMessages.join(" ")}
                           </p>
                         ) : null}
                       </div>

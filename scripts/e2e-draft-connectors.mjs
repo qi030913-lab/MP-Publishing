@@ -530,6 +530,7 @@ async function runLocalDraftEnablementCheck() {
         return (
           !platformStatus?.realPublishEnabled ||
           !platformStatus.draftReady ||
+          platformStatus.draftCredentialRequired ||
           !Array.isArray(platformStatus.draftReadinessIssues) ||
           platformStatus.draftReadinessIssues.length > 0 ||
           platformStatus.draftEndpoint !== `${connectorBaseUrl}/${platform}/drafts`
@@ -828,6 +829,15 @@ async function runCredentialPreflightCheck() {
       runtimeAfterRetry.queue.failed > 0
     ) {
       throw new Error(`Credential preflight retry should not enqueue work: ${JSON.stringify(runtimeAfterRetry.queue)}`);
+    }
+
+    if (
+      platforms.some((platform) => {
+        const platformStatus = runtimeAfterRetry.draftConnector.platforms.find((item) => item.platform === platform);
+        return platformStatus?.draftCredentialRequired !== true || platformStatus?.draftReady !== false;
+      })
+    ) {
+      throw new Error(`Credential preflight runtime should expose credential requirements: ${JSON.stringify(runtimeAfterRetry.draftConnector)}`);
     }
 
     return {

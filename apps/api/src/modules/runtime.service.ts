@@ -8,6 +8,7 @@ type DraftConnectorPlatformStatus = {
   platform: PlatformName;
   realPublishEnabled: boolean;
   draftReady: boolean;
+  draftCredentialRequired: boolean;
   draftReadinessIssues: ValidationIssue[];
   draftEndpoint?: string;
   statusEndpoint?: string;
@@ -225,7 +226,7 @@ function resolveDraftReadiness(
   if (
     upstreamStatus?.draftEndpointConfigured &&
     upstreamStatus.credentialForwardingEnabled &&
-    !isEnabled(`${envPrefix}_DRAFT_INCLUDE_CREDENTIAL`)
+    !platformStatus.draftCredentialRequired
   ) {
     issues.push(
       createReadinessIssue(
@@ -248,6 +249,7 @@ export class RuntimeService {
       platform,
       realPublishEnabled: isEnabled(`${envPrefix}_REAL_PUBLISH_ENABLED`),
       draftReady: false,
+      draftCredentialRequired: isEnabled(`${envPrefix}_DRAFT_INCLUDE_CREDENTIAL`),
       draftReadinessIssues: [],
       draftEndpoint: resolveConnectorEndpoint(envPrefix, platform, "drafts"),
       statusEndpoint: resolveConnectorEndpoint(envPrefix, platform, "status"),

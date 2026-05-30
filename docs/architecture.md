@@ -461,7 +461,7 @@ packages/
 - `/publish/real` 默认受环境开关保护；公众号走微信服务端草稿 API，知乎 / B站 / 小红书走可配置 draft connector
 - `/publish/real` 和真实草稿重试都会对知乎 / B站 / 小红书执行连接器预检；未启用真实草稿、缺少 draft endpoint、本地连接器离线或已声明 upstream health endpoint 但上游草稿服务离线时不会入队执行
 - `/publish/tasks/:taskId/sync` 当前支持公众号 `freepublish/get`、各平台可选 `*_STATUS_ENDPOINT`，以及本地 draft connector 可选 upstream status endpoint 手动状态同步；显式本地 `/:platform/drafts` endpoint 会自动推导同源 `/:platform/status`；当连接器 status 上游离线或凭证转发配置不一致时会提前转待人工处理
-- `/runtime/status` 会同时返回 worker/queue/task 统计和 draft connector 就绪状态，并为每个平台给出 `draftReady` 和 readiness issue codes，用于发布页提示知乎 / B站 / 小红书草稿连接器是否在线、各平台真实草稿是否可创建
+- `/runtime/status` 会同时返回 worker/queue/task 统计和 draft connector 就绪状态，并为每个平台给出 `draftReady`、凭证转发要求和 readiness issue codes，用于发布页提示知乎 / B站 / 小红书草稿连接器是否在线、各平台真实草稿是否可创建
 - `/accounts/*` 操作 Prisma 中的 demo 账号健康状态，不是真实平台授权
 - `/runtime/status` 用于前端任务中心展示 worker 心跳和队列统计
 

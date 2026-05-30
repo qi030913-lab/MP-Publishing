@@ -175,6 +175,7 @@ export type RuntimeStatus = {
       platform: PlatformName;
       realPublishEnabled: boolean;
       draftReady: boolean;
+      draftCredentialRequired: boolean;
       draftReadinessIssues: Array<{
         code: string;
         message: string;
