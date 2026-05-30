@@ -1293,6 +1293,161 @@ export const chromium = {
   }
 }
 
+async function runDraftPlaywrightSessionCaptureCheck() {
+  const captureDir = path.join(runtimeDir, `draft-playwright-session-capture-e2e-${Date.now()}`);
+  const fakePlaywrightPath = path.join(captureDir, "fake-playwright.mjs");
+  const operationLogPath = path.join(captureDir, "operations.json");
+  const sessionPath = path.join(captureDir, "zhihu-storage-state.json");
+  const targetEnvPath = path.join(captureDir, ".env.capture");
+  const selectorsPath = path.join(captureDir, "zhihu-selectors.json");
+  fs.rmSync(captureDir, { recursive: true, force: true });
+  fs.mkdirSync(captureDir, { recursive: true });
+  fs.writeFileSync(selectorsPath, JSON.stringify({ title: "#title", body: "#body" }, null, 2), "utf8");
+  fs.writeFileSync(
+    fakePlaywrightPath,
+    `
+import fs from "node:fs";
+
+const logPath = process.env.FAKE_PLAYWRIGHT_LOG_PATH;
+const operations = [];
+let currentUrl = "";
+
+function log(entry) {
+  operations.push(entry);
+  fs.writeFileSync(logPath, JSON.stringify(operations, null, 2), "utf8");
+}
+
+function locator(selector) {
+  return {
+    async waitFor(options) {
+      log({ action: "waitFor", selector, timeout: options?.timeout });
+    },
+  };
+}
+
+export const chromium = {
+  async launch(options) {
+    log({ action: "launch", headless: options?.headless, channel: options?.channel });
+    return {
+      async newContext(options) {
+        log({ action: "newContext", hasStorageState: Boolean(options?.storageState) });
+        return {
+          async addCookies(cookies) {
+            log({ action: "addCookies", names: cookies.map((cookie) => cookie.name) });
+          },
+          async storageState(options) {
+            log({ action: "storageState", path: options?.path });
+            fs.writeFileSync(options.path, JSON.stringify({ cookies: [{ name: "captured", value: "redacted" }], origins: [] }, null, 2), "utf8");
+          },
+          async newPage() {
+            log({ action: "newPage" });
+            return {
+              setDefaultTimeout(timeout) {
+                log({ action: "setDefaultTimeout", timeout });
+              },
+              async goto(url, options) {
+                currentUrl = url + "?captured=1";
+                log({ action: "goto", url, waitUntil: options?.waitUntil, timeout: options?.timeout });
+              },
+              locator,
+              url() {
+                return currentUrl;
+              },
+            };
+          },
+        };
+      },
+      async close() {
+        log({ action: "close" });
+      },
+    };
+  },
+};
+`.trim(),
+    "utf8",
+  );
+
+  try {
+    const command = await runNodeCommand(
+      "draft playwright session capture",
+      [
+        path.join(root, "scripts/capture-draft-playwright-session.mjs"),
+        "--platform",
+        "zhihu",
+        "--url",
+        "https://creator.zhihu.example.test/drafts/new",
+        "--output",
+        sessionPath,
+        "--wait-for-selector",
+        "#account-menu",
+        "--timeout-ms",
+        "1357",
+        "--headless",
+        "--save-env",
+        "--target-env-file",
+        targetEnvPath,
+        "--selectors-path",
+        selectorsPath,
+      ],
+      {
+        DRAFT_AUTOMATION_PLAYWRIGHT_MODULE: pathToFileURL(fakePlaywrightPath).href,
+        DRAFT_AUTOMATION_PLAYWRIGHT_BROWSER_CHANNEL: "chrome",
+        DRAFT_AUTOMATION_ZHIHU_COOKIES: "SESSION=zhihu-capture-secret",
+        DRAFT_AUTOMATION_ZHIHU_STORAGE_STATE_JSON: "{\"cookies\":[],\"origins\":[]}",
+        FAKE_PLAYWRIGHT_LOG_PATH: operationLogPath,
+      },
+    );
+    const result = JSON.parse(command.stdout);
+    const operations = JSON.parse(fs.readFileSync(operationLogPath, "utf8"));
+    const envContent = fs.readFileSync(targetEnvPath, "utf8");
+    const sessionContent = JSON.parse(fs.readFileSync(sessionPath, "utf8"));
+    const relativeSessionPath = path.relative(root, sessionPath).replaceAll("\\", "/");
+    const relativeSelectorsPath = path.relative(root, selectorsPath).replaceAll("\\", "/");
+
+    if (
+      result.ok !== true ||
+      result.platform !== "zhihu" ||
+      result.savedEnv !== true ||
+      result.hasInitialStorageState !== true ||
+      result.hasCookieSeed !== true ||
+      result.waitedForSelector !== "#account-menu" ||
+      result.headless !== true ||
+      result.finalUrl !== "https://creator.zhihu.example.test/drafts/new?captured=1" ||
+      sessionContent.cookies?.[0]?.name !== "captured" ||
+      !envContent.includes('DRAFT_AUTOMATION_ZHIHU_CREATOR_DRAFT_URL="https://creator.zhihu.example.test/drafts/new"') ||
+      !envContent.includes(`DRAFT_AUTOMATION_ZHIHU_STORAGE_STATE_PATH="${relativeSessionPath}"`) ||
+      !envContent.includes('DRAFT_AUTOMATION_ZHIHU_REQUIRE_SESSION="true"') ||
+      !envContent.includes(`DRAFT_AUTOMATION_ZHIHU_PLAYWRIGHT_SELECTORS_PATH="${relativeSelectorsPath}"`) ||
+      envContent.includes("zhihu-capture-secret") ||
+      !operations.some((item) => item.action === "launch" && item.headless === true && item.channel === "chrome") ||
+      !operations.some((item) => item.action === "newContext" && item.hasStorageState === true) ||
+      !operations.some((item) => item.action === "addCookies" && item.names.includes("SESSION")) ||
+      !operations.some((item) => item.action === "goto" && item.url === "https://creator.zhihu.example.test/drafts/new") ||
+      !operations.some((item) => item.action === "waitFor" && item.selector === "#account-menu" && item.timeout === 1357) ||
+      !operations.some((item) => item.action === "storageState" && item.path === sessionPath)
+    ) {
+      throw new Error(
+        `Draft Playwright session capture did not save session state and env pointers correctly: ${JSON.stringify({
+          result,
+          operations,
+          envContent,
+          sessionContent,
+        })}`,
+      );
+    }
+
+    return {
+      platform: result.platform,
+      savedEnv: result.savedEnv,
+      storageStateCaptured: fs.existsSync(sessionPath),
+      waitedForSelector: result.waitedForSelector,
+      envUpdated: envContent.includes(relativeSessionPath),
+    };
+  } finally {
+    fs.rmSync(captureDir, { recursive: true, force: true });
+  }
+}
+
 async function runDraftPlaywrightHandlerCheck() {
   const automationPort = await getFreePort();
   const automationBaseUrl = `http://127.0.0.1:${automationPort}`;
@@ -4431,6 +4586,7 @@ const upstreamContractCheck = await runUpstreamContractCheckScriptCheck();
 const upstreamSandboxCheck = await runUpstreamSandboxScriptCheck();
 const draftAutomationServiceCheck = await runDraftAutomationServiceScriptCheck();
 const draftAutomationDirectUpstreamCheck = await runDraftAutomationDirectUpstreamCheck();
+const draftPlaywrightSessionCaptureCheck = await runDraftPlaywrightSessionCaptureCheck();
 const draftPlaywrightSetupCheck = await runDraftPlaywrightSetupCheckScriptCheck();
 const draftPlaywrightHandlerCheck = await runDraftPlaywrightHandlerCheck();
 const upstreamSandboxCallback = await runUpstreamSandboxCallbackCheck();
@@ -4867,6 +5023,7 @@ try {
     upstreamSandboxCheck,
     draftAutomationServiceCheck,
     draftAutomationDirectUpstreamCheck,
+    draftPlaywrightSessionCaptureCheck,
     draftPlaywrightSetupCheck,
     draftPlaywrightHandlerCheck,
     upstreamSandboxCallback,

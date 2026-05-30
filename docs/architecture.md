@@ -44,6 +44,8 @@
 
 补充：`pnpm drafts:check-playwright -- --platform <platform>` 会复用同一套 Playwright 配置打开创作者草稿页，只检查登录态、必需 selector（title/body）和已配置的可选 selector，并可输出截图；它不会填写字段、不会点击保存草稿，适合在把知乎 / B站 / 小红书真实 selector 接进 automation service 前做页面预演。
 
+补充：`pnpm drafts:capture-playwright-session -- --platform <platform> --url <creator-draft-url> --save-env` 已用于采集真实创作者中心登录态：脚本会打开 Playwright 浏览器供人工完成登录，默认把 storage state 保存到被 git 忽略的 `.runtime/draft-sessions`，并可只把草稿页 URL、storage-state 路径、`REQUIRE_SESSION=true` 和 selector 文件路径写入 `.env`。当前 e2e 已覆盖该捕获脚本的 session 保存、`.env` 指针更新和敏感 cookie 不落盘到 `.env` 的约束。
+
 ## 1. 目标
 
 面向公众号、知乎、B站、小红书等内容平台，提供一个统一的创作与发布工具，解决以下问题：
