@@ -9,6 +9,9 @@ Options:
   --sandbox-base-url <url>         Defaults to DRAFT_UPSTREAM_SANDBOX_BASE_URL or http://127.0.0.1:3020.
   --api-key <key>                  Optional upstream sandbox bearer token.
   --platform <platforms>           Comma-separated subset: zhihu,bilibili,xiaohongshu.
+  --automation-endpoint <url>      POST each full work order to this automation/API endpoint before completion.
+  --automation-api-key <key>       Optional bearer token for --automation-endpoint.
+  --require-automation             Fail if a pending work order has no automation endpoint configured.
   --external-base-url <url>        Defaults to DRAFT_WORK_ORDER_EXTERNAL_BASE_URL or https://creator.example.test.
   --external-id-prefix <prefix>    Optional prefix for generated creator-center draft ids.
   --completed-by <value>           Defaults to DRAFT_WORK_ORDER_COMPLETED_BY or draft-work-order-runner.
@@ -16,7 +19,12 @@ Options:
   --poll-interval-ms <ms>          Continuous mode delay; defaults to 3000.
   --include-completed              Re-run already completed work orders.
   --once                           Run once and print a JSON summary.
-  --help`;
+  --help
+
+Environment:
+  DRAFT_WORK_ORDER_AUTOMATION_ENDPOINT or DRAFT_WORK_ORDER_<PLATFORM>_AUTOMATION_ENDPOINT
+  can point this runner at a real Playwright/official-API worker. Without one, the runner
+  keeps using generated creator-center draft links for sandbox rehearsal.`;
 
 function parseArgs(argv) {
   const parsed = {};
@@ -88,13 +96,13 @@ function parseNonNegativeInteger(value, label) {
   return parsed;
 }
 
-function normalizeState(value) {
+function normalizeState(value, label = "--state") {
   const state = String(value ?? "").trim();
   if (["draft", "publishing", "ready", "succeeded", "failed", "needs_manual_action"].includes(state)) {
     return state;
   }
 
-  throw new Error("--state must be one of draft, publishing, ready, succeeded, failed, needs_manual_action.");
+  throw new Error(`${label} must be one of draft, publishing, ready, succeeded, failed, needs_manual_action.`);
 }
 
 function normalizeHttpBaseUrl(value, label) {
@@ -104,6 +112,14 @@ function normalizeHttpBaseUrl(value, label) {
   }
 
   return url.toString().replace(/\/+$/, "");
+}
+
+function normalizeOptionalHttpUrl(value, label) {
+  return value ? normalizeHttpBaseUrl(value, label) : undefined;
+}
+
+function readOptionalString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function sanitizeSegment(value) {
@@ -129,6 +145,34 @@ function parsePlatforms(value) {
   }
 
   return platforms;
+}
+
+function readPlatformAutomationEndpoints(args) {
+  const entries = [];
+  for (const platform of supportedPlatforms) {
+    const optionName = `${platform}-automation-endpoint`;
+    const envName = `DRAFT_WORK_ORDER_${platform.toUpperCase()}_AUTOMATION_ENDPOINT`;
+    const value = readOption(args, optionName, [envName]);
+    if (value) {
+      entries.push([platform, normalizeHttpBaseUrl(value, `--${optionName}`)]);
+    }
+  }
+
+  return new Map(entries);
+}
+
+function readPlatformAutomationApiKeys(args) {
+  const entries = [];
+  for (const platform of supportedPlatforms) {
+    const optionName = `${platform}-automation-api-key`;
+    const envName = `DRAFT_WORK_ORDER_${platform.toUpperCase()}_AUTOMATION_API_KEY`;
+    const value = readOption(args, optionName, [envName]);
+    if (value) {
+      entries.push([platform, value]);
+    }
+  }
+
+  return new Map(entries);
 }
 
 async function requestJson(label, url, { method = "GET", apiKey, body } = {}) {
@@ -174,7 +218,84 @@ function createExternalDraftUrl(externalBaseUrl, platform, externalDraftId) {
   return `${externalBaseUrl}/${platform}/drafts/${externalDraftId}`;
 }
 
-async function completeWorkOrder({ sandboxBaseUrl, apiKey, workOrder, externalBaseUrl, externalIdPrefix, completedBy, state }) {
+function resolveAutomationEndpoint(platform, options) {
+  return options.platformAutomationEndpoints.get(platform) ?? options.automationEndpoint;
+}
+
+function resolveAutomationApiKey(platform, options) {
+  return options.platformAutomationApiKeys.get(platform) ?? options.automationApiKey;
+}
+
+function createGeneratedDraftResult(workOrder, { externalBaseUrl, externalIdPrefix, completedBy, state }) {
+  const externalDraftId = createExternalDraftId(workOrder, externalIdPrefix);
+  const externalUrl = createExternalDraftUrl(externalBaseUrl, workOrder.platform, externalDraftId);
+  return {
+    source: "generated",
+    externalDraftId,
+    externalUrl,
+    state,
+    detail: `${workOrder.platform} creator-center draft completed by ${completedBy}.`,
+  };
+}
+
+async function createAutomationDraftResult(fullWorkOrder, options) {
+  const endpoint = resolveAutomationEndpoint(fullWorkOrder.platform, options);
+  if (!endpoint) {
+    if (options.requireAutomation) {
+      throw new Error(
+        `${fullWorkOrder.platform} work order ${fullWorkOrder.remoteId} has no automation endpoint. Set --automation-endpoint or DRAFT_WORK_ORDER_${fullWorkOrder.platform.toUpperCase()}_AUTOMATION_ENDPOINT.`,
+      );
+    }
+
+    return createGeneratedDraftResult(fullWorkOrder, options);
+  }
+
+  const payload = await requestJson(`Run ${fullWorkOrder.platform} automation`, endpoint, {
+    method: "POST",
+    apiKey: resolveAutomationApiKey(fullWorkOrder.platform, options),
+    body: {
+      platform: fullWorkOrder.platform,
+      accountId: fullWorkOrder.accountId,
+      workOrder: fullWorkOrder,
+      requestedAt: new Date().toISOString(),
+      runner: {
+        completedBy: options.completedBy,
+        safeMode: true,
+      },
+    },
+  });
+
+  if (payload.ok === false) {
+    throw new Error(
+      `${fullWorkOrder.platform} automation rejected work order ${fullWorkOrder.remoteId}: ${readOptionalString(payload.detail) ?? readOptionalString(payload.message) ?? "no detail"}`,
+    );
+  }
+
+  const externalDraftId =
+    readOptionalString(payload.externalDraftId) ?? readOptionalString(payload.remoteId) ?? readOptionalString(payload.draftId);
+  const externalUrl = readOptionalString(payload.externalUrl) ?? readOptionalString(payload.url);
+  if (!externalDraftId || !externalUrl) {
+    throw new Error(
+      `${fullWorkOrder.platform} automation response for ${fullWorkOrder.remoteId} must include remoteId/externalDraftId and url/externalUrl.`,
+    );
+  }
+
+  return {
+    source: "automation",
+    automationEndpoint: endpoint,
+    externalDraftId,
+    externalUrl,
+    state: normalizeState(payload.state ?? options.state, "automation response state"),
+    detail:
+      readOptionalString(payload.detail) ??
+      readOptionalString(payload.message) ??
+      `${fullWorkOrder.platform} creator-center draft completed by ${options.completedBy}.`,
+    issues: Array.isArray(payload.issues) ? payload.issues : [],
+  };
+}
+
+async function completeWorkOrder(options) {
+  const { sandboxBaseUrl, apiKey, workOrder, completedBy } = options;
   const detail = await requestJson(
     `Read ${workOrder.platform} work order ${workOrder.remoteId}`,
     `${sandboxBaseUrl}/${workOrder.platform}/work-orders/${workOrder.remoteId}`,
@@ -185,8 +306,7 @@ async function completeWorkOrder({ sandboxBaseUrl, apiKey, workOrder, externalBa
     throw new Error(`${workOrder.platform} work order ${workOrder.remoteId} does not include the save-draft checklist item.`);
   }
 
-  const externalDraftId = createExternalDraftId(workOrder, externalIdPrefix);
-  const externalUrl = createExternalDraftUrl(externalBaseUrl, workOrder.platform, externalDraftId);
+  const draftResult = await createAutomationDraftResult(fullWorkOrder, options);
   const completion = await requestJson(
     `Complete ${workOrder.platform} work order ${workOrder.remoteId}`,
     `${sandboxBaseUrl}/${workOrder.platform}/work-orders/${workOrder.remoteId}/complete`,
@@ -194,11 +314,12 @@ async function completeWorkOrder({ sandboxBaseUrl, apiKey, workOrder, externalBa
       method: "POST",
       apiKey,
       body: {
-        remoteId: externalDraftId,
-        url: externalUrl,
-        state,
+        remoteId: draftResult.externalDraftId,
+        url: draftResult.externalUrl,
+        state: draftResult.state,
         completedBy,
-        detail: `${workOrder.platform} creator-center draft completed by ${completedBy}.`,
+        detail: draftResult.detail,
+        ...(draftResult.issues?.length ? { issues: draftResult.issues } : {}),
       },
     },
   );
@@ -206,8 +327,10 @@ async function completeWorkOrder({ sandboxBaseUrl, apiKey, workOrder, externalBa
   return {
     platform: workOrder.platform,
     workOrderId: workOrder.remoteId,
-    externalDraftId,
-    externalUrl,
+    source: draftResult.source,
+    ...(draftResult.automationEndpoint ? { automationEndpoint: draftResult.automationEndpoint } : {}),
+    externalDraftId: draftResult.externalDraftId,
+    externalUrl: draftResult.externalUrl,
     state: completion.state,
     callbackStatus: completion.callback?.status,
     callbackOk: completion.callback?.ok,
@@ -247,6 +370,14 @@ async function main() {
     ),
     apiKey: readOption(args, "api-key", ["DRAFT_UPSTREAM_SANDBOX_API_KEY"]),
     platforms: parsePlatforms(readOption(args, "platform", ["DRAFT_WORK_ORDER_PLATFORMS"])),
+    automationEndpoint: normalizeOptionalHttpUrl(
+      readOption(args, "automation-endpoint", ["DRAFT_WORK_ORDER_AUTOMATION_ENDPOINT"]),
+      "--automation-endpoint",
+    ),
+    platformAutomationEndpoints: readPlatformAutomationEndpoints(args),
+    automationApiKey: readOption(args, "automation-api-key", ["DRAFT_WORK_ORDER_AUTOMATION_API_KEY"]),
+    platformAutomationApiKeys: readPlatformAutomationApiKeys(args),
+    requireAutomation: readBoolean(args, "require-automation", ["DRAFT_WORK_ORDER_REQUIRE_AUTOMATION"]),
     externalBaseUrl: normalizeHttpBaseUrl(
       readOption(args, "external-base-url", ["DRAFT_WORK_ORDER_EXTERNAL_BASE_URL"]) ?? "https://creator.example.test",
       "--external-base-url",

@@ -310,6 +310,86 @@ async function startFakeUpstreamDraftService(port, expectedApiKey, options = {})
   };
 }
 
+async function startFakeWorkOrderAutomationService(port, expectedApiKey) {
+  const requests = [];
+  const baseUrl = `http://127.0.0.1:${port}`;
+
+  const server = createServer((request, response) => {
+    void (async () => {
+      const pathname = new URL(request.url ?? "/", baseUrl).pathname;
+      if (request.method !== "POST" || pathname !== "/drafts") {
+        response.writeHead(404, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: false, message: "automation route not found" }));
+        return;
+      }
+
+      if (request.headers.authorization !== `Bearer ${expectedApiKey}`) {
+        response.writeHead(401, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: false, message: "automation api key is invalid" }));
+        return;
+      }
+
+      const payload = await readRequestJson(request);
+      const workOrder = payload.workOrder;
+      const platform = workOrder?.platform;
+      const checklist = Array.isArray(workOrder?.checklist) ? workOrder.checklist : [];
+      const saveDraft = checklist.find((item) => item.id === "save-draft");
+      if (
+        !["zhihu", "bilibili", "xiaohongshu"].includes(platform) ||
+        payload.platform !== platform ||
+        payload.accountId !== workOrder?.accountId ||
+        workOrder?.version !== "draft-upstream-work-order-v1" ||
+        !workOrder?.draft?.title ||
+        !workOrder?.draft?.renderedBody ||
+        !workOrder?.connector?.statusCallbackUrl ||
+        !workOrder?.callbackPayloadTemplate ||
+        !saveDraft?.required ||
+        workOrder?.automation?.safeMode !== true ||
+        payload.runner?.safeMode !== true
+      ) {
+        response.writeHead(422, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: false, message: "automation payload is missing work-order data" }));
+        return;
+      }
+
+      const remoteId = `${platform}-automation-draft-${workOrder.remoteId}`;
+      const url = `https://automation.example.test/${platform}/drafts/${remoteId}`;
+      requests.push({
+        platform,
+        remoteId,
+        url,
+        workOrderRemoteId: workOrder.remoteId,
+        title: workOrder.draft.title,
+        completedBy: payload.runner.completedBy,
+        callbackUrl: workOrder.connector.statusCallbackUrl,
+      });
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          ok: true,
+          remoteId,
+          url,
+          state: "ready",
+          detail: `${platform} draft saved by fake automation.`,
+        }),
+      );
+    })();
+  });
+
+  server.listen(port, "127.0.0.1");
+  await once(server, "listening");
+
+  return {
+    baseUrl,
+    requests,
+    async close() {
+      await new Promise((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    },
+  };
+}
+
 function ensureBuildOutput() {
   for (const filePath of ["apps/api/dist/main.js", "apps/worker/dist/main.js", "apps/draft-connector/dist/main.js"]) {
     if (!fs.existsSync(path.join(root, filePath))) {
@@ -796,6 +876,7 @@ async function runUpstreamSandboxCallbackCheck() {
   const apiPort = await getFreePort();
   const connectorPort = await getFreePort();
   const sandboxPort = await getFreePort();
+  const automationPort = await getFreePort();
   const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
   const sandboxBaseUrl = `http://127.0.0.1:${sandboxPort}`;
   const queueName = `mp-publishing-draft-upstream-sandbox-callback-e2e-${Date.now()}`;
@@ -804,6 +885,7 @@ async function runUpstreamSandboxCallbackCheck() {
   const connectorApiKey = "draft-secret";
   const connectorCallbackApiKey = "callback-secret";
   const sandboxApiKey = "sandbox-secret";
+  const automation = await startFakeWorkOrderAutomationService(automationPort, "automation-secret");
 
   apiBaseUrl = `http://127.0.0.1:${apiPort}`;
   fs.rmSync(outboxDir, { recursive: true, force: true });
@@ -999,10 +1081,11 @@ async function runUpstreamSandboxCallbackCheck() {
       sandboxBaseUrl,
       "--api-key",
       sandboxApiKey,
-      "--external-base-url",
-      "https://creator.example.test",
-      "--external-id-prefix",
-      created.id,
+      "--automation-endpoint",
+      `${automation.baseUrl}/drafts`,
+      "--automation-api-key",
+      "automation-secret",
+      "--require-automation",
       "--completed-by",
       "e2e-work-order-runner",
       "--once",
@@ -1011,9 +1094,22 @@ async function runUpstreamSandboxCallbackCheck() {
     if (
       !runnerResult.ok ||
       runnerResult.completedCount !== platforms.length ||
-      runnerResult.items?.some((item) => item.callbackStatus !== 200 || !item.callbackOk)
+      runnerResult.items?.some(
+        (item) =>
+          item.source !== "automation" ||
+          item.automationEndpoint !== `${automation.baseUrl}/drafts` ||
+          item.callbackStatus !== 200 ||
+          !item.callbackOk,
+      ) ||
+      automation.requests.length !== platforms.length ||
+      automation.requests.some((request) => request.completedBy !== "e2e-work-order-runner")
     ) {
-      throw new Error(`Draft work-order runner did not complete every sandbox work order: ${JSON.stringify(runnerResult)}`);
+      throw new Error(
+        `Draft work-order runner did not delegate and complete every sandbox work order: ${JSON.stringify({
+          runnerResult,
+          automationRequests: automation.requests,
+        })}`,
+      );
     }
     const workOrderCompletions = runnerResult.items;
 
@@ -1056,7 +1152,7 @@ async function runUpstreamSandboxCallbackCheck() {
         return !target || !completion || target.remoteId !== completion.externalDraftId || target.url !== completion.externalUrl;
       })
     ) {
-      throw new Error(`Work-order completion sync did not expose creator-center draft links: ${JSON.stringify(completedTask)}`);
+      throw new Error(`Work-order completion sync did not expose automation draft links: ${JSON.stringify(completedTask)}`);
     }
 
     return {
@@ -1066,6 +1162,7 @@ async function runUpstreamSandboxCallbackCheck() {
       callbackKeyDraftCreateRejected,
       callbackDrafts,
       workOrderCompletions,
+      automationRequests: automation.requests,
       sandboxCallbacks: sandboxOutbox.items.map((item) => ({
         platform: item.platform,
         remoteId: item.remoteId,
@@ -1073,7 +1170,7 @@ async function runUpstreamSandboxCallbackCheck() {
       })),
     };
   } finally {
-    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector), stopService(sandbox)]);
+    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector), stopService(sandbox), automation.close()]);
     fs.rmSync(outboxDir, { recursive: true, force: true });
     fs.rmSync(sandboxOutboxDir, { recursive: true, force: true });
     apiBaseUrl = previousApiBaseUrl;
