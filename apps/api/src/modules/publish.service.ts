@@ -191,7 +191,7 @@ export class PublishService {
     }
   }
 
-  private async preflightRealDraftTarget(platform: PlatformName) {
+  private async preflightRealDraftTarget(platform: PlatformName, account: PlatformAccountRecord | null) {
     const connectorConfig = draftConnectorPlatforms[platform];
     const issues: ValidationIssue[] = [];
 
@@ -205,6 +205,16 @@ export class PublishService {
         this.createIssue(
           `${platform.toUpperCase()}_REAL_PUBLISH_DISABLED`,
           `Set ${enabledKey}=true before creating a real ${platform} draft.`,
+        ),
+      );
+    }
+
+    const includeCredentialKey = `${connectorConfig.envPrefix}_DRAFT_INCLUDE_CREDENTIAL`;
+    if (isEnabled(includeCredentialKey) && !resolvePlatformCredential(account)) {
+      issues.push(
+        this.createIssue(
+          `${platform.toUpperCase()}_DRAFT_CREDENTIAL_MISSING`,
+          `Set credentials for ${account?.credentialRef ?? platform} or disable ${includeCredentialKey} before creating a credentialed real ${platform} draft.`,
         ),
       );
     }
@@ -312,7 +322,7 @@ export class PublishService {
 
     const targets = await Promise.all(input.platforms.map(async (platform) => {
       const matchedAccount = accounts.find((account) => account.platform === platform) ?? null;
-      const preflightIssues = mode === "real-publish" ? await this.preflightRealDraftTarget(platform) : [];
+      const preflightIssues = mode === "real-publish" ? await this.preflightRealDraftTarget(platform, matchedAccount) : [];
       const initialStatus = this.resolveInitialTargetStatus(matchedAccount);
         const targetStatus =
           initialStatus === "queued" && preflightIssues.length > 0 ? "needs_manual_action" : initialStatus;
@@ -461,7 +471,7 @@ export class PublishService {
       const initialStatus = this.resolveInitialTargetStatus(target.account);
       const preflightIssues =
         refreshedTask.mode === "real-publish" && initialStatus === "queued"
-          ? await this.preflightRealDraftTarget(target.platform)
+          ? await this.preflightRealDraftTarget(target.platform, target.account)
           : [];
       target.status =
         initialStatus === "queued" && preflightIssues.length > 0 ? "needs_manual_action" : initialStatus;

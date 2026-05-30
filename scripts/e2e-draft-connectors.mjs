@@ -685,6 +685,129 @@ async function runDisabledDraftPreflightCheck() {
   }
 }
 
+async function runCredentialPreflightCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const preflightApiPort = await getFreePort();
+  const preflightQueueName = `mp-publishing-draft-credential-preflight-e2e-${Date.now()}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+  apiBaseUrl = `http://127.0.0.1:${preflightApiPort}`;
+  const api = startService("api-draft-credential-preflight", ["apps/api/dist/main.js"], {
+    PORT: String(preflightApiPort),
+    PUBLISH_QUEUE_NAME: preflightQueueName,
+    DRAFT_CONNECTOR_BASE_URL: "",
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    ZHIHU_DRAFT_ENDPOINT: "http://127.0.0.1:9/zhihu/drafts",
+    ZHIHU_DRAFT_INCLUDE_CREDENTIAL: "true",
+    ZHIHU_APP_ID: "",
+    ZHIHU_APP_SECRET: "",
+    ZHIHU_ACCESS_TOKEN: "",
+    ZHIHU_REFRESH_TOKEN: "",
+    ZHIHU_COOKIES: "",
+    ZHIHU_STORAGE_STATE_JSON: "",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_DRAFT_ENDPOINT: "http://127.0.0.1:9/bilibili/drafts",
+    BILIBILI_DRAFT_INCLUDE_CREDENTIAL: "true",
+    BILIBILI_APP_ID: "",
+    BILIBILI_APP_SECRET: "",
+    BILIBILI_ACCESS_TOKEN: "",
+    BILIBILI_REFRESH_TOKEN: "",
+    BILIBILI_COOKIES: "",
+    BILIBILI_STORAGE_STATE_JSON: "",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_DRAFT_ENDPOINT: "http://127.0.0.1:9/xiaohongshu/drafts",
+    XIAOHONGSHU_DRAFT_INCLUDE_CREDENTIAL: "true",
+    XIAOHONGSHU_APP_ID: "",
+    XIAOHONGSHU_APP_SECRET: "",
+    XIAOHONGSHU_ACCESS_TOKEN: "",
+    XIAOHONGSHU_REFRESH_TOKEN: "",
+    XIAOHONGSHU_COOKIES: "",
+    XIAOHONGSHU_STORAGE_STATE_JSON: "",
+  });
+
+  try {
+    await waitForApi(api);
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length || accounts.some((account) => account.credentialStatus !== "missing")) {
+      throw new Error(`Credential preflight accounts should be missing credentials: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "三平台凭证缺失预检验证",
+          summary: "验证开启凭证转发但账号凭证缺失时不会入队真实草稿任务。",
+          body: "这条内容用于确认官方 API 代理需要凭证时，API 会先要求人工补齐凭证，而不是让 worker 进入必然失败的草稿创建。",
+          tags: ["draft", "credential", "preflight", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+
+    if (
+      created.status !== "needs_manual_action" ||
+      platforms.some((platform) => {
+        const target = created.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return target?.status !== "needs_manual_action" || !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_CREDENTIAL_MISSING`);
+      })
+    ) {
+      throw new Error(`Credential preflight did not hold missing credential targets correctly: ${JSON.stringify(created)}`);
+    }
+
+    const retried = await requestJson(`/publish/tasks/${created.id}/retry`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const runtimeAfterRetry = await requestJson("/runtime/status");
+
+    if (
+      retried.status !== "needs_manual_action" ||
+      platforms.some((platform) => {
+        const target = retried.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return target?.status !== "needs_manual_action" || !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_CREDENTIAL_MISSING`);
+      })
+    ) {
+      throw new Error(`Credential preflight retry did not keep targets on manual action: ${JSON.stringify(retried)}`);
+    }
+
+    if (
+      runtimeAfterRetry.queue.waiting > 0 ||
+      runtimeAfterRetry.queue.active > 0 ||
+      runtimeAfterRetry.queue.delayed > 0 ||
+      runtimeAfterRetry.queue.failed > 0
+    ) {
+      throw new Error(`Credential preflight retry should not enqueue work: ${JSON.stringify(runtimeAfterRetry.queue)}`);
+    }
+
+    return {
+      taskId: created.id,
+      status: retried.status,
+      targets: retried.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        attemptCount: target.attemptCount,
+        issueCodes: target.issues.map((issue) => issue.code),
+      })),
+      queue: runtimeAfterRetry.queue,
+    };
+  } finally {
+    await stopService(api);
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runOfflineDraftConnectorPreflightCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -1500,6 +1623,7 @@ const draftConnectorEnv = {
 const workspaceEnvCheck = await runDraftConnectorWorkspaceEnvCheck();
 const localEnablement = await runLocalDraftEnablementCheck();
 const disabledPreflight = await runDisabledDraftPreflightCheck();
+const credentialPreflight = await runCredentialPreflightCheck();
 const offlinePreflight = await runOfflineDraftConnectorPreflightCheck();
 const offlineUpstreamPreflight = await runOfflineUpstreamDraftPreflightCheck();
 const offlineUpstreamRecovery = await runOfflineUpstreamDraftRecoveryCheck();
@@ -1766,6 +1890,7 @@ try {
     workspaceEnvCheck,
     localEnablement,
     disabledPreflight,
+    credentialPreflight,
     offlinePreflight,
     offlineUpstreamPreflight,
     offlineUpstreamRecovery,
