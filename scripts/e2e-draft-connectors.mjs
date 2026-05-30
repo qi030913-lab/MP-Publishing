@@ -362,16 +362,17 @@ async function runDraftConnectorWorkspaceEnvCheck() {
   const upstreamBaseUrl = `http://127.0.0.1:${upstreamPort}`;
   const workspaceEnvDir = path.join(runtimeDir, `draft-connector-workspace-env-e2e-${Date.now()}`);
   const outboxDir = path.join(workspaceEnvDir, "outbox");
+  const connectorCwd = path.join(workspaceEnvDir, "apps", "draft-connector");
   const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
 
   fs.rmSync(workspaceEnvDir, { recursive: true, force: true });
-  fs.mkdirSync(workspaceEnvDir, { recursive: true });
+  fs.mkdirSync(connectorCwd, { recursive: true });
   fs.writeFileSync(path.join(workspaceEnvDir, "pnpm-workspace.yaml"), "packages: []\n");
   fs.writeFileSync(
     path.join(workspaceEnvDir, ".env"),
     [
       `PORT="${connectorPort}"`,
-      `DRAFT_CONNECTOR_OUTBOX_DIR="${outboxDir}"`,
+      `DRAFT_CONNECTOR_OUTBOX_DIR="outbox"`,
       `DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_ENDPOINT="${upstreamBaseUrl}/zhihu/drafts"`,
       `DRAFT_CONNECTOR_ZHIHU_UPSTREAM_HEALTH_ENDPOINT="${upstreamBaseUrl}/health"`,
       `DRAFT_CONNECTOR_ZHIHU_UPSTREAM_STATUS_ENDPOINT="${upstreamBaseUrl}/zhihu/status"`,
@@ -390,7 +391,7 @@ async function runDraftConnectorWorkspaceEnvCheck() {
   const service = startServiceWithEnv(
     "draft-connector-workspace-env",
     [path.join(root, "apps/draft-connector/dist/main.js")],
-    workspaceEnvDir,
+    connectorCwd,
     childEnv,
   );
 

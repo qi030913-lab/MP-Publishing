@@ -161,8 +161,12 @@ function loadWorkspaceEnv() {
 loadWorkspaceEnv();
 
 const port = Number(process.env.PORT ?? 3010);
+function resolveWorkspacePath(value: string) {
+  return path.isAbsolute(value) ? path.resolve(value) : path.resolve(workspaceRoot, value);
+}
+
 const outboxDir = process.env.DRAFT_CONNECTOR_OUTBOX_DIR
-  ? path.resolve(process.env.DRAFT_CONNECTOR_OUTBOX_DIR)
+  ? resolveWorkspacePath(process.env.DRAFT_CONNECTOR_OUTBOX_DIR)
   : path.join(workspaceRoot, ".runtime", "drafts");
 
 function createDraftId(platform: string) {

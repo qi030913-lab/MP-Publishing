@@ -48,6 +48,7 @@ pnpm --filter @mp-publishing/web dev
 
 For local Zhihu, Bilibili, and Xiaohongshu draft publishing, run `pnpm drafts:enable-local` once to turn on the three connector-backed draft targets in `.env`, then run `apps/draft-connector`.
 The draft connector loads the workspace `.env` on startup, so local connector keys, outbox paths, and upstream endpoints can live in the same file as the API and worker settings.
+Relative `DRAFT_CONNECTOR_OUTBOX_DIR` values are resolved from the workspace root, including when the connector is started through `pnpm --filter @mp-publishing/draft-connector dev`.
 With `DRAFT_CONNECTOR_BASE_URL=http://localhost:3010`, per-platform draft and status endpoints are inferred automatically.
 The local connector returns browsable draft detail URLs such as `http://localhost:3010/zhihu/drafts/<id>` and outbox list views at `http://localhost:3010/drafts` or `/:platform/drafts`; set `DRAFT_CONNECTOR_PUBLIC_BASE_URL` when it runs behind a proxy.
 Set `DRAFT_CONNECTOR_<PLATFORM>_UPSTREAM_DRAFT_ENDPOINT` when the local connector should synchronously forward drafts to an official API proxy or creator-center automation service; upstream responses with `remoteId` and `url` are persisted in the outbox and returned to the publish task.
