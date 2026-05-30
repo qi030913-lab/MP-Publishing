@@ -50,19 +50,7 @@ const connectorDraftPlatforms = new Set<PlatformName>(["zhihu", "bilibili", "xia
 
 function isConnectorDraftReady(platform: PlatformName, runtime: RuntimeStatus | null) {
   const platformStatus = runtime?.draftConnector.platforms.find((item) => item.platform === platform);
-  if (!platformStatus?.realPublishEnabled || !platformStatus.draftEndpoint) {
-    return false;
-  }
-
-  if (runtime?.draftConnector.status === "offline" || runtime?.draftConnector.status === "unconfigured") {
-    return false;
-  }
-
-  if (platformStatus.upstreamDraftEndpointConfigured && platformStatus.upstreamDraftStatus === "offline") {
-    return false;
-  }
-
-  return true;
+  return platformStatus?.draftReady === true;
 }
 
 export default function PublishPage() {

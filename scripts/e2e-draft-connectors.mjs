@@ -527,7 +527,11 @@ async function runLocalDraftEnablementCheck() {
       runtime.draftConnector?.status !== "online" ||
       platforms.some((platform) => {
         const platformStatus = runtime.draftConnector.platforms.find((item) => item.platform === platform);
-        return !platformStatus?.realPublishEnabled || platformStatus.draftEndpoint !== `${connectorBaseUrl}/${platform}/drafts`;
+        return (
+          !platformStatus?.realPublishEnabled ||
+          !platformStatus.draftReady ||
+          platformStatus.draftEndpoint !== `${connectorBaseUrl}/${platform}/drafts`
+        );
       })
     ) {
       throw new Error(`Enable-local runtime did not expose ready connector platforms: ${JSON.stringify(runtime.draftConnector)}`);
@@ -961,7 +965,11 @@ async function runExplicitLocalDraftEndpointPreflightCheck() {
     const initialRuntime = await requestJson("/runtime/status");
     if (
       initialRuntime.draftConnector?.status !== "offline" ||
-      initialRuntime.draftConnector?.healthUrl !== `${connectorBaseUrl}/health`
+      initialRuntime.draftConnector?.healthUrl !== `${connectorBaseUrl}/health` ||
+      platforms.some((platform) => {
+        const platformStatus = initialRuntime.draftConnector.platforms.find((item) => item.platform === platform);
+        return platformStatus?.draftReady !== false;
+      })
     ) {
       throw new Error(`Explicit local draft endpoints did not infer connector health: ${JSON.stringify(initialRuntime.draftConnector)}`);
     }
@@ -1104,6 +1112,7 @@ async function runExplicitLocalDraftEndpointStatusSyncCheck() {
       platforms.some((platform) => {
         const platformStatus = initialRuntime.draftConnector.platforms.find((item) => item.platform === platform);
         return (
+          !platformStatus?.draftReady ||
           platformStatus?.draftEndpoint !== `${connectorBaseUrl}/${platform}/drafts` ||
           platformStatus?.statusEndpoint !== `${connectorBaseUrl}/${platform}/status`
         );
@@ -1471,6 +1480,15 @@ async function runOfflineUpstreamDraftPreflightCheck() {
       runtimeAfterRetry.queue.failed > 0
     ) {
       throw new Error(`Offline upstream retry should not enqueue work: ${JSON.stringify(runtimeAfterRetry.queue)}`);
+    }
+
+    if (
+      platforms.some((platform) => {
+        const platformStatus = runtimeAfterRetry.draftConnector.platforms.find((item) => item.platform === platform);
+        return platformStatus?.draftReady !== false || platformStatus?.upstreamDraftStatus !== "offline";
+      })
+    ) {
+      throw new Error(`Offline upstream runtime should mark draft targets as not ready: ${JSON.stringify(runtimeAfterRetry.draftConnector)}`);
     }
 
     return {

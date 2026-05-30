@@ -7,6 +7,7 @@ type DraftConnectorStatus = "online" | "offline" | "configured" | "unconfigured"
 type DraftConnectorPlatformStatus = {
   platform: PlatformName;
   realPublishEnabled: boolean;
+  draftReady: boolean;
   draftEndpoint?: string;
   statusEndpoint?: string;
   upstreamDraftEndpointConfigured?: boolean;
@@ -158,12 +159,33 @@ function inferBaseUrlFromHealthUrl(healthUrl: string | undefined) {
   }
 }
 
+function resolveDraftReady(
+  platformStatus: DraftConnectorPlatformStatus,
+  connectorStatus: DraftConnectorStatus,
+  upstreamStatus?: NonNullable<DraftConnectorHealthPayload["upstreamDrafts"]>[number],
+) {
+  if (!platformStatus.realPublishEnabled || !platformStatus.draftEndpoint) {
+    return false;
+  }
+
+  if (connectorStatus === "offline" || connectorStatus === "unconfigured") {
+    return false;
+  }
+
+  if (upstreamStatus?.draftEndpointConfigured && upstreamStatus.status === "offline") {
+    return false;
+  }
+
+  return true;
+}
+
 @Injectable()
 export class RuntimeService {
   private async getDraftConnectorStatus() {
     const platforms: DraftConnectorPlatformStatus[] = draftConnectorPlatforms.map(({ platform, envPrefix }) => ({
       platform,
       realPublishEnabled: isEnabled(`${envPrefix}_REAL_PUBLISH_ENABLED`),
+      draftReady: false,
       draftEndpoint: resolveConnectorEndpoint(envPrefix, platform, "drafts"),
       statusEndpoint: resolveConnectorEndpoint(envPrefix, platform, "status"),
     }));
@@ -171,12 +193,17 @@ export class RuntimeService {
     const healthUrl = resolveDraftConnectorHealthUrl(platforms);
 
     if (!healthUrl) {
+      const status = hasConnectorConfig ? "configured" : "unconfigured";
+
       return {
-        status: hasConnectorConfig ? "configured" : "unconfigured",
+        status,
         detail: hasConnectorConfig
           ? "Draft endpoints are configured directly; set DRAFT_CONNECTOR_HEALTH_URL or DRAFT_CONNECTOR_BASE_URL to enable health checks."
           : "Set DRAFT_CONNECTOR_BASE_URL to enable local draft connector health checks.",
-        platforms,
+        platforms: platforms.map((platformStatus) => ({
+          ...platformStatus,
+          draftReady: resolveDraftReady(platformStatus, status),
+        })),
       } satisfies {
         status: DraftConnectorStatus;
         detail: string;
@@ -195,11 +222,13 @@ export class RuntimeService {
       const payload = response.ok
         ? ((await response.json().catch(() => ({}))) as DraftConnectorHealthPayload)
         : {};
+      const status = response.ok ? "online" : "offline";
       const platformsWithUpstream = platforms.map((platformStatus) => {
         const upstreamStatus = payload.upstreamDrafts?.find((item) => item.platform === platformStatus.platform);
 
         return {
           ...platformStatus,
+          draftReady: resolveDraftReady(platformStatus, status, upstreamStatus),
           upstreamDraftEndpointConfigured: upstreamStatus?.draftEndpointConfigured,
           upstreamStatusEndpointConfigured: upstreamStatus?.statusEndpointConfigured,
           upstreamCredentialForwardingEnabled: upstreamStatus?.credentialForwardingEnabled,
@@ -211,7 +240,7 @@ export class RuntimeService {
       });
 
       return {
-        status: response.ok ? "online" : "offline",
+        status,
         baseUrl: normalizedBaseUrl,
         outboxUrl: normalizedBaseUrl ? `${normalizedBaseUrl}/drafts` : undefined,
         healthUrl,
@@ -228,7 +257,10 @@ export class RuntimeService {
         outboxUrl: normalizedBaseUrl ? `${normalizedBaseUrl}/drafts` : undefined,
         healthUrl,
         detail: error instanceof Error ? error.message : "Draft connector health check failed.",
-        platforms,
+        platforms: platforms.map((platformStatus) => ({
+          ...platformStatus,
+          draftReady: resolveDraftReady(platformStatus, "offline"),
+        })),
       };
     } finally {
       clearTimeout(timeout);
