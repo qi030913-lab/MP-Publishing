@@ -17,6 +17,8 @@ export type SimulatePublishDto = {
 
 export type PublishMockDto = SimulatePublishDto;
 
+export type PublishRealDto = SimulatePublishDto;
+
 export type RetryPublishTaskDto = {
   platform?: PlatformName;
 };

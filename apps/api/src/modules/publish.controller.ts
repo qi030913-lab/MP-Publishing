@@ -2,6 +2,7 @@ import { Body, Controller, Get, Inject, Param, Post } from "@nestjs/common";
 
 import type {
   PublishMockDto,
+  PublishRealDto,
   RetryPublishTaskDto,
   SimulatePublishDto,
 } from "./publish.dto.js";
@@ -29,6 +30,11 @@ export class PublishController {
   @Post("mock")
   mockPublish(@Body() body: PublishMockDto) {
     return this.publishService.publishMock(body);
+  }
+
+  @Post("real")
+  realPublish(@Body() body: PublishRealDto) {
+    return this.publishService.publishReal(body);
   }
 
   @Post("tasks/:taskId/retry")

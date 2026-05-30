@@ -99,7 +99,7 @@ export type TaskResult = {
 
 export type PublishTaskDetail = {
   id: string;
-  mode: "simulate" | "mock-publish";
+  mode: "simulate" | "mock-publish" | "real-publish";
   overallStatus: "ready" | "needs_attention" | "published" | "partial";
   status: TaskStatus;
   documentTitle: string;
@@ -126,7 +126,7 @@ export type PublishTaskDetail = {
 
 export type PublishTaskSummary = {
   id: string;
-  mode: "simulate" | "mock-publish";
+  mode: "simulate" | "mock-publish" | "real-publish";
   status: TaskStatus;
   documentTitle: string;
   createdAt: string;

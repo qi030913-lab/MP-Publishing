@@ -60,7 +60,7 @@ function loadWorkspaceEnv() {
 loadWorkspaceEnv();
 
 export type PlatformAccountHealth = "healthy" | "expiring" | "needs-login";
-export type PublishTaskMode = "simulate" | "mock-publish";
+export type PublishTaskMode = "simulate" | "mock-publish" | "real-publish";
 export type PublishTaskTargetStatus =
   | "queued"
   | "running"

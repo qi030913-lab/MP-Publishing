@@ -64,6 +64,12 @@ function runtimeFallback(): RuntimeStatus {
   };
 }
 
+function taskModeLabel(mode: PublishTaskSummary["mode"] | PublishTaskDetail["mode"]) {
+  if (mode === "simulate") return "模拟发布";
+  if (mode === "real-publish") return "真实发布";
+  return "mock 发布";
+}
+
 export default function TasksPage() {
   const [tasks, setTasks] = useState<PublishTaskSummary[]>([]);
   const [activeTask, setActiveTask] = useState<PublishTaskDetail | null>(null);
@@ -250,7 +256,7 @@ export default function TasksPage() {
                     <StatusBadge tone={taskStatusTone(task.status)}>{taskStatusLabel(task.status)}</StatusBadge>
                   </span>
                   <span className="task-meta">
-                    {task.mode === "simulate" ? "模拟发布" : "mock 发布"} · {formatTime(task.updatedAt)}
+                    {taskModeLabel(task.mode)} · {formatTime(task.updatedAt)}
                   </span>
                   <span className="task-platform-row">
                     {task.platforms.map((platform) => (

@@ -53,7 +53,7 @@ export function listAccounts() {
   return request<{ items: PlatformAccount[]; summary: AccountSummary }>("/accounts");
 }
 
-export function runPublishAction(mode: "simulate" | "mock", draft: DraftDocument, accountIds: string[]) {
+export function runPublishAction(mode: "simulate" | "mock" | "real", draft: DraftDocument, accountIds: string[]) {
   return request<PublishTaskDetail>(`/publish/${mode}`, {
     method: "POST",
     body: JSON.stringify({

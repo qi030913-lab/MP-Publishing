@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from "@nestjs/common";
+import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { createDocumentFromInput } from "@mp-publishing/content-model";
 import {
   createContentSnapshot,
@@ -19,6 +19,7 @@ import {
 
 import type {
   PublishMockDto,
+  PublishRealDto,
   RetryPublishTaskDto,
   SimulatePublishDto,
 } from "./publish.dto.js";
@@ -88,7 +89,7 @@ export class PublishService {
     return "queued";
   }
 
-  private createBaseDocument(input: SimulatePublishDto | PublishMockDto) {
+  private createBaseDocument(input: SimulatePublishDto | PublishMockDto | PublishRealDto) {
     return createDocumentFromInput({
       title: input.document.title,
       summary: input.document.summary,
@@ -151,8 +152,12 @@ export class PublishService {
 
   private async createTaskFromInput(
     mode: PublishTaskMode,
-    input: SimulatePublishDto | PublishMockDto,
+    input: SimulatePublishDto | PublishMockDto | PublishRealDto,
   ): Promise<PublishTaskRecord> {
+    if (mode === "real-publish" && input.platforms.some((platform) => platform !== "wechat")) {
+      throw new BadRequestException("real publish is currently enabled for wechat only");
+    }
+
     const accounts = (await listAccounts()).filter((account) => input.accountIds.includes(account.id));
     const taskCreatedAt = this.createTimestamp();
 
@@ -162,7 +167,14 @@ export class PublishService {
     const targets = input.platforms.map((platform) => {
         const matchedAccount = accounts.find((account) => account.platform === platform) ?? null;
         const baseLogs = [
-          this.createLog("info", mode === "simulate" ? `已创建 ${platform} 模拟发布任务。` : `已创建 ${platform} mock 发布任务。`),
+          this.createLog(
+            "info",
+            mode === "simulate"
+              ? `已创建 ${platform} 模拟发布任务。`
+              : mode === "real-publish"
+                ? `已创建 ${platform} 真实发布任务。`
+                : `已创建 ${platform} mock 发布任务。`,
+          ),
           this.createLog("info", `${platform} 等待 BullMQ worker 执行。`),
         ];
 
@@ -190,7 +202,11 @@ export class PublishService {
         this.createEvent(
           "created",
           "info",
-          mode === "simulate" ? "已创建模拟发布任务。" : "已创建 mock 一键发布任务。",
+          mode === "simulate"
+            ? "已创建模拟发布任务。"
+            : mode === "real-publish"
+              ? "已创建真实平台发布任务。"
+              : "已创建 mock 一键发布任务。",
         ),
         ...targets.map((target) =>
           this.createEvent(
@@ -222,6 +238,11 @@ export class PublishService {
 
   async publishMock(input: PublishMockDto) {
     const task = await this.createTaskFromInput("mock-publish", input);
+    return this.mapTaskForResponse(task);
+  }
+
+  async publishReal(input: PublishRealDto) {
+    const task = await this.createTaskFromInput("real-publish", input);
     return this.mapTaskForResponse(task);
   }
 
