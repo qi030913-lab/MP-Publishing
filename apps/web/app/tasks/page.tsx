@@ -294,6 +294,13 @@ export default function TasksPage() {
               <div key={platformStatus.platform} className="capability-item">
                 <span>{platformLabel(platformStatus.platform)} 草稿</span>
                 <strong>{formatOutboxSummary(platformStatus.outbox) ?? "暂无草稿"}</strong>
+                {platformStatus.outboxUrl ? (
+                  <div style={{ marginTop: 8 }}>
+                    <a className="secondary-button compact" href={platformStatus.outboxUrl} target="_blank" rel="noreferrer">
+                      打开{platformLabel(platformStatus.platform)}草稿箱
+                    </a>
+                  </div>
+                ) : null}
               </div>
             ))}
           </div>

@@ -311,6 +311,13 @@ export default function PublishPage() {
                           ) : null}
                         </p>
                         {outboxSummary ? <p className="page-description">收件箱: {outboxSummary}</p> : null}
+                        {platformStatus.outboxUrl ? (
+                          <div style={{ marginTop: 8 }}>
+                            <a className="secondary-button compact" href={platformStatus.outboxUrl} target="_blank" rel="noreferrer">
+                              打开{platformLabel(platformStatus.platform)}草稿箱
+                            </a>
+                          </div>
+                        ) : null}
                         {!connectorReady && readinessMessages.length > 0 ? (
                           <p className="page-description">
                             Action: {readinessMessages.join(" ")}

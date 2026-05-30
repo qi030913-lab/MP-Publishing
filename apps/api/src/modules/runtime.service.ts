@@ -12,6 +12,7 @@ type DraftConnectorPlatformStatus = {
   draftReadinessIssues: ValidationIssue[];
   draftEndpoint?: string;
   statusEndpoint?: string;
+  outboxUrl?: string;
   upstreamDraftEndpointConfigured?: boolean;
   upstreamStatusEndpointConfigured?: boolean;
   upstreamCredentialForwardingEnabled?: boolean;
@@ -175,6 +176,29 @@ function inferBaseUrlFromHealthUrl(healthUrl: string | undefined) {
   }
 }
 
+function resolvePlatformOutboxUrl(platformStatus: DraftConnectorPlatformStatus, baseUrl: string | undefined) {
+  if (baseUrl) {
+    return `${baseUrl}/${platformStatus.platform}/drafts`;
+  }
+
+  const draftEndpoint = platformStatus.draftEndpoint;
+  if (!draftEndpoint) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(draftEndpoint);
+    const pathname = url.pathname.replace(/\/+$/, "");
+    if (!isLocalConnectorHost(url.hostname) || pathname !== `/${platformStatus.platform}/drafts`) {
+      return undefined;
+    }
+
+    return `${url.origin}/${platformStatus.platform}/drafts`;
+  } catch {
+    return undefined;
+  }
+}
+
 function createReadinessIssue(code: string, message: string, severity: ValidationIssue["severity"] = "error"): ValidationIssue {
   return { code, message, severity };
 }
@@ -281,6 +305,7 @@ export class RuntimeService {
           : "Set DRAFT_CONNECTOR_BASE_URL to enable local draft connector health checks.",
         platforms: platforms.map((platformStatus) => ({
           ...platformStatus,
+          outboxUrl: resolvePlatformOutboxUrl(platformStatus, undefined),
           ...resolveDraftReadiness(platformStatus, status, resolveEnvPrefix(platformStatus.platform)),
         })),
       } satisfies {
@@ -307,6 +332,7 @@ export class RuntimeService {
 
         return {
           ...platformStatus,
+          outboxUrl: resolvePlatformOutboxUrl(platformStatus, normalizedBaseUrl),
           ...resolveDraftReadiness(platformStatus, status, resolveEnvPrefix(platformStatus.platform), upstreamStatus),
           outbox: payload.outbox?.platforms?.find((item) => item.platform === platformStatus.platform),
           upstreamDraftEndpointConfigured: upstreamStatus?.draftEndpointConfigured,
@@ -340,6 +366,7 @@ export class RuntimeService {
         detail: error instanceof Error ? error.message : "Draft connector health check failed.",
         platforms: platforms.map((platformStatus) => ({
           ...platformStatus,
+          outboxUrl: resolvePlatformOutboxUrl(platformStatus, normalizedBaseUrl),
           ...resolveDraftReadiness(platformStatus, "offline", resolveEnvPrefix(platformStatus.platform)),
         })),
       };

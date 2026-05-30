@@ -194,6 +194,7 @@ export type RuntimeStatus = {
       }>;
       draftEndpoint?: string;
       statusEndpoint?: string;
+      outboxUrl?: string;
       upstreamDraftEndpointConfigured?: boolean;
       upstreamStatusEndpointConfigured?: boolean;
       upstreamCredentialForwardingEnabled?: boolean;

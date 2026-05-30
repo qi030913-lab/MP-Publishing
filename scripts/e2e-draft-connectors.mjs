@@ -569,7 +569,8 @@ async function runLocalDraftEnablementCheck() {
           platformStatus.draftCredentialRequired ||
           !Array.isArray(platformStatus.draftReadinessIssues) ||
           platformStatus.draftReadinessIssues.length > 0 ||
-          platformStatus.draftEndpoint !== `${connectorBaseUrl}/${platform}/drafts`
+          platformStatus.draftEndpoint !== `${connectorBaseUrl}/${platform}/drafts` ||
+          platformStatus.outboxUrl !== `${connectorBaseUrl}/${platform}/drafts`
         );
       })
     ) {
@@ -2880,7 +2881,12 @@ try {
   if (
     initialRuntime.draftConnector?.status !== "online" ||
     initialRuntime.draftConnector?.outboxUrl !== `${connectorBaseUrl}/drafts` ||
-    initialRuntime.draftConnector?.outbox?.total !== 0
+    initialRuntime.draftConnector?.outbox?.total !== 0 ||
+    platforms.some(
+      (platform) =>
+        initialRuntime.draftConnector?.platforms?.find((item) => item.platform === platform)?.outboxUrl !==
+        `${connectorBaseUrl}/${platform}/drafts`,
+    )
   ) {
     throw new Error(`API runtime did not report the draft connector as online: ${JSON.stringify(initialRuntime.draftConnector)}`);
   }
