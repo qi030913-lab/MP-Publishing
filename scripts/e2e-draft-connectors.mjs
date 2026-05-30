@@ -151,18 +151,11 @@ fs.rmSync(outboxDir, { recursive: true, force: true });
 const connectorEnv = {
   ...(apiPort ? { PORT: String(apiPort) } : {}),
   PUBLISH_QUEUE_NAME: queueName,
+  DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+  DRAFT_CONNECTOR_API_KEY: "draft-secret",
   ZHIHU_REAL_PUBLISH_ENABLED: "true",
-  ZHIHU_DRAFT_ENDPOINT: `${connectorBaseUrl}/zhihu/drafts`,
-  ZHIHU_DRAFT_API_KEY: "draft-secret",
-  ZHIHU_STATUS_ENDPOINT: `${connectorBaseUrl}/zhihu/status`,
   BILIBILI_REAL_PUBLISH_ENABLED: "true",
-  BILIBILI_DRAFT_ENDPOINT: `${connectorBaseUrl}/bilibili/drafts`,
-  BILIBILI_DRAFT_API_KEY: "draft-secret",
-  BILIBILI_STATUS_ENDPOINT: `${connectorBaseUrl}/bilibili/status`,
   XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
-  XIAOHONGSHU_DRAFT_ENDPOINT: `${connectorBaseUrl}/xiaohongshu/drafts`,
-  XIAOHONGSHU_DRAFT_API_KEY: "draft-secret",
-  XIAOHONGSHU_STATUS_ENDPOINT: `${connectorBaseUrl}/xiaohongshu/status`,
 };
 const draftConnectorEnv = {
   PORT: String(connectorPort),

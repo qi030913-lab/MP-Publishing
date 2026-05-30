@@ -203,7 +203,7 @@ const defaultAccounts: PlatformAccountRecord[] = [
     displayName: "B站视频号",
     handle: "效率创作手记",
     authMode: "hybrid",
-    health: "expiring",
+    health: "healthy",
     credentialRef: process.env.BILIBILI_CREDENTIAL_REF ?? "env:BILIBILI",
     credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T21:55:00+08:00",

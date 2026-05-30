@@ -34,7 +34,7 @@
 
 公众号 adapter 已开始接入真实平台链路：在 `WECHAT_REAL_PUBLISH_ENABLED=true` 且凭证、封面素材配置完整时，可调用微信服务端接口创建真实草稿；在 `WECHAT_SUBMIT_FREEPUBLISH=true` 时才会继续提交发布。任务中心提供手动状态同步入口，公众号发布提交后可通过 `freepublish/get` 查询远程发布状态。由于授权、素材、Webhook 和审核回执仍未完整产品化，当前系统仍应视为真实发布链路联调阶段，不应用作无人值守生产发布。
 
-知乎、B站、小红书 adapter 已接入真实草稿连接器基线：在各自 `*_REAL_PUBLISH_ENABLED=true` 且 `*_DRAFT_ENDPOINT` 配置完整时，worker 会把平台化草稿投递给连接器，由连接器对接官方 API、创作者中心自动化或私有联调服务。工程内置 `apps/draft-connector` 作为本地 outbox 连接器，可先把平台草稿落盘，连接器也可选提供 `*_STATUS_ENDPOINT` 做远程状态同步。这三个平台当前还不是内置官方 API 直连实现。
+知乎、B站、小红书 adapter 已接入真实草稿连接器基线：在各自 `*_REAL_PUBLISH_ENABLED=true` 且 `*_DRAFT_ENDPOINT` 配置完整时，worker 会把平台化草稿投递给连接器，由连接器对接官方 API、创作者中心自动化或私有联调服务。工程内置 `apps/draft-connector` 作为本地 outbox 连接器，可先把平台草稿落盘；配置 `DRAFT_CONNECTOR_BASE_URL` 后会自动推导各平台 draft / status endpoint。连接器也可选提供 `*_STATUS_ENDPOINT` 做远程状态同步。这三个平台当前还不是内置官方 API 直连实现。
 
 ## 1. 目标
 

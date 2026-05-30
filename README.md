@@ -45,6 +45,9 @@ pnpm --filter @mp-publishing/draft-connector dev
 pnpm --filter @mp-publishing/web dev
 ```
 
+For local Zhihu, Bilibili, and Xiaohongshu draft publishing, run `apps/draft-connector` and set the corresponding `*_REAL_PUBLISH_ENABLED=true`.
+With `DRAFT_CONNECTOR_BASE_URL=http://localhost:3010`, per-platform draft and status endpoints are inferred automatically.
+
 Verify the local publishing chain after a build:
 
 ```bash

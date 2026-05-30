@@ -79,6 +79,21 @@ function createDraftEnvKey(prefix: string, suffix: string) {
   return `${prefix}_${suffix}`;
 }
 
+function trimTrailingSlash(value: string) {
+  return value.replace(/\/+$/, "");
+}
+
+function resolveConnectorEndpoint(config: NonNullable<AdapterPreset["realDraft"]>, platform: PlatformName, operation: "drafts" | "status") {
+  const key = createDraftEnvKey(config.envPrefix, operation === "drafts" ? "DRAFT_ENDPOINT" : "STATUS_ENDPOINT");
+  const explicitEndpoint = readEnvValue(key);
+  if (explicitEndpoint) {
+    return explicitEndpoint;
+  }
+
+  const baseUrl = readEnvValue("DRAFT_CONNECTOR_BASE_URL");
+  return baseUrl ? `${trimTrailingSlash(baseUrl)}/${platform}/${operation}` : undefined;
+}
+
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, {
     ...init,
@@ -153,9 +168,9 @@ async function publishDraftThroughConnector(
     };
   }
 
-  const endpointKey = createDraftEnvKey(config.envPrefix, "DRAFT_ENDPOINT");
-  const endpoint = readEnvValue(endpointKey);
+  const endpoint = resolveConnectorEndpoint(config, preset.platform, "drafts");
   if (!endpoint) {
+    const endpointKey = createDraftEnvKey(config.envPrefix, "DRAFT_ENDPOINT");
     return {
       ok: false,
       issues: [
@@ -168,7 +183,7 @@ async function publishDraftThroughConnector(
     };
   }
 
-  const apiKey = readEnvValue(createDraftEnvKey(config.envPrefix, "DRAFT_API_KEY"));
+  const apiKey = readEnvValue(createDraftEnvKey(config.envPrefix, "DRAFT_API_KEY")) ?? readEnvValue("DRAFT_CONNECTOR_API_KEY");
   const includeCredential = isEnabled(createDraftEnvKey(config.envPrefix, "DRAFT_INCLUDE_CREDENTIAL"));
 
   try {
@@ -235,7 +250,7 @@ async function queryDraftConnectorStatus(
     };
   }
 
-  const endpoint = readEnvValue(createDraftEnvKey(config.envPrefix, "STATUS_ENDPOINT"));
+  const endpoint = resolveConnectorEndpoint(config, preset.platform, "status");
   if (!endpoint) {
     return {
       state: "draft",
@@ -244,7 +259,10 @@ async function queryDraftConnectorStatus(
     };
   }
 
-  const apiKey = readEnvValue(createDraftEnvKey(config.envPrefix, "STATUS_API_KEY")) ?? readEnvValue(createDraftEnvKey(config.envPrefix, "DRAFT_API_KEY"));
+  const apiKey =
+    readEnvValue(createDraftEnvKey(config.envPrefix, "STATUS_API_KEY")) ??
+    readEnvValue(createDraftEnvKey(config.envPrefix, "DRAFT_API_KEY")) ??
+    readEnvValue("DRAFT_CONNECTOR_API_KEY");
   const includeCredential = isEnabled(createDraftEnvKey(config.envPrefix, "STATUS_INCLUDE_CREDENTIAL"));
 
   try {
@@ -356,7 +374,7 @@ export function createAdapter(preset: AdapterPreset): PlatformAdapter {
         );
       }
 
-      if (config && !readEnvValue(createDraftEnvKey(config.envPrefix, "DRAFT_ENDPOINT"))) {
+      if (config && !resolveConnectorEndpoint(config, preset.platform, "drafts")) {
         issues.push(
           createIssue(
             `${preset.platform.toUpperCase()}_DRAFT_ENDPOINT_MISSING`,
