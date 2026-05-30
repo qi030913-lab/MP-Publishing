@@ -15,6 +15,7 @@
   - `/accounts`：账号管理页
 - **后端 API**：`apps/api`，NestJS，提供平台能力、预览、账号、发布任务和 runtime 状态接口；创建发布任务时写入 Prisma 并投递 BullMQ target job
 - **Worker**：`apps/worker`，BullMQ consumer，消费发布 target job 并推进 `queued -> running -> succeeded / needs_retry / needs_manual_action`
+- **Draft Connector**：`apps/draft-connector`，本地 HTTP 草稿连接器，可接收知乎 / B站 / 小红书平台化草稿并保存到 `.runtime/drafts` outbox
 - **内容模型**：`packages/content-model`，提供 Canonical Content Model、输入转换和纯文本导出
 - **平台协议**：`packages/platform-sdk`，定义平台能力、草稿、校验、模拟发布、发布结果等类型
 - **适配器注册中心**：`packages/adapter-core`，注册并调度 4 个平台 adapter
@@ -33,7 +34,7 @@
 
 公众号 adapter 已开始接入真实平台链路：在 `WECHAT_REAL_PUBLISH_ENABLED=true` 且凭证、封面素材配置完整时，可调用微信服务端接口创建真实草稿；在 `WECHAT_SUBMIT_FREEPUBLISH=true` 时才会继续提交发布。任务中心提供手动状态同步入口，公众号发布提交后可通过 `freepublish/get` 查询远程发布状态。由于授权、素材、Webhook 和审核回执仍未完整产品化，当前系统仍应视为真实发布链路联调阶段，不应用作无人值守生产发布。
 
-知乎、B站、小红书 adapter 已接入真实草稿连接器基线：在各自 `*_REAL_PUBLISH_ENABLED=true` 且 `*_DRAFT_ENDPOINT` 配置完整时，worker 会把平台化草稿投递给外部连接器，由连接器对接官方 API、创作者中心自动化或私有联调服务。连接器可选提供 `*_STATUS_ENDPOINT` 做远程状态同步。这三个平台当前还不是内置官方 API 直连实现。
+知乎、B站、小红书 adapter 已接入真实草稿连接器基线：在各自 `*_REAL_PUBLISH_ENABLED=true` 且 `*_DRAFT_ENDPOINT` 配置完整时，worker 会把平台化草稿投递给连接器，由连接器对接官方 API、创作者中心自动化或私有联调服务。工程内置 `apps/draft-connector` 作为本地 outbox 连接器，可先把平台草稿落盘，连接器也可选提供 `*_STATUS_ENDPOINT` 做远程状态同步。这三个平台当前还不是内置官方 API 直连实现。
 
 ## 1. 目标
 
@@ -177,6 +178,7 @@ flowchart LR
     Q --> WK["Worker<br/>BullMQ consumer"]
     WK --> DB
     WK --> REG
+    WK --> DC["Draft Connector<br/>local outbox / automation proxy"]
 ```
 
 当前 `task-runtime` 不再保存 `.runtime/publish-state.json`，而是作为数据与队列边界：
@@ -383,6 +385,7 @@ apps/
   web/
   api/
   worker/
+  draft-connector/
 packages/
   content-model/
   platform-sdk/

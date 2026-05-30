@@ -7,6 +7,7 @@ MP-Publishing is a multi-platform content adaptation and publishing workspace fo
 - `apps/web`: creator console and multi-platform preview workspace
 - `apps/api`: orchestration API for content, preview, and publishing jobs
 - `apps/worker`: async task runner for adaptation, simulation, and publishing
+- `apps/draft-connector`: local draft outbox connector for non-WeChat draft publishing
 - `packages/content-model`: canonical content schema and helpers
 - `packages/adapter-core`: shared adapter contracts and orchestration primitives
 - `packages/adapters/xiaohongshu`: sample platform adapter implementation
@@ -40,6 +41,7 @@ pnpm infra:up
 pnpm db:push
 pnpm --filter @mp-publishing/api dev
 pnpm --filter @mp-publishing/worker dev
+pnpm --filter @mp-publishing/draft-connector dev
 pnpm --filter @mp-publishing/web dev
 ```
 
@@ -51,7 +53,7 @@ pnpm test:draft-connectors
 ```
 
 This starts the built API and worker, creates a simulated publish task through HTTP, waits for BullMQ consumption, and checks that Postgres task state is updated successfully.
-The draft connector test starts a temporary local connector and verifies that Zhihu, Bilibili, and Xiaohongshu can create real-draft task results when their connector endpoints are configured.
+The draft connector test starts the built local draft connector and verifies that Zhihu, Bilibili, and Xiaohongshu can create real-draft task results and local outbox draft files when their connector endpoints are configured.
 
 Required local services:
 

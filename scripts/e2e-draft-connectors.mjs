@@ -82,80 +82,11 @@ async function waitForApi(api) {
 }
 
 function ensureBuildOutput() {
-  for (const filePath of ["apps/api/dist/main.js", "apps/worker/dist/main.js"]) {
+  for (const filePath of ["apps/api/dist/main.js", "apps/worker/dist/main.js", "apps/draft-connector/dist/main.js"]) {
     if (!fs.existsSync(path.join(root, filePath))) {
       throw new Error(`Missing ${filePath}. Run pnpm build before pnpm test:draft-connectors.`);
     }
   }
-}
-
-async function readRequestBody(request) {
-  const chunks = [];
-  for await (const chunk of request) {
-    chunks.push(chunk);
-  }
-
-  const body = Buffer.concat(chunks).toString("utf8");
-  return body ? JSON.parse(body) : {};
-}
-
-async function startDraftConnectorServer() {
-  const requests = [];
-  const server = createServer(async (request, response) => {
-    try {
-      const body = await readRequestBody(request);
-      const [, platform, operation] = request.url?.split("/") ?? [];
-      const requestRecord = {
-        authorization: request.headers.authorization,
-        platform,
-        operation,
-        body,
-      };
-      requests.push(requestRecord);
-
-      response.setHeader("content-type", "application/json");
-
-      if (operation === "status") {
-        response.end(
-          JSON.stringify({
-            state: "draft",
-            detail: `${platform} draft connector still reports draft state.`,
-            remoteId: body.remoteId,
-          }),
-        );
-        return;
-      }
-
-      const draftId = `${platform}-draft-${requests.filter((item) => item.operation === "drafts").length}`;
-      response.end(
-        JSON.stringify({
-          ok: true,
-          draftId,
-          url: `${platform}://draft/${draftId}`,
-          message: `${platform} connector accepted the draft.`,
-        }),
-      );
-    } catch (error) {
-      response.statusCode = 500;
-      response.end(JSON.stringify({ ok: false, message: error instanceof Error ? error.message : "unknown error" }));
-    }
-  });
-
-  server.listen(0, "127.0.0.1");
-  await once(server, "listening");
-  const address = server.address();
-  if (!address || typeof address === "string") {
-    throw new Error("Draft connector server did not expose a TCP address.");
-  }
-
-  return {
-    baseUrl: `http://127.0.0.1:${address.port}`,
-    requests,
-    close: () =>
-      new Promise((resolve, reject) => {
-        server.close((error) => (error ? reject(error) : resolve()));
-      }),
-  };
 }
 
 async function getFreePort() {
@@ -173,33 +104,78 @@ async function getFreePort() {
   return address.port;
 }
 
+async function waitForHealth(service, url, label) {
+  for (let i = 0; i < 40; i += 1) {
+    if (service.child.exitCode !== null) {
+      throw new Error(`${label} exited early.\n${tail(service.stderrPath)}`);
+    }
+
+    try {
+      const response = await fetch(url);
+      if (response.ok) {
+        return response.json();
+      }
+    } catch {
+      await delay(500);
+    }
+  }
+
+  throw new Error(`${label} health check did not become ready.\n${tail(service.stderrPath)}`);
+}
+
+function readDraftOutbox(outboxDir, platforms) {
+  return platforms.flatMap((platform) => {
+    const platformDir = path.join(outboxDir, platform);
+    if (!fs.existsSync(platformDir)) {
+      return [];
+    }
+
+    return fs.readdirSync(platformDir)
+      .filter((fileName) => fileName.endsWith(".json"))
+      .map((fileName) => {
+        const content = fs.readFileSync(path.join(platformDir, fileName), "utf8");
+        return JSON.parse(content);
+      });
+  });
+}
+
 ensureBuildOutput();
 
-const connector = await startDraftConnectorServer();
+const connectorPort = await getFreePort();
+const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
 const queueName = `mp-publishing-draft-e2e-${Date.now()}`;
 const apiPort = process.env.E2E_API_BASE_URL ? undefined : await getFreePort();
 apiBaseUrl = apiBaseUrl || `http://127.0.0.1:${apiPort}`;
+const outboxDir = path.join(runtimeDir, `draft-connector-e2e-${Date.now()}`);
+fs.rmSync(outboxDir, { recursive: true, force: true });
 const connectorEnv = {
   ...(apiPort ? { PORT: String(apiPort) } : {}),
   PUBLISH_QUEUE_NAME: queueName,
   ZHIHU_REAL_PUBLISH_ENABLED: "true",
-  ZHIHU_DRAFT_ENDPOINT: `${connector.baseUrl}/zhihu/drafts`,
+  ZHIHU_DRAFT_ENDPOINT: `${connectorBaseUrl}/zhihu/drafts`,
   ZHIHU_DRAFT_API_KEY: "draft-secret",
-  ZHIHU_STATUS_ENDPOINT: `${connector.baseUrl}/zhihu/status`,
+  ZHIHU_STATUS_ENDPOINT: `${connectorBaseUrl}/zhihu/status`,
   BILIBILI_REAL_PUBLISH_ENABLED: "true",
-  BILIBILI_DRAFT_ENDPOINT: `${connector.baseUrl}/bilibili/drafts`,
+  BILIBILI_DRAFT_ENDPOINT: `${connectorBaseUrl}/bilibili/drafts`,
   BILIBILI_DRAFT_API_KEY: "draft-secret",
-  BILIBILI_STATUS_ENDPOINT: `${connector.baseUrl}/bilibili/status`,
+  BILIBILI_STATUS_ENDPOINT: `${connectorBaseUrl}/bilibili/status`,
   XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
-  XIAOHONGSHU_DRAFT_ENDPOINT: `${connector.baseUrl}/xiaohongshu/drafts`,
+  XIAOHONGSHU_DRAFT_ENDPOINT: `${connectorBaseUrl}/xiaohongshu/drafts`,
   XIAOHONGSHU_DRAFT_API_KEY: "draft-secret",
-  XIAOHONGSHU_STATUS_ENDPOINT: `${connector.baseUrl}/xiaohongshu/status`,
+  XIAOHONGSHU_STATUS_ENDPOINT: `${connectorBaseUrl}/xiaohongshu/status`,
+};
+const draftConnectorEnv = {
+  PORT: String(connectorPort),
+  DRAFT_CONNECTOR_API_KEY: "draft-secret",
+  DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
 };
 
 const api = startService("api", ["apps/api/dist/main.js"], connectorEnv);
 const worker = startService("worker", ["apps/worker/dist/main.js"], connectorEnv);
+const draftConnector = startService("draft-connector", ["apps/draft-connector/dist/main.js"], draftConnectorEnv);
 
 try {
+  await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector");
   await waitForApi(api);
   await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
 
@@ -247,7 +223,7 @@ try {
     runtime = await requestJson("/runtime/status");
   }
 
-  const draftRequests = connector.requests.filter((request) => request.operation === "drafts");
+  const storedDrafts = readDraftOutbox(outboxDir, platforms);
   const result = {
     taskId: created.id,
     finalStatus: task.status,
@@ -258,11 +234,11 @@ try {
       remoteId: target.remoteId,
       url: target.url,
     })),
-    connectorRequests: draftRequests.map((request) => ({
-      platform: request.platform,
-      title: request.body.draft?.title,
-      hasCredential: Boolean(request.body.credential),
-      authorized: request.authorization === "Bearer draft-secret",
+    storedDrafts: storedDrafts.map((draft) => ({
+      platform: draft.platform,
+      draftId: draft.draftId,
+      title: draft.payload.draft?.title,
+      accountId: draft.accountId,
     })),
     queue: runtime.queue,
   };
@@ -275,13 +251,13 @@ try {
 
   for (const platform of platforms) {
     const target = task.results.find((item) => item.platform === platform);
-    if (!target || target.status !== "succeeded" || !target.remoteId || !target.url?.includes("://draft/")) {
+    if (!target || target.status !== "succeeded" || !target.remoteId || !target.url?.startsWith("draft-outbox://")) {
       throw new Error(`Draft connector target did not produce a draft reference for ${platform}: ${JSON.stringify(target)}`);
     }
   }
 
-  if (draftRequests.length !== platforms.length) {
-    throw new Error(`Expected ${platforms.length} draft connector calls, received ${draftRequests.length}.`);
+  if (storedDrafts.length !== platforms.length) {
+    throw new Error(`Expected ${platforms.length} stored drafts, received ${storedDrafts.length}.`);
   }
 
   if (runtime.queue.failed > 0 || runtime.queue.waiting > 0 || runtime.queue.active > 0) {
@@ -291,7 +267,8 @@ try {
   console.error(error);
   console.error("API stderr tail:\n", tail(api.stderrPath));
   console.error("Worker stderr tail:\n", tail(worker.stderrPath));
+  console.error("Draft connector stderr tail:\n", tail(draftConnector.stderrPath));
   process.exitCode = 1;
 } finally {
-  await Promise.all([stopService(api), stopService(worker), connector.close()]);
+  await Promise.all([stopService(api), stopService(worker), stopService(draftConnector)]);
 }
