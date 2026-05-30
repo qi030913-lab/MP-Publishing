@@ -52,6 +52,15 @@ importers:
         specifier: ^4.22.3
         version: 4.22.3
 
+  apps/draft-connector:
+    devDependencies:
+      '@types/node':
+        specifier: ^25.9.1
+        version: 25.9.1
+      tsx:
+        specifier: ^4.22.3
+        version: 4.22.3
+
   apps/web:
     dependencies:
       '@mp-publishing/adapter-core':

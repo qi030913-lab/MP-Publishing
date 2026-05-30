@@ -7,9 +7,15 @@ import type {
   PlatformName,
   PublishInput,
   PublishResult,
+  PublishStatus,
+  PublishStatusInput,
   SimulationResult,
   ValidationIssue,
 } from "@mp-publishing/platform-sdk";
+
+declare const process: {
+  env: Record<string, string | undefined>;
+};
 
 type AdapterPreset = {
   platform: PlatformName;
@@ -18,6 +24,11 @@ type AdapterPreset = {
   intro?: string;
   bulletsStyle?: "dash" | "number";
   extraHashtags?: string[];
+  realDraft?: {
+    envPrefix: string;
+    remoteIdPrefix: string;
+    urlScheme: string;
+  };
 };
 
 function extractBodySegments(document: CanonicalDocument, bulletStyle: AdapterPreset["bulletsStyle"]): string[] {
@@ -45,6 +56,292 @@ function createTitle(document: CanonicalDocument, capabilities: PlatformCapabili
   }
 
   return `${baseTitle.slice(0, Math.max(titleMaxLength - 3, 1))}...`;
+}
+
+function createIssue(code: string, message: string, severity: ValidationIssue["severity"] = "error"): ValidationIssue {
+  return {
+    code,
+    message,
+    severity,
+  };
+}
+
+function readEnvValue(key: string) {
+  const value = process.env[key]?.trim();
+  return value && value.length > 0 ? value : undefined;
+}
+
+function isEnabled(key: string) {
+  return readEnvValue(key)?.toLowerCase() === "true";
+}
+
+function createDraftEnvKey(prefix: string, suffix: string) {
+  return `${prefix}_${suffix}`;
+}
+
+function trimTrailingSlash(value: string) {
+  return value.replace(/\/+$/, "");
+}
+
+function isLocalConnectorHost(hostname: string) {
+  const normalized = hostname.toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function inferLocalConnectorEndpointFromDraftEndpoint(
+  platform: PlatformName,
+  draftEndpoint: string | undefined,
+  operation: "status",
+) {
+  if (!draftEndpoint) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(draftEndpoint);
+    const pathname = url.pathname.replace(/\/+$/, "");
+    if (!isLocalConnectorHost(url.hostname) || pathname !== `/${platform}/drafts`) {
+      return undefined;
+    }
+
+    return `${url.origin}/${platform}/${operation}`;
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveConnectorEndpoint(config: NonNullable<AdapterPreset["realDraft"]>, platform: PlatformName, operation: "drafts" | "status") {
+  const key = createDraftEnvKey(config.envPrefix, operation === "drafts" ? "DRAFT_ENDPOINT" : "STATUS_ENDPOINT");
+  const explicitEndpoint = readEnvValue(key);
+  if (explicitEndpoint) {
+    return explicitEndpoint;
+  }
+
+  const baseUrl = readEnvValue("DRAFT_CONNECTOR_BASE_URL");
+  if (baseUrl) {
+    return `${trimTrailingSlash(baseUrl)}/${platform}/${operation}`;
+  }
+
+  if (operation === "status") {
+    return inferLocalConnectorEndpointFromDraftEndpoint(
+      platform,
+      readEnvValue(createDraftEnvKey(config.envPrefix, "DRAFT_ENDPOINT")),
+      operation,
+    );
+  }
+
+  return undefined;
+}
+
+async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, {
+    ...init,
+    headers: {
+      "content-type": "application/json",
+      ...(init?.headers ?? {}),
+    },
+  });
+  const body = await response.text();
+  const payload = body ? (JSON.parse(body) as T) : ({} as T);
+
+  if (!response.ok) {
+    throw new Error(`Draft connector HTTP ${response.status}: ${body || response.statusText}`);
+  }
+
+  return payload;
+}
+
+type DraftConnectorResponse = {
+  ok?: boolean;
+  draftId?: string;
+  remoteId?: string;
+  url?: string;
+  message?: string;
+  issues?: ValidationIssue[];
+};
+
+type StatusConnectorResponse = {
+  state?: PublishStatus["state"];
+  detail?: string;
+  remoteId?: string;
+  url?: string;
+  issues?: ValidationIssue[];
+};
+
+function createConnectorDraftPayload(input: PublishInput, draft: PlatformDraft, includeCredential: boolean) {
+  return {
+    platform: draft.platform,
+    accountId: input.accountId,
+    document: input.document,
+    draft,
+    execution: input.execution,
+    credential: includeCredential ? input.credential : undefined,
+    requestedAt: new Date().toISOString(),
+  };
+}
+
+async function publishDraftThroughConnector(
+  preset: AdapterPreset,
+  input: PublishInput,
+  draft: PlatformDraft,
+  issues: ValidationIssue[],
+): Promise<PublishResult> {
+  const config = preset.realDraft;
+  if (!config) {
+    return {
+      ok: false,
+      issues: [...issues, createIssue(`${preset.platform.toUpperCase()}_REAL_DRAFT_UNSUPPORTED`, "Real draft publishing is not configured for this adapter.")],
+    };
+  }
+
+  const enabledKey = createDraftEnvKey(config.envPrefix, "REAL_PUBLISH_ENABLED");
+  if (!isEnabled(enabledKey)) {
+    return {
+      ok: false,
+      issues: [
+        ...issues,
+        createIssue(
+          `${preset.platform.toUpperCase()}_REAL_PUBLISH_DISABLED`,
+          `Set ${enabledKey}=true before allowing this adapter to call its draft connector.`,
+        ),
+      ],
+    };
+  }
+
+  const endpoint = resolveConnectorEndpoint(config, preset.platform, "drafts");
+  if (!endpoint) {
+    const endpointKey = createDraftEnvKey(config.envPrefix, "DRAFT_ENDPOINT");
+    return {
+      ok: false,
+      issues: [
+        ...issues,
+        createIssue(
+          `${preset.platform.toUpperCase()}_DRAFT_ENDPOINT_MISSING`,
+          `${endpointKey} is required before creating a real ${preset.platform} draft.`,
+        ),
+      ],
+    };
+  }
+
+  const apiKey = readEnvValue(createDraftEnvKey(config.envPrefix, "DRAFT_API_KEY")) ?? readEnvValue("DRAFT_CONNECTOR_API_KEY");
+  const includeCredential = isEnabled(createDraftEnvKey(config.envPrefix, "DRAFT_INCLUDE_CREDENTIAL"));
+
+  try {
+    const payload = await requestJson<DraftConnectorResponse>(endpoint, {
+      method: "POST",
+      headers: apiKey ? { authorization: `Bearer ${apiKey}` } : undefined,
+      body: JSON.stringify(createConnectorDraftPayload(input, draft, includeCredential)),
+    });
+
+    if (payload.ok === false) {
+      const remoteId = payload.remoteId ?? payload.draftId;
+      return {
+        ok: false,
+        remoteId,
+        url: payload.url ?? (remoteId ? `${config.urlScheme}://draft/${remoteId}` : undefined),
+        issues: [
+          ...issues,
+          ...(payload.issues ?? []),
+          createIssue(
+            `${preset.platform.toUpperCase()}_DRAFT_CONNECTOR_REJECTED`,
+            payload.message ?? `${preset.platform} draft connector rejected the draft.`,
+          ),
+        ],
+      };
+    }
+
+    const remoteId = payload.remoteId ?? payload.draftId ?? `${config.remoteIdPrefix}-${Date.now()}`;
+    return {
+      ok: true,
+      remoteId,
+      url: payload.url ?? `${config.urlScheme}://draft/${remoteId}`,
+      issues: [
+        ...issues,
+        ...(payload.issues ?? []),
+        createIssue(
+          `${preset.platform.toUpperCase()}_DRAFT_CREATED`,
+          payload.message ?? `${preset.platform} draft connector accepted the draft.`,
+          "info",
+        ),
+      ],
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      issues: [
+        ...issues,
+        createIssue(
+          `${preset.platform.toUpperCase()}_DRAFT_CONNECTOR_ERROR`,
+          error instanceof Error ? error.message : `Unknown ${preset.platform} draft connector error.`,
+        ),
+      ],
+    };
+  }
+}
+
+async function queryDraftConnectorStatus(
+  preset: AdapterPreset,
+  remoteId: string,
+  input?: PublishStatusInput,
+): Promise<PublishStatus> {
+  const config = preset.realDraft;
+  if (!config) {
+    return {
+      state: "needs_manual_action",
+      detail: `${preset.platform} does not expose a remote status connector.`,
+      remoteId,
+    };
+  }
+
+  const endpoint = resolveConnectorEndpoint(config, preset.platform, "status");
+  if (!endpoint) {
+    return {
+      state: "draft",
+      detail: `${preset.platform} draft was created; no status connector is configured.`,
+      remoteId,
+    };
+  }
+
+  const apiKey =
+    readEnvValue(createDraftEnvKey(config.envPrefix, "STATUS_API_KEY")) ??
+    readEnvValue(createDraftEnvKey(config.envPrefix, "DRAFT_API_KEY")) ??
+    readEnvValue("DRAFT_CONNECTOR_API_KEY");
+  const includeCredential = isEnabled(createDraftEnvKey(config.envPrefix, "STATUS_INCLUDE_CREDENTIAL"));
+
+  try {
+    const payload = await requestJson<StatusConnectorResponse>(endpoint, {
+      method: "POST",
+      headers: apiKey ? { authorization: `Bearer ${apiKey}` } : undefined,
+      body: JSON.stringify({
+        platform: preset.platform,
+        accountId: input?.accountId,
+        remoteId,
+        credential: includeCredential ? input?.credential : undefined,
+        requestedAt: new Date().toISOString(),
+      }),
+    });
+
+    return {
+      state: payload.state ?? "draft",
+      detail: payload.detail ?? `${preset.platform} status connector returned ${payload.state ?? "draft"}.`,
+      remoteId: payload.remoteId ?? remoteId,
+      url: payload.url,
+      issues: payload.issues,
+    };
+  } catch (error) {
+    return {
+      state: "needs_manual_action",
+      detail: error instanceof Error ? error.message : `Unknown ${preset.platform} status connector error.`,
+      remoteId,
+      issues: [
+        createIssue(
+          `${preset.platform.toUpperCase()}_STATUS_CONNECTOR_FAILED`,
+          error instanceof Error ? error.message : `Unknown ${preset.platform} status connector error.`,
+          "warning",
+        ),
+      ],
+    };
+  }
 }
 
 export function createAdapter(preset: AdapterPreset): PlatformAdapter {
@@ -108,6 +405,27 @@ export function createAdapter(preset: AdapterPreset): PlatformAdapter {
     },
     async simulatePublish(input: PublishInput): Promise<SimulationResult> {
       const issues = await this.validate(input.document);
+      const config = preset.realDraft;
+
+      if (config && !isEnabled(createDraftEnvKey(config.envPrefix, "REAL_PUBLISH_ENABLED"))) {
+        issues.push(
+          createIssue(
+            `${preset.platform.toUpperCase()}_REAL_PUBLISH_DISABLED`,
+            `${preset.platform} real draft connector is disabled.`,
+            "warning",
+          ),
+        );
+      }
+
+      if (config && !resolveConnectorEndpoint(config, preset.platform, "drafts")) {
+        issues.push(
+          createIssue(
+            `${preset.platform.toUpperCase()}_DRAFT_ENDPOINT_MISSING`,
+            `${preset.platform} draft connector endpoint is not configured.`,
+            "warning",
+          ),
+        );
+      }
 
       return {
         ok: issues.every((issue) => issue.severity !== "error"),
@@ -118,18 +436,24 @@ export function createAdapter(preset: AdapterPreset): PlatformAdapter {
     async publish(input: PublishInput): Promise<PublishResult> {
       const issues = await this.validate(input.document);
 
+      if (!input.dryRun) {
+        const draft = await this.adapt(input.document, {
+          toneMode: "platform-optimized",
+          preserveOriginal: false,
+        });
+
+        return publishDraftThroughConnector(preset, input, draft, issues);
+      }
+
       return {
         ok: true,
-        remoteId: input.dryRun ? `dry-run-${preset.platform}` : `${preset.platform}-demo-remote-id`,
+        remoteId: `dry-run-${preset.platform}`,
         url: `https://example.com/published/${preset.platform}`,
         issues,
       };
     },
-    async getPublishStatus() {
-      return {
-        state: "succeeded",
-        detail: `Demo ${preset.platform} adapter returns a mocked successful status.`,
-      };
+    async getPublishStatus(remoteId: string, input?: PublishStatusInput) {
+      return queryDraftConnectorStatus(preset, remoteId, input);
     },
   };
 }

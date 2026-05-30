@@ -1,12 +1,13 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import { createServer } from "node:http";
 import path from "node:path";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
 
 const root = process.cwd();
 const runtimeDir = path.join(root, ".runtime");
-const apiBaseUrl = process.env.E2E_API_BASE_URL ?? "http://localhost:3001";
+let apiBaseUrl = process.env.E2E_API_BASE_URL ?? "";
 
 fs.mkdirSync(runtimeDir, { recursive: true });
 
@@ -19,7 +20,7 @@ function tail(filePath) {
   return content.slice(Math.max(0, content.length - 5000));
 }
 
-function startService(name, args) {
+function startService(name, args, extraEnv = {}) {
   const stdoutPath = path.join(runtimeDir, `${name}-e2e.out.log`);
   const stderrPath = path.join(runtimeDir, `${name}-e2e.err.log`);
   const stdout = fs.openSync(stdoutPath, "w");
@@ -29,6 +30,7 @@ function startService(name, args) {
     env: {
       ...process.env,
       REDIS_URL: process.env.REDIS_URL ?? "redis://127.0.0.1:6380",
+      ...extraEnv,
     },
     stdio: ["ignore", stdout, stderr],
   });
@@ -87,10 +89,33 @@ function ensureBuildOutput() {
   }
 }
 
+async function getFreePort() {
+  const server = createServer();
+  server.listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("Free port probe did not expose a TCP address.");
+  }
+
+  await new Promise((resolve, reject) => {
+    server.close((error) => (error ? reject(error) : resolve()));
+  });
+  return address.port;
+}
+
 ensureBuildOutput();
 
-const api = startService("api", ["apps/api/dist/main.js"]);
-const worker = startService("worker", ["apps/worker/dist/main.js"]);
+const apiPort = process.env.E2E_API_BASE_URL ? undefined : await getFreePort();
+const queueName = `mp-publishing-publish-flow-e2e-${Date.now()}`;
+apiBaseUrl = apiBaseUrl || `http://127.0.0.1:${apiPort}`;
+const e2eEnv = {
+  ...(apiPort ? { PORT: String(apiPort) } : {}),
+  PUBLISH_QUEUE_NAME: queueName,
+};
+
+const api = startService("api", ["apps/api/dist/main.js"], e2eEnv);
+const worker = startService("worker", ["apps/worker/dist/main.js"], e2eEnv);
 
 try {
   await waitForApi(api);

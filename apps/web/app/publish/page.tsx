@@ -1,14 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { PlayCircle, RadioTower, Rocket, ShieldCheck } from "lucide-react";
+import { PlayCircle, RadioTower, RefreshCcw, Rocket, ShieldCheck } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 
-import { listAccounts, runPublishAction } from "../lib/api";
+import { getRuntimeStatus, listAccounts, runPublishAction } from "../lib/api";
 import { loadDraft, saveActiveTaskId, saveDraft } from "../lib/draft-store";
 import { platformLabel } from "../lib/platforms";
-import type { DraftDocument, PlatformAccount } from "../lib/types";
+import type { DraftDocument, PlatformAccount, PlatformName, RuntimeStatus } from "../lib/types";
 import { PlatformPicker } from "../components/platform-picker";
 import {
   EmptyState,
@@ -32,14 +32,76 @@ function healthLabel(health: PlatformAccount["health"]) {
   return "需要登录";
 }
 
+function connectorTone(status: RuntimeStatus["draftConnector"]["status"]): "success" | "warning" | "danger" | "info" {
+  if (status === "online") return "success";
+  if (status === "configured") return "warning";
+  if (status === "offline") return "danger";
+  return "info";
+}
+
+function connectorLabel(status: RuntimeStatus["draftConnector"]["status"]) {
+  if (status === "online") return "连接器在线";
+  if (status === "configured") return "端点已配置";
+  if (status === "offline") return "连接器离线";
+  return "未配置";
+}
+
+const connectorDraftPlatforms = new Set<PlatformName>(["zhihu", "bilibili", "xiaohongshu"]);
+
+type DraftConnectorPlatformRuntime = RuntimeStatus["draftConnector"]["platforms"][number];
+
+function getCredentialReadinessIssue(
+  platformStatus: DraftConnectorPlatformRuntime | undefined,
+  account: PlatformAccount | undefined,
+) {
+  if (!platformStatus?.draftCredentialRequired || account?.credentialStatus === "configured") {
+    return null;
+  }
+
+  return `Set credentials for ${account?.credentialRef ?? platformLabel(platformStatus.platform)} before creating a credentialed ${platformStatus.platform} draft.`;
+}
+
+function isConnectorDraftReady(platform: PlatformName, runtime: RuntimeStatus | null, account?: PlatformAccount) {
+  const platformStatus = runtime?.draftConnector.platforms.find((item) => item.platform === platform);
+  return platformStatus?.draftReady === true && !getCredentialReadinessIssue(platformStatus, account);
+}
+
+function formatOutboxSummary(summary: DraftConnectorPlatformRuntime["outbox"]) {
+  if (!summary) {
+    return null;
+  }
+
+  const byState = summary.byState ?? {};
+  const parts = [`${summary.total ?? 0} 个草稿`];
+  if (byState.publishing) {
+    parts.push(`${byState.publishing} 发布中`);
+  }
+  if (byState.ready) {
+    parts.push(`${byState.ready} 已就绪`);
+  }
+  if (byState.needs_manual_action) {
+    parts.push(`${byState.needs_manual_action} 待处理`);
+  }
+  if (summary.externalizedCount) {
+    parts.push(`${summary.externalizedCount} 外部草稿`);
+  }
+  if (summary.stalePublishingCount) {
+    parts.push(`${summary.stalePublishingCount} 可恢复`);
+  }
+
+  return parts.join(" / ");
+}
+
 export default function PublishPage() {
   const router = useRouter();
   const [draft, setDraft] = useState<DraftDocument | null>(null);
   const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([]);
   const [isSimulating, setIsSimulating] = useState(false);
   const [isPublishing, setIsPublishing] = useState(false);
   const [isRealPublishing, setIsRealPublishing] = useState(false);
+  const [isRefreshingStatus, setIsRefreshingStatus] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const selectedAccounts = useMemo(
@@ -52,17 +114,45 @@ export default function PublishPage() {
     [selectedAccounts],
   );
 
+  const selectedConnectorDraftPlatforms = useMemo(
+    () => draft?.platforms.filter((platform) => connectorDraftPlatforms.has(platform)) ?? [],
+    [draft],
+  );
+
+  const readyConnectorDraftPlatforms = useMemo(
+    () =>
+      selectedConnectorDraftPlatforms.filter((platform) => {
+        const account = accountsByPlatform.get(platform);
+        return Boolean(account && isConnectorDraftReady(platform, runtime, account));
+      }),
+    [accountsByPlatform, runtime, selectedConnectorDraftPlatforms],
+  );
+
   useEffect(() => {
     const storedDraft = loadDraft();
     setDraft(storedDraft);
 
-    void listAccounts()
-      .then((payload) => {
-        setAccounts(payload.items);
-        setSelectedAccountIds(payload.items.map((account) => account.id));
-      })
-      .catch(() => setError("读取账号列表失败，请确认 API 服务已经启动。"));
+    void refreshPublishContext(true);
   }, []);
+
+  async function refreshPublishContext(selectAllAccounts = false) {
+    setIsRefreshingStatus(true);
+    setError(null);
+
+    try {
+      const [payload, runtimePayload] = await Promise.all([listAccounts(), getRuntimeStatus()]);
+      const availableAccountIds = new Set(payload.items.map((account) => account.id));
+      setAccounts(payload.items);
+      setSelectedAccountIds((current) =>
+        selectAllAccounts ? payload.items.map((account) => account.id) : current.filter((id) => availableAccountIds.has(id)),
+      );
+      setRuntime(runtimePayload);
+    } catch {
+      setError("读取发布运行状态失败，请确认 API 服务已经启动。");
+    } finally {
+      setIsRefreshingStatus(false);
+    }
+  }
 
   function toggleAccount(accountId: string) {
     setSelectedAccountIds((current) =>
@@ -100,14 +190,23 @@ export default function PublishPage() {
     }
   }
 
-  async function submitRealWechat() {
+  async function submitRealDraft() {
     if (!draft) {
       return;
     }
 
-    const wechatAccount = selectedAccounts.find((account) => account.platform === "wechat");
-    if (!wechatAccount) {
-      setError("请先选择一个公众号账号。");
+    const realDraftPlatforms = draft.platforms.filter(
+      (platform) => {
+        const account = selectedAccounts.find((item) => item.platform === platform);
+        return connectorDraftPlatforms.has(platform) && Boolean(account && isConnectorDraftReady(platform, runtime, account));
+      },
+    );
+    const realDraftAccountIds = selectedAccounts
+      .filter((account) => realDraftPlatforms.includes(account.platform))
+      .map((account) => account.id);
+
+    if (realDraftPlatforms.length === 0) {
+      setError("请先选择已就绪的知乎、B站或小红书连接器草稿平台，并为其选择可用账号。");
       return;
     }
 
@@ -115,11 +214,11 @@ export default function PublishPage() {
     setIsRealPublishing(true);
 
     try {
-      const task = await runPublishAction("real", { ...draft, platforms: ["wechat"] }, [wechatAccount.id]);
+      const task = await runPublishAction("real", { ...draft, platforms: realDraftPlatforms }, realDraftAccountIds);
       saveActiveTaskId(task.id);
       router.push("/tasks");
     } catch {
-      setError("公众号真实发布任务创建失败，请检查 API 服务和公众号凭证配置。");
+      setError("真实草稿任务创建失败，请检查 API 服务、平台账号和连接器配置。");
     } finally {
       setIsRealPublishing(false);
     }
@@ -130,7 +229,7 @@ export default function PublishPage() {
       <PageHeader
         kicker="Publish"
         title="发布确认"
-        description="发布前确认目标平台、账号健康状态和执行模式。当前真实发布仍是 dry-run/mock 链路。"
+        description="发布前确认目标平台、账号健康状态和执行模式。真实草稿默认进入平台草稿或连接器草稿，不会越过平台最终确认。"
         actions={
           <>
             <button className="secondary-button" type="button" onClick={() => submit("simulate")} disabled={isSimulating}>
@@ -141,9 +240,14 @@ export default function PublishPage() {
               {isPublishing ? <LoadingInline label="提交中" /> : <Rocket size={18} />}
               mock 一键发布
             </button>
-            <button className="secondary-button" type="button" onClick={submitRealWechat} disabled={isRealPublishing}>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={submitRealDraft}
+              disabled={isRealPublishing || !draft || readyConnectorDraftPlatforms.length === 0}
+            >
               {isRealPublishing ? <LoadingInline label="提交中" /> : <Rocket size={18} />}
-              公众号真实草稿
+              创建连接器草稿
             </button>
           </>
         }
@@ -168,12 +272,92 @@ export default function PublishPage() {
             <div className="summary-grid">
               <SummaryTile label="正文段落" value={draft.body.split(/\n{2,}/).filter(Boolean).length} />
               <SummaryTile label="标签" value={draft.tags.length} />
-              <SummaryTile label="账号" value={selectedAccounts.length} />
+              <SummaryTile label="账号" value={selectedAccounts.length} detail={`连接器草稿 ${readyConnectorDraftPlatforms.length}`} />
             </div>
 
             <div className="field" style={{ marginTop: 18 }}>
               <span>目标平台</span>
               <PlatformPicker value={draft.platforms} onChange={updatePlatforms} />
+            </div>
+
+            <div className="subsection" style={{ marginTop: 18 }}>
+              <div className="panel-header">
+                <div>
+                  <h3>真实草稿连接器</h3>
+                  <p className="page-description">
+                    {runtime?.draftConnector.detail ?? "正在读取连接器状态。"}
+                  </p>
+                </div>
+                <div className="button-row">
+                  {runtime?.draftConnector ? (
+                    <StatusBadge tone={connectorTone(runtime.draftConnector.status)}>
+                      {connectorLabel(runtime.draftConnector.status)}
+                    </StatusBadge>
+                  ) : null}
+                  <button className="secondary-button compact" type="button" onClick={() => refreshPublishContext()} disabled={isRefreshingStatus}>
+                    {isRefreshingStatus ? <LoadingInline label="刷新中" /> : <RefreshCcw size={16} />}
+                    刷新状态
+                  </button>
+                </div>
+              </div>
+              <div className="issue-list">
+                {runtime?.draftConnector.platforms.map((platformStatus) => {
+                  const account = accountsByPlatform.get(platformStatus.platform);
+                  const credentialReadinessIssue = getCredentialReadinessIssue(platformStatus, account);
+                  const readinessMessages = [
+                    ...platformStatus.draftReadinessIssues.map((issue) => issue.message),
+                    ...(credentialReadinessIssue ? [credentialReadinessIssue] : []),
+                  ];
+                  const connectorReady = isConnectorDraftReady(platformStatus.platform, runtime, account);
+                  const outboxSummary = formatOutboxSummary(platformStatus.outbox);
+
+                  return (
+                    <div key={platformStatus.platform} className={connectorReady ? "issue-item info" : "issue-item warning"}>
+                      <RadioTower size={18} />
+                      <div>
+                        <strong>{platformLabel(platformStatus.platform)}</strong>
+                        <p>
+                          {connectorReady ? "可创建连接器草稿" : "暂不可创建连接器草稿"} /{" "}
+                          {platformStatus.realPublishEnabled ? "真实草稿已启用" : "真实草稿未启用"} /{" "}
+                          {platformStatus.draftEndpoint ? "draft endpoint 已配置" : "缺少 draft endpoint"}
+                          {platformStatus.draftCredentialRequired ? " / 需要凭证转发" : ""}
+                          {platformStatus.statusEndpoint ? " / status endpoint 已配置" : ""}
+                          {platformStatus.upstreamDraftEndpointConfigured !== undefined ? (
+                            <>
+                              {" "}
+                              / upstream {platformStatus.upstreamDraftStatus ?? "unknown"}
+                              {platformStatus.upstreamStatusEndpointConfigured ? " / status sync" : ""}
+                            </>
+                          ) : null}
+                        </p>
+                        {outboxSummary ? <p className="page-description">收件箱: {outboxSummary}</p> : null}
+                        {platformStatus.outboxUrl ? (
+                          <div style={{ marginTop: 8 }}>
+                            <a className="secondary-button compact" href={platformStatus.outboxUrl} target="_blank" rel="noreferrer">
+                              打开{platformLabel(platformStatus.platform)}草稿箱
+                            </a>
+                          </div>
+                        ) : null}
+                        {!connectorReady && readinessMessages.length > 0 ? (
+                          <p className="page-description">
+                            Action: {readinessMessages.join(" ")}
+                          </p>
+                        ) : null}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+              {runtime?.draftConnector.outboxUrl ? (
+                <a className="secondary-button compact" href={runtime.draftConnector.outboxUrl} target="_blank" rel="noreferrer">
+                  打开草稿收件箱
+                </a>
+              ) : null}
+              {runtime?.draftConnector.contractUrl ? (
+                <a className="secondary-button compact" href={runtime.draftConnector.contractUrl} target="_blank" rel="noreferrer">
+                  查看上游契约
+                </a>
+              ) : null}
             </div>
 
             <div className="subsection" style={{ marginTop: 18 }}>

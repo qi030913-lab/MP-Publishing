@@ -9,6 +9,7 @@ import { platformLabel } from "../lib/platforms";
 import type { PlatformName, PublishTaskDetail, PublishTaskSummary, RuntimeStatus, TaskStatus } from "../lib/types";
 import {
   EmptyState,
+  IssueList,
   LoadingInline,
   PageHeader,
   PlatformBadge,
@@ -20,6 +21,7 @@ import {
 } from "../components/ui";
 
 type FilterMode = "all" | "running" | "attention" | "succeeded";
+type DraftConnectorPlatformRuntime = RuntimeStatus["draftConnector"]["platforms"][number];
 
 function matchesFilter(task: PublishTaskSummary, filter: FilterMode) {
   if (filter === "all") return true;
@@ -61,13 +63,58 @@ function runtimeFallback(): RuntimeStatus {
       manualActionCount: 0,
       succeededCount: 0,
     },
+    draftConnector: {
+      status: "unconfigured",
+      detail: "Draft connector status is unavailable while the API is offline.",
+      platforms: [],
+    },
   };
 }
 
 function taskModeLabel(mode: PublishTaskSummary["mode"] | PublishTaskDetail["mode"]) {
   if (mode === "simulate") return "模拟发布";
-  if (mode === "real-publish") return "真实发布";
+  if (mode === "real-publish") return "真实草稿";
   return "mock 发布";
+}
+
+function resultLinkLabel(url: string, mode: PublishTaskDetail["mode"]) {
+  if (mode === "real-publish") return "打开草稿";
+  if (url.includes("/drafts/") || url.startsWith("draft-outbox://") || url.includes("://draft/")) return "打开草稿";
+  if (url.startsWith("https://example.com/")) return "打开 mock 链接";
+  return "打开发布结果";
+}
+
+function connectorStatusLabel(status: RuntimeStatus["draftConnector"]["status"]) {
+  if (status === "online") return "连接器在线";
+  if (status === "configured") return "端点已配置";
+  if (status === "offline") return "连接器离线";
+  return "未配置";
+}
+
+function formatOutboxSummary(summary: DraftConnectorPlatformRuntime["outbox"]) {
+  if (!summary) {
+    return null;
+  }
+
+  const byState = summary.byState ?? {};
+  const parts = [`${summary.total ?? 0} 个草稿`];
+  if (byState.publishing) {
+    parts.push(`${byState.publishing} 发布中`);
+  }
+  if (byState.ready) {
+    parts.push(`${byState.ready} 已就绪`);
+  }
+  if (byState.needs_manual_action) {
+    parts.push(`${byState.needs_manual_action} 待处理`);
+  }
+  if (summary.externalizedCount) {
+    parts.push(`${summary.externalizedCount} 外部草稿`);
+  }
+  if (summary.stalePublishingCount) {
+    parts.push(`${summary.stalePublishingCount} 可恢复`);
+  }
+
+  return parts.join(" / ");
 }
 
 export default function TasksPage() {
@@ -80,6 +127,9 @@ export default function TasksPage() {
   const [retryingKey, setRetryingKey] = useState<string | null>(null);
   const [syncingKey, setSyncingKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const draftConnectorOutboxTotal =
+    runtime.draftConnector.outbox?.total ??
+    runtime.draftConnector.platforms.reduce((total, platformStatus) => total + (platformStatus.outbox?.total ?? 0), 0);
 
   const filteredTasks = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -216,12 +266,59 @@ export default function TasksPage() {
             <strong>{runtime.worker.processedCount}</strong>
           </div>
         </div>
+        <div className="runtime-grid" style={{ marginTop: 12 }}>
+          <div className="capability-item">
+            <span>Draft connector</span>
+            <strong>{connectorStatusLabel(runtime.draftConnector.status)}</strong>
+          </div>
+          <div className="capability-item">
+            <span>草稿收件箱</span>
+            <strong>{draftConnectorOutboxTotal}</strong>
+          </div>
+          <div className="capability-item">
+            <span>连接器说明</span>
+            <strong>{runtime.draftConnector.detail}</strong>
+          </div>
+          {runtime.draftConnector.outboxUrl ? (
+            <div className="capability-item">
+              <span>Outbox</span>
+              <a className="secondary-button compact" href={runtime.draftConnector.outboxUrl} target="_blank" rel="noreferrer">
+                打开草稿收件箱
+              </a>
+            </div>
+          ) : null}
+          {runtime.draftConnector.contractUrl ? (
+            <div className="capability-item">
+              <span>Contract</span>
+              <a className="secondary-button compact" href={runtime.draftConnector.contractUrl} target="_blank" rel="noreferrer">
+                查看上游契约
+              </a>
+            </div>
+          ) : null}
+        </div>
+        {runtime.draftConnector.platforms.length > 0 ? (
+          <div className="runtime-grid" style={{ marginTop: 12 }}>
+            {runtime.draftConnector.platforms.map((platformStatus) => (
+              <div key={platformStatus.platform} className="capability-item">
+                <span>{platformLabel(platformStatus.platform)} 草稿</span>
+                <strong>{formatOutboxSummary(platformStatus.outbox) ?? "暂无草稿"}</strong>
+                {platformStatus.outboxUrl ? (
+                  <div style={{ marginTop: 8 }}>
+                    <a className="secondary-button compact" href={platformStatus.outboxUrl} target="_blank" rel="noreferrer">
+                      打开{platformLabel(platformStatus.platform)}草稿箱
+                    </a>
+                  </div>
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : null}
       </section>
 
       {tasks.length === 0 ? (
         <EmptyState
           title="暂无任务记录"
-          description="在发布确认页发起模拟发布或 mock 发布后，任务会出现在这里。"
+          description="在发布确认页发起模拟发布、mock 发布或真实草稿后，任务会出现在这里。"
           actionHref="/publish"
           actionLabel="去发布确认"
         />
@@ -335,9 +432,11 @@ export default function TasksPage() {
 
                       {result.url ? (
                         <a className="ghost-button compact" href={result.url} target="_blank" rel="noreferrer">
-                          打开 mock 链接
+                          {resultLinkLabel(result.url, activeTask.mode)}
                         </a>
                       ) : null}
+
+                      {result.issues.length > 0 ? <IssueList issues={result.issues} /> : null}
 
                       {result.status !== "succeeded" ? (
                         <button
@@ -355,7 +454,7 @@ export default function TasksPage() {
                         </button>
                       ) : null}
 
-                      {activeTask.mode === "real-publish" && result.platform === "wechat" ? (
+                      {activeTask.mode === "real-publish" ? (
                         <button
                           className="secondary-button compact"
                           type="button"

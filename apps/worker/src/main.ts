@@ -18,6 +18,22 @@ function createTimestamp() {
   return new Date().toISOString();
 }
 
+const realDraftManualActionIssueSuffixes = [
+  "_REAL_DRAFT_UNSUPPORTED",
+  "_REAL_PUBLISH_DISABLED",
+  "_DRAFT_ENDPOINT_MISSING",
+  "_DRAFT_CONNECTOR_REJECTED",
+  "_DRAFT_CONNECTOR_ERROR",
+];
+
+function isRealDraftManualActionIssue(issue: { code: string }) {
+  return realDraftManualActionIssueSuffixes.some((suffix) => issue.code.endsWith(suffix));
+}
+
+function shouldHoldRealDraftForManualAction(mode: string, issues: Array<{ code: string }>) {
+  return mode === "real-publish" && issues.some(isRealDraftManualActionIssue);
+}
+
 async function markWorkerWorking(taskId?: string) {
   await updateWorkerStatus({
     status: "working",
@@ -99,10 +115,31 @@ async function processPublishTarget(job: Job<PublishQueueJobData>) {
         document: context.document,
         dryRun: context.mode !== "real-publish",
         credential: context.credential ?? undefined,
+        execution: {
+          taskId: context.taskId,
+          targetId: context.targetId,
+          attemptCount: context.attemptCount,
+        },
       });
 
       if (!result.ok) {
-        await markPublishTargetFailed(context.targetId, `${context.platform} mock 发布失败。`, result.issues);
+        if (shouldHoldRealDraftForManualAction(context.mode, result.issues)) {
+          await markPublishTargetNeedsManualAction(
+            context.targetId,
+            `${context.platform} 真实草稿连接器需要人工处理后继续。`,
+            result.issues,
+            {
+              remoteId: result.remoteId,
+              url: result.url,
+            },
+          );
+        } else {
+          await markPublishTargetFailed(
+            context.targetId,
+            context.mode === "real-publish" ? `${context.platform} 真实草稿发布失败。` : `${context.platform} mock 发布失败。`,
+            result.issues,
+          );
+        }
       } else {
         await markPublishTargetSucceeded(context.targetId, {
           remoteId: result.remoteId,

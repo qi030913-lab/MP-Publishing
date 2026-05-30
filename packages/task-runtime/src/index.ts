@@ -193,6 +193,7 @@ const defaultAccounts: PlatformAccountRecord[] = [
     handle: "内容系统设计",
     authMode: "official-api",
     health: "healthy",
+    credentialRef: process.env.ZHIHU_CREDENTIAL_REF ?? "env:ZHIHU",
     credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T22:05:00+08:00",
   },
@@ -202,7 +203,8 @@ const defaultAccounts: PlatformAccountRecord[] = [
     displayName: "B站视频号",
     handle: "效率创作手记",
     authMode: "hybrid",
-    health: "expiring",
+    health: "healthy",
+    credentialRef: process.env.BILIBILI_CREDENTIAL_REF ?? "env:BILIBILI",
     credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T21:55:00+08:00",
   },
@@ -213,6 +215,7 @@ const defaultAccounts: PlatformAccountRecord[] = [
     handle: "创作效率观察",
     authMode: "hybrid",
     health: "healthy",
+    credentialRef: process.env.XIAOHONGSHU_CREDENTIAL_REF ?? "env:XIAOHONGSHU",
     credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T21:50:00+08:00",
   },
@@ -830,8 +833,8 @@ export async function upsertTask(task: PublishTaskRecord) {
         accountId: target.account?.id,
         status: target.status,
         attemptCount: target.attemptCount,
-        remoteId: target.remoteId,
-        url: target.url,
+        remoteId: target.remoteId ?? null,
+        url: target.url ?? null,
         screenshots: toJson(target.screenshots ?? []),
         issues: toJson(target.issues),
         logs: toJson(target.logs),
@@ -1176,7 +1179,15 @@ export async function markPublishTargetNeedsRetry(targetId: string, message: str
   );
 }
 
-export async function markPublishTargetNeedsManualAction(targetId: string, message: string) {
+export async function markPublishTargetNeedsManualAction(
+  targetId: string,
+  message: string,
+  issues: ValidationIssue[] = [],
+  result: {
+    remoteId?: string;
+    url?: string;
+  } = {},
+) {
   const target = await prisma.publishTarget.findUnique({
     where: { id: targetId },
     select: { attemptCount: true, platform: true },
@@ -1206,6 +1217,9 @@ export async function markPublishTargetNeedsManualAction(targetId: string, messa
     createEvent("needs_manual_action", "warning", message, target.platform as PlatformName),
     {
       status: "needs_manual_action",
+      remoteId: result.remoteId,
+      url: result.url,
+      issues,
       completedAt: new Date(),
     },
   );

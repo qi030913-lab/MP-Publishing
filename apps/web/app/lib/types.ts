@@ -164,4 +164,55 @@ export type RuntimeStatus = {
     manualActionCount: number;
     succeededCount: number;
   };
+  draftConnector: {
+    status: "online" | "offline" | "configured" | "unconfigured";
+    baseUrl?: string;
+    publicBaseUrl?: string;
+    outboxUrl?: string;
+    contractUrl?: string;
+    contractVersion?: string;
+    healthUrl?: string;
+    outboxDir?: string;
+    outbox?: {
+      total?: number;
+      platforms?: Array<{
+        platform?: PlatformName;
+        total?: number;
+        externalizedCount?: number;
+        stalePublishingCount?: number;
+        latestUpdatedAt?: string;
+        byState?: Partial<Record<string, number>>;
+      }>;
+    };
+    detail: string;
+    platforms: Array<{
+      platform: PlatformName;
+      realPublishEnabled: boolean;
+      draftReady: boolean;
+      draftCredentialRequired: boolean;
+      draftReadinessIssues: Array<{
+        code: string;
+        message: string;
+        severity: "info" | "warning" | "error";
+      }>;
+      draftEndpoint?: string;
+      statusEndpoint?: string;
+      outboxUrl?: string;
+      upstreamDraftEndpointConfigured?: boolean;
+      upstreamStatusEndpointConfigured?: boolean;
+      upstreamCredentialForwardingEnabled?: boolean;
+      upstreamStatusCredentialForwardingEnabled?: boolean;
+      upstreamDraftStatus?: "unconfigured" | "configured" | "online" | "offline";
+      upstreamDraftDetail?: string;
+      upstreamDraftHealthEndpoint?: string;
+      outbox?: {
+        platform?: PlatformName;
+        total?: number;
+        externalizedCount?: number;
+        stalePublishingCount?: number;
+        latestUpdatedAt?: string;
+        byState?: Partial<Record<string, number>>;
+      };
+    }>;
+  };
 };

@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { createDocumentFromInput } from "@mp-publishing/content-model";
 import { adapterRegistry } from "@mp-publishing/adapter-core";
-import type { PublishStatus } from "@mp-publishing/platform-sdk";
+import type { PlatformName, PublishStatus, ValidationIssue } from "@mp-publishing/platform-sdk";
 import {
   createContentSnapshot,
   enqueueTaskTargets,
@@ -27,6 +27,101 @@ import type {
   SimulatePublishDto,
   SyncPublishTaskDto,
 } from "./publish.dto.js";
+
+const draftConnectorPlatforms: Partial<Record<PlatformName, { envPrefix: string }>> = {
+  zhihu: { envPrefix: "ZHIHU" },
+  bilibili: { envPrefix: "BILIBILI" },
+  xiaohongshu: { envPrefix: "XIAOHONGSHU" },
+};
+
+type DraftConnectorHealthPayload = {
+  upstreamDrafts?: Array<{
+    platform?: PlatformName;
+    draftEndpointConfigured?: boolean;
+    statusEndpointConfigured?: boolean;
+    credentialForwardingEnabled?: boolean;
+    statusCredentialForwardingEnabled?: boolean;
+    status?: "unconfigured" | "configured" | "online" | "offline" | "needs_action";
+    detail?: string;
+  }>;
+};
+
+function readEnvValue(key: string) {
+  const value = process.env[key]?.trim();
+  return value && value.length > 0 ? value : undefined;
+}
+
+function isEnabled(key: string) {
+  return readEnvValue(key)?.toLowerCase() === "true";
+}
+
+function trimTrailingSlash(value: string) {
+  return value.replace(/\/+$/, "");
+}
+
+function mergeValidationIssues(current: ValidationIssue[], incoming: ValidationIssue[] = []) {
+  const seen = new Set<string>();
+  const merged: ValidationIssue[] = [];
+
+  for (const issue of [...current, ...incoming]) {
+    const key = `${issue.code}\u0000${issue.severity}\u0000${issue.message}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    merged.push(issue);
+  }
+
+  return merged;
+}
+
+function isLocalConnectorHost(hostname: string) {
+  const normalized = hostname.toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function inferLocalDraftConnectorHealthUrl(platform: PlatformName, draftEndpoint: string | undefined) {
+  if (!draftEndpoint) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(draftEndpoint);
+    const pathname = url.pathname.replace(/\/+$/, "");
+    if (!isLocalConnectorHost(url.hostname) || pathname !== `/${platform}/drafts`) {
+      return undefined;
+    }
+
+    return `${url.origin}/health`;
+  } catch {
+    return undefined;
+  }
+}
+
+function resolveDraftEndpoint(platform: PlatformName, envPrefix: string) {
+  const explicitEndpoint = readEnvValue(`${envPrefix}_DRAFT_ENDPOINT`);
+  if (explicitEndpoint) {
+    return explicitEndpoint;
+  }
+
+  const baseUrl = readEnvValue("DRAFT_CONNECTOR_BASE_URL");
+  return baseUrl ? `${trimTrailingSlash(baseUrl)}/${platform}/drafts` : undefined;
+}
+
+function resolveDraftConnectorHealthUrl(platform: PlatformName, envPrefix: string) {
+  const explicitHealthUrl = readEnvValue("DRAFT_CONNECTOR_HEALTH_URL");
+  if (explicitHealthUrl) {
+    return explicitHealthUrl;
+  }
+
+  const baseUrl = readEnvValue("DRAFT_CONNECTOR_BASE_URL");
+  if (baseUrl) {
+    return `${trimTrailingSlash(baseUrl)}/health`;
+  }
+
+  return inferLocalDraftConnectorHealthUrl(platform, readEnvValue(`${envPrefix}_DRAFT_ENDPOINT`));
+}
 
 @Injectable()
 export class PublishService {
@@ -93,8 +188,183 @@ export class PublishService {
     return "queued";
   }
 
+  private createIssue(code: string, message: string, severity: ValidationIssue["severity"] = "error"): ValidationIssue {
+    return { code, message, severity };
+  }
+
+  private async probeDraftConnectorHealth(platform: PlatformName, envPrefix: string) {
+    const healthUrl = resolveDraftConnectorHealthUrl(platform, envPrefix);
+    if (!healthUrl) {
+      return [];
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+
+    try {
+      const response = await fetch(healthUrl, { signal: controller.signal });
+      if (!response.ok) {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_DRAFT_CONNECTOR_OFFLINE`,
+            `Draft connector health check returned HTTP ${response.status}; start the connector before creating a real ${platform} draft.`,
+          ),
+        ];
+      }
+
+      const payload = (await response.json().catch(() => ({}))) as DraftConnectorHealthPayload;
+      const upstreamStatus = payload.upstreamDrafts?.find((item) => item.platform === platform);
+      if (upstreamStatus?.draftEndpointConfigured && upstreamStatus.status === "offline") {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_UPSTREAM_DRAFT_CONNECTOR_OFFLINE`,
+            upstreamStatus.detail ??
+              `${platform} upstream draft connector health check failed before creating a real draft.`,
+          ),
+        ];
+      }
+
+      if (upstreamStatus?.draftEndpointConfigured && upstreamStatus.status === "needs_action") {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_UPSTREAM_DRAFT_CONNECTOR_NOT_READY`,
+            upstreamStatus.detail ??
+              `${platform} upstream draft connector is reachable but not ready before creating a real draft.`,
+          ),
+        ];
+      }
+
+      if (upstreamStatus?.draftEndpointConfigured && upstreamStatus.credentialForwardingEnabled && !isEnabled(`${envPrefix}_DRAFT_INCLUDE_CREDENTIAL`)) {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_DRAFT_CREDENTIAL_FORWARDING_DISABLED`,
+            `Enable ${envPrefix}_DRAFT_INCLUDE_CREDENTIAL=true because the local draft connector is configured to forward credentials to the ${platform} upstream draft service.`,
+          ),
+        ];
+      }
+
+      return [];
+    } catch (error) {
+      return [
+        this.createIssue(
+          `${platform.toUpperCase()}_DRAFT_CONNECTOR_OFFLINE`,
+          error instanceof Error
+            ? error.message
+            : `Draft connector health check failed before creating a real ${platform} draft.`,
+        ),
+      ];
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async preflightRealDraftTarget(platform: PlatformName, account: PlatformAccountRecord | null) {
+    const connectorConfig = draftConnectorPlatforms[platform];
+    const issues: ValidationIssue[] = [];
+
+    if (!connectorConfig) {
+      return issues;
+    }
+
+    const enabledKey = `${connectorConfig.envPrefix}_REAL_PUBLISH_ENABLED`;
+    if (!isEnabled(enabledKey)) {
+      issues.push(
+        this.createIssue(
+          `${platform.toUpperCase()}_REAL_PUBLISH_DISABLED`,
+          `Set ${enabledKey}=true before creating a real ${platform} draft.`,
+        ),
+      );
+    }
+
+    const includeCredentialKey = `${connectorConfig.envPrefix}_DRAFT_INCLUDE_CREDENTIAL`;
+    if (isEnabled(includeCredentialKey) && !resolvePlatformCredential(account)) {
+      issues.push(
+        this.createIssue(
+          `${platform.toUpperCase()}_DRAFT_CREDENTIAL_MISSING`,
+          `Set credentials for ${account?.credentialRef ?? platform} or disable ${includeCredentialKey} before creating a credentialed real ${platform} draft.`,
+        ),
+      );
+    }
+
+    if (!resolveDraftEndpoint(platform, connectorConfig.envPrefix)) {
+      issues.push(
+        this.createIssue(
+          `${platform.toUpperCase()}_DRAFT_ENDPOINT_MISSING`,
+          `Configure ${connectorConfig.envPrefix}_DRAFT_ENDPOINT or DRAFT_CONNECTOR_BASE_URL before creating a real ${platform} draft.`,
+        ),
+      );
+    }
+
+    issues.push(...(await this.probeDraftConnectorHealth(platform, connectorConfig.envPrefix)));
+
+    return issues;
+  }
+
+  private async preflightDraftStatusSyncTarget(platform: PlatformName) {
+    const connectorConfig = draftConnectorPlatforms[platform];
+    if (!connectorConfig) {
+      return [];
+    }
+
+    const healthUrl = resolveDraftConnectorHealthUrl(platform, connectorConfig.envPrefix);
+    if (!healthUrl) {
+      return [];
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+
+    try {
+      const response = await fetch(healthUrl, { signal: controller.signal });
+      if (!response.ok) {
+        return [];
+      }
+
+      const payload = (await response.json().catch(() => ({}))) as DraftConnectorHealthPayload;
+      const upstreamStatus = payload.upstreamDrafts?.find((item) => item.platform === platform);
+      if (upstreamStatus?.statusEndpointConfigured && upstreamStatus.status === "offline") {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_UPSTREAM_STATUS_CONNECTOR_OFFLINE`,
+            upstreamStatus.detail ??
+              `${platform} upstream status connector health check failed before syncing draft status.`,
+          ),
+        ];
+      }
+
+      if (upstreamStatus?.statusEndpointConfigured && upstreamStatus.status === "needs_action") {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_UPSTREAM_STATUS_CONNECTOR_NOT_READY`,
+            upstreamStatus.detail ??
+              `${platform} upstream status connector is reachable but not ready before syncing draft status.`,
+          ),
+        ];
+      }
+
+      if (
+        upstreamStatus?.statusEndpointConfigured &&
+        upstreamStatus.statusCredentialForwardingEnabled &&
+        !isEnabled(`${connectorConfig.envPrefix}_STATUS_INCLUDE_CREDENTIAL`)
+      ) {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_STATUS_CREDENTIAL_FORWARDING_DISABLED`,
+            `Enable ${connectorConfig.envPrefix}_STATUS_INCLUDE_CREDENTIAL=true because the local draft connector is configured to forward credentials to the ${platform} upstream status service.`,
+          ),
+        ];
+      }
+
+      return [];
+    } catch {
+      return [];
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   private mapRemoteStateToTargetStatus(state: PublishStatus["state"]): PublishTaskTargetRecord["status"] {
-    if (state === "succeeded") {
+    if (state === "succeeded" || state === "draft" || state === "ready" || state === "partially_succeeded") {
       return "succeeded";
     }
 
@@ -174,40 +444,52 @@ export class PublishService {
     mode: PublishTaskMode,
     input: SimulatePublishDto | PublishMockDto | PublishRealDto,
   ): Promise<PublishTaskRecord> {
-    if (mode === "real-publish" && input.platforms.some((platform) => platform !== "wechat")) {
-      throw new BadRequestException("real publish is currently enabled for wechat only");
-    }
-
     const accounts = (await listAccounts()).filter((account) => input.accountIds.includes(account.id));
     const taskCreatedAt = this.createTimestamp();
 
     const document = this.createBaseDocument(input);
     const contentSnapshot = await createContentSnapshot(document);
 
-    const targets = input.platforms.map((platform) => {
-        const matchedAccount = accounts.find((account) => account.platform === platform) ?? null;
+    const targets = await Promise.all(input.platforms.map(async (platform) => {
+      const matchedAccount = accounts.find((account) => account.platform === platform) ?? null;
+      const preflightIssues = mode === "real-publish" ? await this.preflightRealDraftTarget(platform, matchedAccount) : [];
+      const initialStatus = this.resolveInitialTargetStatus(matchedAccount);
+        const targetStatus =
+          initialStatus === "queued" && preflightIssues.length > 0 ? "needs_manual_action" : initialStatus;
         const baseLogs = [
           this.createLog(
             "info",
             mode === "simulate"
               ? `已创建 ${platform} 模拟发布任务。`
               : mode === "real-publish"
-                ? `已创建 ${platform} 真实发布任务。`
+                ? `已创建 ${platform} 真实草稿任务。`
                 : `已创建 ${platform} mock 发布任务。`,
           ),
           this.createLog("info", `${platform} 等待 BullMQ worker 执行。`),
         ];
 
+        if (targetStatus !== "queued") {
+          baseLogs.pop();
+          baseLogs.push(
+            this.createLog(
+              "warning",
+              preflightIssues.length > 0
+                ? `${platform} real draft preflight did not pass; connector configuration needs manual action.`
+                : `${platform} requires manual action before queueing.`,
+            ),
+          );
+        }
+
         return {
           platform,
           account: matchedAccount,
-          status: this.resolveInitialTargetStatus(matchedAccount),
+          status: targetStatus,
           attemptCount: 1,
           screenshots: [],
-          issues: [],
+          issues: preflightIssues,
           logs: baseLogs,
         } satisfies PublishTaskTargetRecord;
-      });
+      }));
 
     const task: PublishTaskRecord = {
       id: `task_${Date.now()}`,
@@ -225,7 +507,7 @@ export class PublishService {
           mode === "simulate"
             ? "已创建模拟发布任务。"
             : mode === "real-publish"
-              ? "已创建真实平台发布任务。"
+              ? "已创建真实草稿任务。"
               : "已创建 mock 一键发布任务。",
         ),
         ...targets.map((target) =>
@@ -316,20 +598,59 @@ export class PublishService {
       const runtimeAccount = target.account?.id ? await findAccountById(target.account.id) : null;
       target.account = runtimeAccount ?? target.account;
       target.attemptCount += 1;
-      target.status = this.resolveInitialTargetStatus(target.account);
+      const initialStatus = this.resolveInitialTargetStatus(target.account);
+      const preflightIssues =
+        refreshedTask.mode === "real-publish" && initialStatus === "queued"
+          ? await this.preflightRealDraftTarget(target.platform, target.account)
+          : [];
+      target.status =
+        initialStatus === "queued" && preflightIssues.length > 0 ? "needs_manual_action" : initialStatus;
+      if (refreshedTask.mode === "real-publish") {
+        target.issues = preflightIssues;
+      }
+      if (target.status === "queued") {
+        target.remoteId = undefined;
+        target.url = undefined;
+        target.screenshots = [];
+      }
       target.startedAt = undefined;
       target.completedAt = undefined;
       target.logs.push(this.createLog("info", `已执行第 ${target.attemptCount} 次重试。`));
       refreshedTask.timeline.push(
         this.createEvent("retrying", "info", `${target.platform} 已执行第 ${target.attemptCount} 次重试。`, target.platform),
       );
-      if (!target.account) {
+      if (preflightIssues.length > 0) {
+        target.logs.push(
+          this.createLog(
+            "warning",
+            `${target.platform} real draft preflight did not pass on retry; connector configuration still needs manual action.`,
+          ),
+        );
+        refreshedTask.timeline.push(
+          this.createEvent(
+            "needs_manual_action",
+            "warning",
+            `${target.platform} retry was held before queueing because draft connector preflight did not pass.`,
+            target.platform,
+          ),
+        );
+      } else if (!target.account) {
         target.logs.push(this.createLog("warning", `${target.platform} 缺少账号绑定，重试后仍需人工处理。`));
         refreshedTask.timeline.push(
           this.createEvent(
             "needs_manual_action",
             "warning",
             `${target.platform} 重试后仍缺少账号绑定。`,
+            target.platform,
+          ),
+        );
+      } else if (target.account.health === "needs-login") {
+        target.logs.push(this.createLog("warning", `${target.platform} 账号需要登录，重试后仍需人工处理。`));
+        refreshedTask.timeline.push(
+          this.createEvent(
+            "needs_manual_action",
+            "warning",
+            `${target.platform} 重试后账号仍需要登录。`,
             target.platform,
           ),
         );
@@ -370,9 +691,13 @@ export class PublishService {
     }
 
     const refreshedTask = await this.refreshTaskAccounts(task);
-    const targets = refreshedTask.targets.filter((target) =>
-      input.platform ? target.platform === input.platform : target.platform === "wechat",
-    );
+    const targets = refreshedTask.targets.filter((target) => {
+      if (input.platform) {
+        return target.platform === input.platform;
+      }
+
+      return refreshedTask.mode === "real-publish" || target.platform === "wechat";
+    });
 
     if (targets.length === 0) {
       throw new BadRequestException("no syncable publish targets found");
@@ -406,6 +731,18 @@ export class PublishService {
         continue;
       }
 
+      const preflightIssues =
+        refreshedTask.mode === "real-publish" ? await this.preflightDraftStatusSyncTarget(target.platform) : [];
+      if (preflightIssues.length > 0) {
+        const message = `${target.platform} 状态同步预检未通过，连接器状态同步配置或上游可用性需要人工处理。`;
+        target.status = "needs_manual_action";
+        target.issues = mergeValidationIssues(target.issues, preflightIssues);
+        target.logs.push(this.createLog("warning", message));
+        target.completedAt = this.createTimestamp();
+        refreshedTask.timeline.push(this.createEvent("needs_manual_action", "warning", message, target.platform));
+        continue;
+      }
+
       const status = await adapter.getPublishStatus(target.remoteId, {
         accountId: target.account.id,
         credential: resolvePlatformCredential(target.account) ?? undefined,
@@ -416,7 +753,7 @@ export class PublishService {
       target.status = nextTargetStatus;
       target.remoteId = status.remoteId ?? target.remoteId;
       target.url = status.url ?? target.url;
-      target.issues = [...target.issues, ...(status.issues ?? [])];
+      target.issues = mergeValidationIssues(target.issues, status.issues);
       target.logs.push(this.createLog(nextTargetStatus === "failed" ? "error" : "info", message));
       target.completedAt = nextTargetStatus === "running" ? undefined : this.createTimestamp();
       refreshedTask.timeline.push(

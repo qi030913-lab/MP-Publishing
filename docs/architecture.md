@@ -15,6 +15,7 @@
   - `/accounts`：账号管理页
 - **后端 API**：`apps/api`，NestJS，提供平台能力、预览、账号、发布任务和 runtime 状态接口；创建发布任务时写入 Prisma 并投递 BullMQ target job
 - **Worker**：`apps/worker`，BullMQ consumer，消费发布 target job 并推进 `queued -> running -> succeeded / needs_retry / needs_manual_action`
+- **Draft Connector**：`apps/draft-connector`，本地 HTTP 草稿连接器，可接收知乎 / B站 / 小红书平台化草稿并保存到 `.runtime/drafts` outbox
 - **内容模型**：`packages/content-model`，提供 Canonical Content Model、输入转换和纯文本导出
 - **平台协议**：`packages/platform-sdk`，定义平台能力、草稿、校验、模拟发布、发布结果等类型
 - **适配器注册中心**：`packages/adapter-core`，注册并调度 4 个平台 adapter
@@ -29,9 +30,29 @@
 - OAuth / Cookie Session / Token 的真实授权、刷新和加密存储
 - 平台真实发布 API、Webhook 回执、状态同步和审计日志
 
-当前大多数 adapter 的 `simulatePublish` 和 `publish` 仍是 mock/demo 行为：模拟发布返回 `simulation://...`，mock 发布返回 `dry-run-*` 和 `https://example.com/...`。
+当前 `simulatePublish` 和 mock 发布仍是 demo 行为：模拟发布返回 `simulation://...`，mock 发布返回 `dry-run-*` 和 `https://example.com/...`。
 
 公众号 adapter 已开始接入真实平台链路：在 `WECHAT_REAL_PUBLISH_ENABLED=true` 且凭证、封面素材配置完整时，可调用微信服务端接口创建真实草稿；在 `WECHAT_SUBMIT_FREEPUBLISH=true` 时才会继续提交发布。任务中心提供手动状态同步入口，公众号发布提交后可通过 `freepublish/get` 查询远程发布状态。由于授权、素材、Webhook 和审核回执仍未完整产品化，当前系统仍应视为真实发布链路联调阶段，不应用作无人值守生产发布。
+
+知乎、B站、小红书 adapter 已接入真实草稿连接器基线：在各自 `*_REAL_PUBLISH_ENABLED=true` 且 `*_DRAFT_ENDPOINT` 配置完整时，worker 会把平台化草稿投递给连接器，由连接器对接官方 API、创作者中心自动化或私有联调服务。工程内置 `apps/draft-connector` 作为本地 outbox 连接器，启动时会读取工作区 `.env` 中的 connector 配置，可先把平台草稿落盘，并返回 `/:platform/drafts/:draftId` 形式的 HTTP 草稿详情链接，同时提供 `/drafts` 和 `/:platform/drafts` 收件箱列表便于联调检查；真实草稿请求会携带 publish task、target 和 attempt 上下文，同一次 worker attempt 重复投递时会复用已有 outbox 草稿，避免重复创建平台草稿；配置 `DRAFT_CONNECTOR_BASE_URL` 后会自动推导各平台 draft / status endpoint，显式配置本地 `/:platform/drafts` endpoint 时也会推导 `/health` 和同源 `/:platform/status`，必要时可用 `DRAFT_CONNECTOR_PUBLIC_BASE_URL` 覆盖对外展示链接。API 会在 `/runtime/status` 暴露连接器在线状态、内部 base URL、public base URL、outbox 入口、各平台 outbox 入口、各平台 draft/status endpoint、`/contract` 上游代理契约和可选 upstream health/status 状态配置，发布页也会在创建知乎 / B站 / 小红书连接器草稿前展示这组就绪信息；创建或重试真实草稿任务时，未启用、缺少 draft endpoint、依赖 `DRAFT_CONNECTOR_BASE_URL` 推导端点但本地连接器离线，或已声明 upstream health endpoint 但上游草稿服务离线的非公众号目标，都会在入队前被标记为 `needs_manual_action`，任务中心会展示 target 级 validation issues 说明具体配置原因。worker 执行真实草稿时，如果 connector 或 upstream 明确拒绝草稿，也会保留 issue、本地草稿 ID 和本地草稿 URL，并把 target 落到 `needs_manual_action`，避免把创作者中心审核/策略拦截混成普通执行失败；手动状态同步会合并去重 issue，若 connector health 显示 upstream status 离线，或 connector 声明 upstream status 需要凭证但 API 侧未开启 `*_STATUS_INCLUDE_CREDENTIAL`，同步会在调用上游前转入 `needs_manual_action`；修好上游后重试会重新入队、清理旧拒绝 issue 和旧草稿链接，直到新尝试返回新的真实草稿结果。连接器可通过 `DRAFT_CONNECTOR_<PLATFORM>_UPSTREAM_DRAFT_ENDPOINT` 同步转发草稿到官方 API 代理或创作者中心自动化服务，并把 upstream 返回的真实平台草稿 ID、URL 和状态落回 outbox；配置 `DRAFT_CONNECTOR_<PLATFORM>_UPSTREAM_HEALTH_ENDPOINT` 或 `DRAFT_CONNECTOR_UPSTREAM_HEALTH_ENDPOINT` 后，连接器 `/health` 会探测上游可用性并供 API 预检使用；配置 `DRAFT_CONNECTOR_<PLATFORM>_UPSTREAM_STATUS_ENDPOINT` 或 `DRAFT_CONNECTOR_UPSTREAM_STATUS_ENDPOINT` 后，任务中心手动 sync 可经由连接器向上游查询真实平台草稿状态并回写 outbox。外部服务也可以调用连接器的 `POST /:platform/drafts/:draftId/status` 事后回写状态，之后任务中心手动 sync 会把 target 从本地 outbox 链接推进到真实平台草稿链接。upstream sandbox 现在也会为每个收到的草稿生成 creator-center work order，包含标题/正文/标签、填稿检查清单、安全模式提示和 connector callback 模板，便于后续 Playwright 或私有自动化服务按统一输入实现真实落草稿；人工或自动化保存真实平台草稿后，可以调用 work-order complete 路由写入真实 draft id/url 并触发 connector 回调；`pnpm drafts:run-work-orders` 提供了一个可轮询这些工单并自动调用 completion 的本地 runner，可作为真实 Playwright/官方 API worker 的进程骨架。连接器也可选提供 `*_STATUS_ENDPOINT` 做远程状态同步；当前 e2e 已覆盖 connector `.env` 启动、三平台禁用连接器预检、worker 侧配置漂移转待人工处理、三平台连接器离线预检、显式本地 endpoint 状态同步推导、三平台 upstream 离线预检、重试预检不入队、三平台 upstream 恢复后重试进入草稿发布、连接器就绪探测、三平台草稿创建、upstream 同步转发、upstream sandbox work order、work-order runner completion 回调真实草稿链接、upstream 拒绝转待人工处理、拒绝后保留本地草稿链接、拒绝态重复同步 issue 去重、状态凭证转发不一致时同步不打上游、上游 status 离线时同步不打上游、重试入队清理旧链接并在恢复后成功、upstream 状态同步转发、public base outbox/contract 链接、详情链接打开、外部草稿链接回写、outbox 列表和手动 sync 查回草稿状态。这三个平台当前还不是内置官方 API 直连实现。
+
+补充：`pnpm drafts:run-work-orders` 已从单纯的沙箱 completion runner 推进到可委托自动化服务的进程骨架；配置 `DRAFT_WORK_ORDER_AUTOMATION_ENDPOINT` 或平台级 `DRAFT_WORK_ORDER_<PLATFORM>_AUTOMATION_ENDPOINT` 后，runner 会把完整 `draft-upstream-work-order-v1` 工单 POST 给 Playwright/官方 API worker，并使用其返回的真实草稿 id/url 调用 work-order completion。未配置自动化端点时仍会生成沙箱草稿链接，便于本地联调；当前 e2e 覆盖了这条 automation 委托和回调链路。
+
+补充：`pnpm drafts:automation-service` 提供了本地可启动的 automation endpoint，默认把 runner 投递的工单保存为可浏览的本地 handoff draft，并暴露 `/health`、`/contract`、`/drafts` 和 `/:platform/drafts/:automationDraftId`；配置 `DRAFT_AUTOMATION_SERVICE_HANDLER_MODULE` 后可以由外部 ESM handler 接管真实 Playwright 或官方 API 创建草稿逻辑，同时保持 runner、sandbox completion 和 connector callback 契约不变。它也可以直接作为 draft connector upstream endpoint 使用：`POST /:platform/drafts` 会接收 `draft-connector-upstream-v1` 请求、转成脱敏的 `draft-upstream-work-order-v1`，再交给同一个 handler，因此 `DRAFT_CONNECTOR_<PLATFORM>_UPSTREAM_DRAFT_ENDPOINT=http://localhost:3030/<platform>/drafts` 可以直接把 connector 草稿转发到 Playwright/官方 API 自动化服务。该服务还定义了平台级 session 输入：`DRAFT_AUTOMATION_<PLATFORM>_ACCESS_TOKEN`、`*_COOKIES`、`*_STORAGE_STATE_JSON`、`*_STORAGE_STATE_PATH` 和 creator URL 会以 `platformSession` 传给 handler；当 connector upstream 请求携带 credential 时，raw 凭证只会合并进本次 handler 调用，健康检查、contract、outbox 和转出的 work order 仍只保留脱敏摘要；配置 `DRAFT_AUTOMATION_<PLATFORM>_REQUIRE_SESSION=true` 时，缺少配置态或 connector 转发态登录材料会在调用 handler 前拒绝工单。
+
+补充：draft connector 现在会解析 upstream `/health` 的业务状态；当 Playwright automation service 返回 `needs_session` 且当前平台在 `missingRequiredSessions` 中时，connector health 会把该平台 upstream 标记为 `needs_action`，API 的 `/publish/real` 预检和 `/runtime/status` 会生成 `*_UPSTREAM_DRAFT_CONNECTOR_NOT_READY`，从而在入队前提示先补 session/selector，而不是等 worker 执行时才失败。当前 e2e 覆盖了这条 automation-service 缺 session 的三平台预检。
+
+补充：`scripts/handlers/playwright-draft-handler.mjs` 是首个可复用 browser automation handler，按平台读取 creator draft URL、session 和 `DRAFT_AUTOMATION_<PLATFORM>_PLAYWRIGHT_SELECTORS_JSON` / `*_SELECTORS_PATH`，只执行打开创作者草稿页、填标题/摘要/正文/标签、点击显式配置的 save-draft selector、等待保存反馈并提取草稿 URL/ID；默认不查找也不点击发布按钮，便于知乎 / B站 / 小红书后续按真实页面 selector 接入。默认保存草稿路径现在要求 selector 文件显式包含 `saveDraft`，否则 handler 会在启动浏览器前失败；只有 `--no-click-save` 的填充预演可以省略该 selector，避免把“只填了页面”误判成“已保存草稿”。
+
+补充：`pnpm drafts:check-playwright -- --platform <platform>` 会复用同一套 Playwright 配置打开创作者草稿页，只检查登录态、必需 selector（title/body）和已配置的可选 selector，并可输出截图；它不会填写字段、不会点击保存草稿，适合在把知乎 / B站 / 小红书真实 selector 接进 automation service 前做页面预演。
+
+补充：`pnpm drafts:capture-playwright-session -- --platform <platform> --url <creator-draft-url> --save-env` 已用于采集真实创作者中心登录态：脚本会打开 Playwright 浏览器供人工完成登录，默认把 storage state 保存到被 git 忽略的 `.runtime/draft-sessions`，并可只把草稿页 URL、storage-state 路径、`REQUIRE_SESSION=true` 和 selector 文件路径写入 `.env`。当前 e2e 已覆盖该捕获脚本的 session 保存、`.env` 指针更新和敏感 cookie 不落盘到 `.env` 的约束。
+
+补充：`pnpm drafts:capture-playwright-selectors -- --platform <platform> --url <creator-draft-url> --fields title,body,saveDraft --save-env` 已补上真实页面 selector 采集步骤：脚本复用上一步的 session 打开创作者草稿页，在页面内注入点击捕获层，让操作者依次点选标题、正文、保存草稿等元素，生成可直接给 `playwright-draft-handler` 使用的扁平 JSON selector 文件，并把 `DRAFT_AUTOMATION_<PLATFORM>_PLAYWRIGHT_SELECTORS_PATH` 写入 `.env`。当前 e2e 已覆盖 selector 文件格式、`.env` 指针更新、可跳过可选字段和敏感 cookie 不落入 `.env`。
+
+补充：Playwright capture、check、automation service 和 smoke 脚本现在会默认加载工作区 `.env`，因此 session capture 写入的 storage-state 路径和 selector capture 写入的 selector 路径会被后续命令自动接上；如需使用隔离配置，可设置 `DRAFT_AUTOMATION_ENV_FILE`。`pnpm drafts:smoke-playwright -- --platform <platform> --headed` 会直接构造安全的 `draft-upstream-work-order-v1` 工单调用内置 handler，默认只点击配置的 save-draft selector，不触碰最终发布按钮，用来在真实知乎 / B站 / 小红书页面上验证“填充并保存草稿”。
+
+补充：`pnpm drafts:enable-playwright-automation -- --api-key <key>` 会把应用侧真实草稿链路一键接到本地 Playwright automation service：它开启知乎 / B站 / 小红书真实草稿目标、保留本地 draft connector 作为 outbox/回写层、把 `DRAFT_CONNECTOR_<PLATFORM>_UPSTREAM_DRAFT_ENDPOINT` 指向 `http://localhost:3030/<platform>/drafts`，并配置 `DRAFT_AUTOMATION_SERVICE_HANDLER_MODULE=scripts/handlers/playwright-draft-handler.mjs` 和平台级 `REQUIRE_SESSION=true`。当前 e2e 已覆盖该脚本写出的 connector/service/upstream/session-required 配置，避免真实联调时手工漏填。
 
 ## 1. 目标
 
@@ -175,6 +196,7 @@ flowchart LR
     Q --> WK["Worker<br/>BullMQ consumer"]
     WK --> DB
     WK --> REG
+    WK --> DC["Draft Connector<br/>local outbox / automation proxy"]
 ```
 
 当前 `task-runtime` 不再保存 `.runtime/publish-state.json`，而是作为数据与队列边界：
@@ -381,6 +403,7 @@ apps/
   web/
   api/
   worker/
+  draft-connector/
 packages/
   content-model/
   platform-sdk/
@@ -453,8 +476,10 @@ packages/
 
 - `/preview` 仍直接从输入生成 Canonical Document 和平台草稿，不写入内容库
 - `/publish/simulate` 和 `/publish/mock` 会创建 `ContentDocument / ContentVersion / PublishJob / PublishTarget`，然后将可执行 target 投递到 BullMQ
-- `/publish/real` 当前仅允许公众号，默认受环境开关保护；可创建真实公众号草稿，并可选提交发布
-- `/publish/tasks/:taskId/sync` 当前主要用于公众号 `freepublish/get` 手动状态同步
+- `/publish/real` 默认受环境开关保护；公众号走微信服务端草稿 API，知乎 / B站 / 小红书走可配置 draft connector
+- `/publish/real` 和真实草稿重试都会对知乎 / B站 / 小红书执行连接器预检；未启用真实草稿、缺少 draft endpoint、本地连接器离线或已声明 upstream health endpoint 但上游草稿服务离线时不会入队执行
+- `/publish/tasks/:taskId/sync` 当前支持公众号 `freepublish/get`、各平台可选 `*_STATUS_ENDPOINT`，以及本地 draft connector 可选 upstream status endpoint 手动状态同步；显式本地 `/:platform/drafts` endpoint 会自动推导同源 `/:platform/status`；当连接器 status 上游离线或凭证转发配置不一致时会提前转待人工处理
+- `/runtime/status` 会同时返回 worker/queue/task 统计和 draft connector 就绪状态，并为每个平台给出 `draftReady`、凭证转发要求和 readiness issue codes，用于发布页提示知乎 / B站 / 小红书草稿连接器是否在线、各平台真实草稿是否可创建
 - `/accounts/*` 操作 Prisma 中的 demo 账号健康状态，不是真实平台授权
 - `/runtime/status` 用于前端任务中心展示 worker 心跳和队列统计
 

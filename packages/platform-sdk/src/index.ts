@@ -53,6 +53,11 @@ export type PublishInput = {
   document: CanonicalDocument;
   dryRun?: boolean;
   credential?: PlatformCredential;
+  execution?: {
+    taskId: string;
+    targetId: string;
+    attemptCount: number;
+  };
 };
 
 export type SimulationResult = {
