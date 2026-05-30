@@ -8,7 +8,7 @@ import { useEffect, useMemo, useState } from "react";
 import { getRuntimeStatus, listAccounts, runPublishAction } from "../lib/api";
 import { loadDraft, saveActiveTaskId, saveDraft } from "../lib/draft-store";
 import { platformLabel } from "../lib/platforms";
-import type { DraftDocument, PlatformAccount, RuntimeStatus } from "../lib/types";
+import type { DraftDocument, PlatformAccount, PlatformName, RuntimeStatus } from "../lib/types";
 import { PlatformPicker } from "../components/platform-picker";
 import {
   EmptyState,
@@ -46,6 +46,8 @@ function connectorLabel(status: RuntimeStatus["draftConnector"]["status"]) {
   return "未配置";
 }
 
+const connectorDraftPlatforms = new Set<PlatformName>(["zhihu", "bilibili", "xiaohongshu"]);
+
 export default function PublishPage() {
   const router = useRouter();
   const [draft, setDraft] = useState<DraftDocument | null>(null);
@@ -65,6 +67,16 @@ export default function PublishPage() {
   const accountsByPlatform = useMemo(
     () => new Map(selectedAccounts.map((account) => [account.platform, account])),
     [selectedAccounts],
+  );
+
+  const selectedConnectorDraftPlatforms = useMemo(
+    () => draft?.platforms.filter((platform) => connectorDraftPlatforms.has(platform)) ?? [],
+    [draft],
+  );
+
+  const readyConnectorDraftPlatforms = useMemo(
+    () => selectedConnectorDraftPlatforms.filter((platform) => accountsByPlatform.has(platform)),
+    [accountsByPlatform, selectedConnectorDraftPlatforms],
   );
 
   useEffect(() => {
@@ -121,15 +133,15 @@ export default function PublishPage() {
       return;
     }
 
-    const realDraftPlatforms = draft.platforms.filter((platform) =>
-      selectedAccounts.some((account) => account.platform === platform),
+    const realDraftPlatforms = draft.platforms.filter(
+      (platform) => connectorDraftPlatforms.has(platform) && selectedAccounts.some((account) => account.platform === platform),
     );
     const realDraftAccountIds = selectedAccounts
       .filter((account) => realDraftPlatforms.includes(account.platform))
       .map((account) => account.id);
 
     if (realDraftPlatforms.length === 0) {
-      setError("请先为目标平台选择可用账号。");
+      setError("请先选择知乎、B站或小红书平台，并为其选择可用账号。");
       return;
     }
 
@@ -165,7 +177,7 @@ export default function PublishPage() {
             </button>
             <button className="secondary-button" type="button" onClick={submitRealDraft} disabled={isRealPublishing}>
               {isRealPublishing ? <LoadingInline label="提交中" /> : <Rocket size={18} />}
-              创建真实草稿
+              创建连接器草稿
             </button>
           </>
         }
@@ -190,7 +202,7 @@ export default function PublishPage() {
             <div className="summary-grid">
               <SummaryTile label="正文段落" value={draft.body.split(/\n{2,}/).filter(Boolean).length} />
               <SummaryTile label="标签" value={draft.tags.length} />
-              <SummaryTile label="账号" value={selectedAccounts.length} />
+              <SummaryTile label="账号" value={selectedAccounts.length} detail={`连接器草稿 ${readyConnectorDraftPlatforms.length}`} />
             </div>
 
             <div className="field" style={{ marginTop: 18 }}>
