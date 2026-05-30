@@ -1963,6 +1963,169 @@ async function runUpstreamDraftRejectionManualActionCheck() {
   }
 }
 
+async function runStatusCredentialForwardingMismatchSyncCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const upstreamPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const apiPort = await getFreePort();
+  const upstream = await startFakeUpstreamDraftService(upstreamPort, "status-mismatch-upstream-secret");
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const outboxDir = path.join(runtimeDir, `draft-connector-status-credential-mismatch-e2e-${Date.now()}`);
+  const queueName = `mp-publishing-draft-status-credential-mismatch-e2e-${Date.now()}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+
+  const connectorEnv = {
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+    ZHIHU_STATUS_INCLUDE_CREDENTIAL: "",
+    BILIBILI_STATUS_INCLUDE_CREDENTIAL: "",
+    XIAOHONGSHU_STATUS_INCLUDE_CREDENTIAL: "",
+  };
+  const draftConnectorEnv = {
+    PORT: String(connectorPort),
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_UPSTREAM_API_KEY: "status-mismatch-upstream-secret",
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/zhihu/drafts`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_STATUS_ENDPOINT: `${upstream.baseUrl}/zhihu/status`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_STATUS_INCLUDE_CREDENTIAL: "true",
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/bilibili/drafts`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_STATUS_ENDPOINT: `${upstream.baseUrl}/bilibili/status`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_STATUS_INCLUDE_CREDENTIAL: "true",
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/xiaohongshu/drafts`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_STATUS_ENDPOINT: `${upstream.baseUrl}/xiaohongshu/status`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_STATUS_INCLUDE_CREDENTIAL: "true",
+  };
+
+  const api = startService("api-draft-status-credential-mismatch", ["apps/api/dist/main.js"], connectorEnv);
+  const worker = startService("worker-draft-status-credential-mismatch", ["apps/worker/dist/main.js"], connectorEnv);
+  const draftConnector = startService(
+    "draft-connector-status-credential-mismatch",
+    ["apps/draft-connector/dist/main.js"],
+    draftConnectorEnv,
+  );
+
+  try {
+    const connectorHealth = await waitForHealth(
+      draftConnector,
+      `${connectorBaseUrl}/health`,
+      "Draft connector status credential mismatch",
+    );
+    if (
+      platforms.some(
+        (platform) =>
+          !connectorHealth.upstreamDrafts?.some(
+            (item) =>
+              item.platform === platform &&
+              item.statusEndpointConfigured &&
+              item.statusCredentialForwardingEnabled &&
+              item.status === "online",
+          ),
+      )
+    ) {
+      throw new Error(`Draft connector health did not expose upstream status credential requirements: ${JSON.stringify(connectorHealth)}`);
+    }
+
+    await waitForApi(api);
+    await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
+
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for status credential mismatch verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "Status credential mismatch e2e",
+          summary: "Verify status sync is held before forwarding an uncredentialed upstream request.",
+          body: "This content confirms status sync credential forwarding must be enabled on both API and connector hops.",
+          tags: ["draft", "status", "credential", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+
+    let task = created;
+    for (let i = 0; i < 50; i += 1) {
+      await delay(600);
+      task = await requestJson(`/publish/tasks/${created.id}`);
+      if (!["running", "queued"].includes(task.status)) {
+        break;
+      }
+    }
+
+    if (task.status !== "succeeded" || upstream.requests.length !== platforms.length) {
+      throw new Error(`Status credential mismatch setup did not create upstream drafts: ${JSON.stringify({ task, upstreamRequests: upstream.requests })}`);
+    }
+
+    const synced = await requestJson(`/publish/tasks/${created.id}/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    if (
+      synced.status !== "needs_manual_action" ||
+      platforms.some((platform) => {
+        const target = synced.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return (
+          target?.status !== "needs_manual_action" ||
+          !target.remoteId?.startsWith(`${platform}-upstream-${platform}-draft-`) ||
+          !target.url?.startsWith(`https://upstream.example.test/${platform}/`) ||
+          !issueCodes.includes(`${platform.toUpperCase()}_STATUS_CREDENTIAL_FORWARDING_DISABLED`)
+        );
+      })
+    ) {
+      throw new Error(`Status credential mismatch sync was not held for manual action: ${JSON.stringify(synced)}`);
+    }
+
+    if (upstream.statusRequests.length > 0) {
+      throw new Error(`Status credential mismatch should not call upstream status: ${JSON.stringify(upstream.statusRequests)}`);
+    }
+
+    return {
+      taskId: created.id,
+      finalStatus: synced.status,
+      targets: synced.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        remoteId: target.remoteId,
+        url: target.url,
+        issueCodes: target.issues.map((issue) => issue.code),
+      })),
+      upstreamDraftRequests: upstream.requests.map((request) => request.platform).sort(),
+      upstreamStatusRequests: upstream.statusRequests.length,
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector)]);
+    await upstream.close();
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runCredentialForwardingCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -2175,6 +2338,7 @@ const offlineUpstreamPreflight = await runOfflineUpstreamDraftPreflightCheck();
 const offlineUpstreamRecovery = await runOfflineUpstreamDraftRecoveryCheck();
 const upstreamForwarding = await runUpstreamDraftForwardingCheck();
 const upstreamRejectionManualAction = await runUpstreamDraftRejectionManualActionCheck();
+const statusCredentialMismatch = await runStatusCredentialForwardingMismatchSyncCheck();
 const credentialForwarding = await runCredentialForwardingCheck();
 
 const api = startService("api", ["apps/api/dist/main.js"], connectorEnv);
@@ -2445,6 +2609,7 @@ try {
     offlineUpstreamRecovery,
     upstreamForwarding,
     upstreamRejectionManualAction,
+    statusCredentialMismatch,
     credentialForwarding,
     queue: runtime.queue,
   };

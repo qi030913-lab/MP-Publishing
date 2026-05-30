@@ -290,6 +290,49 @@ export class PublishService {
     return issues;
   }
 
+  private async preflightDraftStatusSyncTarget(platform: PlatformName) {
+    const connectorConfig = draftConnectorPlatforms[platform];
+    if (!connectorConfig) {
+      return [];
+    }
+
+    const healthUrl = resolveDraftConnectorHealthUrl(platform, connectorConfig.envPrefix);
+    if (!healthUrl) {
+      return [];
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+
+    try {
+      const response = await fetch(healthUrl, { signal: controller.signal });
+      if (!response.ok) {
+        return [];
+      }
+
+      const payload = (await response.json().catch(() => ({}))) as DraftConnectorHealthPayload;
+      const upstreamStatus = payload.upstreamDrafts?.find((item) => item.platform === platform);
+      if (
+        upstreamStatus?.statusEndpointConfigured &&
+        upstreamStatus.statusCredentialForwardingEnabled &&
+        !isEnabled(`${connectorConfig.envPrefix}_STATUS_INCLUDE_CREDENTIAL`)
+      ) {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_STATUS_CREDENTIAL_FORWARDING_DISABLED`,
+            `Enable ${connectorConfig.envPrefix}_STATUS_INCLUDE_CREDENTIAL=true because the local draft connector is configured to forward credentials to the ${platform} upstream status service.`,
+          ),
+        ];
+      }
+
+      return [];
+    } catch {
+      return [];
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
   private mapRemoteStateToTargetStatus(state: PublishStatus["state"]): PublishTaskTargetRecord["status"] {
     if (state === "succeeded" || state === "draft" || state === "ready" || state === "partially_succeeded") {
       return "succeeded";
@@ -654,6 +697,18 @@ export class PublishService {
       if (!adapter.getPublishStatus) {
         const message = `${target.platform} 暂未实现远程状态查询。`;
         target.logs.push(this.createLog("warning", message));
+        refreshedTask.timeline.push(this.createEvent("needs_manual_action", "warning", message, target.platform));
+        continue;
+      }
+
+      const preflightIssues =
+        refreshedTask.mode === "real-publish" ? await this.preflightDraftStatusSyncTarget(target.platform) : [];
+      if (preflightIssues.length > 0) {
+        const message = `${target.platform} 状态同步预检未通过，连接器凭证转发配置需要人工处理。`;
+        target.status = "needs_manual_action";
+        target.issues = mergeValidationIssues(target.issues, preflightIssues);
+        target.logs.push(this.createLog("warning", message));
+        target.completedAt = this.createTimestamp();
         refreshedTask.timeline.push(this.createEvent("needs_manual_action", "warning", message, target.platform));
         continue;
       }
