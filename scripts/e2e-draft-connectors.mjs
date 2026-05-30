@@ -352,6 +352,27 @@ async function waitForHealth(service, url, label) {
   throw new Error(`${label} health check did not become ready.\n${tail(service.stderrPath)}`);
 }
 
+async function waitForAuthorizedHealth(service, url, label, apiKey) {
+  for (let i = 0; i < 40; i += 1) {
+    if (service.child.exitCode !== null) {
+      throw new Error(`${label} exited early.\n${tail(service.stderrPath)}`);
+    }
+
+    try {
+      const response = await fetch(url, {
+        headers: apiKey ? { authorization: `Bearer ${apiKey}` } : undefined,
+      });
+      if (response.ok) {
+        return response.json();
+      }
+    } catch {
+      await delay(500);
+    }
+  }
+
+  throw new Error(`${label} health check did not become ready.\n${tail(service.stderrPath)}`);
+}
+
 function readDraftOutbox(outboxDir, platforms) {
   return platforms.flatMap((platform) => {
     const platformDir = path.join(outboxDir, platform);
@@ -650,6 +671,81 @@ async function runUpstreamContractCheckScriptCheck() {
     };
   } finally {
     await upstream.close();
+  }
+}
+
+async function runUpstreamSandboxScriptCheck() {
+  const sandboxPort = await getFreePort();
+  const sandboxBaseUrl = `http://127.0.0.1:${sandboxPort}`;
+  const sandboxOutboxDir = path.join(runtimeDir, `draft-upstream-sandbox-e2e-${Date.now()}`);
+  const sandboxApiKey = "sandbox-secret";
+  fs.rmSync(sandboxOutboxDir, { recursive: true, force: true });
+
+  const sandbox = startService("draft-upstream-sandbox", ["scripts/start-draft-upstream-sandbox.mjs"], {
+    DRAFT_UPSTREAM_SANDBOX_PORT: String(sandboxPort),
+    DRAFT_UPSTREAM_SANDBOX_OUTBOX_DIR: sandboxOutboxDir,
+    DRAFT_UPSTREAM_SANDBOX_API_KEY: sandboxApiKey,
+  });
+
+  try {
+    const health = await waitForAuthorizedHealth(sandbox, `${sandboxBaseUrl}/health`, "Draft upstream sandbox", sandboxApiKey);
+    if (health.version !== "draft-upstream-sandbox-v1" || health.contractVersion !== "draft-connector-upstream-v1") {
+      throw new Error(`Draft upstream sandbox health did not expose expected metadata: ${JSON.stringify(health)}`);
+    }
+
+    const checkedPlatforms = [];
+    for (const platform of platforms) {
+      const command = await runNodeCommand("draft upstream sandbox contract check", [
+        path.join(root, "scripts/check-draft-upstream-contract.mjs"),
+        "--platform",
+        platform,
+        "--draft-endpoint",
+        `${sandboxBaseUrl}/${platform}/drafts`,
+        "--status-endpoint",
+        `${sandboxBaseUrl}/${platform}/status`,
+        "--health-endpoint",
+        `${sandboxBaseUrl}/health`,
+        "--api-key",
+        sandboxApiKey,
+        "--include-credential",
+        "--status-include-credential",
+      ]);
+      const result = JSON.parse(command.stdout);
+      if (
+        !result.ok ||
+        result.platform !== platform ||
+        result.draft?.state !== "ready" ||
+        !result.draft?.remoteId?.startsWith(`${platform}-sandbox-`) ||
+        result.status?.state !== "ready"
+      ) {
+        throw new Error(`Draft upstream sandbox failed ${platform} contract check: ${JSON.stringify(result)}`);
+      }
+
+      checkedPlatforms.push({
+        platform,
+        remoteId: result.draft.remoteId,
+        statusState: result.status.state,
+      });
+    }
+
+    const sandboxOutbox = await requestAbsoluteJson(`${sandboxBaseUrl}/drafts`, {
+      headers: { authorization: `Bearer ${sandboxApiKey}` },
+    });
+    if (
+      sandboxOutbox.items?.length !== platforms.length ||
+      platforms.some((platform) => !sandboxOutbox.items.some((item) => item.platform === platform && item.hasCredential && item.statusHasCredential))
+    ) {
+      throw new Error(`Draft upstream sandbox did not persist every checked platform draft: ${JSON.stringify(sandboxOutbox)}`);
+    }
+
+    return {
+      healthStatus: health.status,
+      platforms: checkedPlatforms,
+      outboxTotal: sandboxOutbox.items.length,
+    };
+  } finally {
+    await stopService(sandbox);
+    fs.rmSync(sandboxOutboxDir, { recursive: true, force: true });
   }
 }
 
@@ -3242,6 +3338,7 @@ const draftConnectorEnv = {
 const workspaceEnvCheck = await runDraftConnectorWorkspaceEnvCheck();
 const publicBaseRuntime = await runDraftConnectorPublicBaseRuntimeCheck();
 const upstreamContractCheck = await runUpstreamContractCheckScriptCheck();
+const upstreamSandboxCheck = await runUpstreamSandboxScriptCheck();
 const upstreamProxyEnablement = await runUpstreamProxyEnablementCheck();
 const localEnablement = await runLocalDraftEnablementCheck();
 const disabledPreflight = await runDisabledDraftPreflightCheck();
@@ -3671,6 +3768,7 @@ try {
     workspaceEnvCheck,
     publicBaseRuntime,
     upstreamContractCheck,
+    upstreamSandboxCheck,
     upstreamProxyEnablement,
     localEnablement,
     disabledPreflight,
