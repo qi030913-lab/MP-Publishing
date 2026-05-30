@@ -40,6 +40,22 @@ function startService(name, args, extraEnv = {}) {
   return { name, child, stdoutPath, stderrPath };
 }
 
+function startServiceWithEnv(name, args, cwd, env) {
+  const stdoutPath = path.join(runtimeDir, `${name}-draft-e2e.out.log`);
+  const stderrPath = path.join(runtimeDir, `${name}-draft-e2e.err.log`);
+  const stdout = fs.openSync(stdoutPath, "w");
+  const stderr = fs.openSync(stderrPath, "w");
+  const child = spawn(process.execPath, args, {
+    cwd,
+    env,
+    stdio: ["ignore", stdout, stderr],
+  });
+
+  fs.closeSync(stdout);
+  fs.closeSync(stderr);
+  return { name, child, stdoutPath, stderrPath };
+}
+
 async function stopService(service) {
   if (!service || service.child.exitCode !== null) {
     return;
@@ -282,6 +298,73 @@ function readDraftOutbox(outboxDir, platforms) {
         return JSON.parse(content);
       });
   });
+}
+
+async function runDraftConnectorWorkspaceEnvCheck() {
+  const connectorPort = await getFreePort();
+  const upstreamPort = await getFreePort();
+  const upstreamBaseUrl = `http://127.0.0.1:${upstreamPort}`;
+  const workspaceEnvDir = path.join(runtimeDir, `draft-connector-workspace-env-e2e-${Date.now()}`);
+  const outboxDir = path.join(workspaceEnvDir, "outbox");
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+
+  fs.rmSync(workspaceEnvDir, { recursive: true, force: true });
+  fs.mkdirSync(workspaceEnvDir, { recursive: true });
+  fs.writeFileSync(path.join(workspaceEnvDir, "pnpm-workspace.yaml"), "packages: []\n");
+  fs.writeFileSync(
+    path.join(workspaceEnvDir, ".env"),
+    [
+      `PORT="${connectorPort}"`,
+      `DRAFT_CONNECTOR_OUTBOX_DIR="${outboxDir}"`,
+      `DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_ENDPOINT="${upstreamBaseUrl}/zhihu/drafts"`,
+      `DRAFT_CONNECTOR_ZHIHU_UPSTREAM_HEALTH_ENDPOINT="${upstreamBaseUrl}/health"`,
+      `DRAFT_CONNECTOR_ZHIHU_UPSTREAM_STATUS_ENDPOINT="${upstreamBaseUrl}/zhihu/status"`,
+      `DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_API_KEY="env-upstream-secret"`,
+      "",
+    ].join("\n"),
+  );
+
+  const childEnv = { ...process.env };
+  for (const key of Object.keys(childEnv)) {
+    if (key === "PORT" || key.startsWith("DRAFT_CONNECTOR_")) {
+      delete childEnv[key];
+    }
+  }
+
+  const service = startServiceWithEnv(
+    "draft-connector-workspace-env",
+    [path.join(root, "apps/draft-connector/dist/main.js")],
+    workspaceEnvDir,
+    childEnv,
+  );
+
+  try {
+    const health = await waitForHealth(service, `${connectorBaseUrl}/health`, "Draft connector workspace env");
+    const zhihuUpstream = health.upstreamDrafts?.find((item) => item.platform === "zhihu");
+
+    if (
+      health.outboxDir !== path.resolve(outboxDir) ||
+      !zhihuUpstream?.draftEndpointConfigured ||
+      !zhihuUpstream.statusEndpointConfigured ||
+      zhihuUpstream.status !== "offline" ||
+      zhihuUpstream.healthEndpoint !== `${upstreamBaseUrl}/health`
+    ) {
+      throw new Error(`Draft connector did not load workspace .env settings: ${JSON.stringify(health)}`);
+    }
+
+    return {
+      status: health.status,
+      outboxDir: health.outboxDir,
+      zhihuUpstream: {
+        status: zhihuUpstream.status,
+        draftEndpointConfigured: zhihuUpstream.draftEndpointConfigured,
+        statusEndpointConfigured: zhihuUpstream.statusEndpointConfigured,
+      },
+    };
+  } finally {
+    await stopService(service);
+    fs.rmSync(workspaceEnvDir, { recursive: true, force: true });
+  }
 }
 
 async function runDisabledDraftPreflightCheck() {
@@ -1003,6 +1086,7 @@ const draftConnectorEnv = {
   DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
   DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
 };
+const workspaceEnvCheck = await runDraftConnectorWorkspaceEnvCheck();
 const disabledPreflight = await runDisabledDraftPreflightCheck();
 const offlinePreflight = await runOfflineDraftConnectorPreflightCheck();
 const offlineUpstreamPreflight = await runOfflineUpstreamDraftPreflightCheck();
@@ -1266,6 +1350,7 @@ try {
       status: initialRuntime.draftConnector.status,
       outboxUrl: initialRuntime.draftConnector.outboxUrl,
     },
+    workspaceEnvCheck,
     disabledPreflight,
     offlinePreflight,
     offlineUpstreamPreflight,
