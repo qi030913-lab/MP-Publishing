@@ -310,86 +310,6 @@ async function startFakeUpstreamDraftService(port, expectedApiKey, options = {})
   };
 }
 
-async function startFakeWorkOrderAutomationService(port, expectedApiKey) {
-  const requests = [];
-  const baseUrl = `http://127.0.0.1:${port}`;
-
-  const server = createServer((request, response) => {
-    void (async () => {
-      const pathname = new URL(request.url ?? "/", baseUrl).pathname;
-      if (request.method !== "POST" || pathname !== "/drafts") {
-        response.writeHead(404, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: false, message: "automation route not found" }));
-        return;
-      }
-
-      if (request.headers.authorization !== `Bearer ${expectedApiKey}`) {
-        response.writeHead(401, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: false, message: "automation api key is invalid" }));
-        return;
-      }
-
-      const payload = await readRequestJson(request);
-      const workOrder = payload.workOrder;
-      const platform = workOrder?.platform;
-      const checklist = Array.isArray(workOrder?.checklist) ? workOrder.checklist : [];
-      const saveDraft = checklist.find((item) => item.id === "save-draft");
-      if (
-        !["zhihu", "bilibili", "xiaohongshu"].includes(platform) ||
-        payload.platform !== platform ||
-        payload.accountId !== workOrder?.accountId ||
-        workOrder?.version !== "draft-upstream-work-order-v1" ||
-        !workOrder?.draft?.title ||
-        !workOrder?.draft?.renderedBody ||
-        !workOrder?.connector?.statusCallbackUrl ||
-        !workOrder?.callbackPayloadTemplate ||
-        !saveDraft?.required ||
-        workOrder?.automation?.safeMode !== true ||
-        payload.runner?.safeMode !== true
-      ) {
-        response.writeHead(422, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: false, message: "automation payload is missing work-order data" }));
-        return;
-      }
-
-      const remoteId = `${platform}-automation-draft-${workOrder.remoteId}`;
-      const url = `https://automation.example.test/${platform}/drafts/${remoteId}`;
-      requests.push({
-        platform,
-        remoteId,
-        url,
-        workOrderRemoteId: workOrder.remoteId,
-        title: workOrder.draft.title,
-        completedBy: payload.runner.completedBy,
-        callbackUrl: workOrder.connector.statusCallbackUrl,
-      });
-      response.writeHead(200, { "content-type": "application/json" });
-      response.end(
-        JSON.stringify({
-          ok: true,
-          remoteId,
-          url,
-          state: "ready",
-          detail: `${platform} draft saved by fake automation.`,
-        }),
-      );
-    })();
-  });
-
-  server.listen(port, "127.0.0.1");
-  await once(server, "listening");
-
-  return {
-    baseUrl,
-    requests,
-    async close() {
-      await new Promise((resolve, reject) => {
-        server.close((error) => (error ? reject(error) : resolve()));
-      });
-    },
-  };
-}
-
 function ensureBuildOutput() {
   for (const filePath of ["apps/api/dist/main.js", "apps/worker/dist/main.js", "apps/draft-connector/dist/main.js"]) {
     if (!fs.existsSync(path.join(root, filePath))) {
@@ -867,6 +787,132 @@ async function runUpstreamSandboxScriptCheck() {
   }
 }
 
+async function runDraftAutomationServiceScriptCheck() {
+  const automationPort = await getFreePort();
+  const automationBaseUrl = `http://127.0.0.1:${automationPort}`;
+  const automationDir = path.join(runtimeDir, `draft-automation-service-script-e2e-${Date.now()}`);
+  const outboxDir = path.join(automationDir, "outbox");
+  const handlerPath = path.join(automationDir, "handler.mjs");
+  const apiKey = "automation-secret";
+  fs.rmSync(automationDir, { recursive: true, force: true });
+  fs.mkdirSync(automationDir, { recursive: true });
+  fs.writeFileSync(
+    handlerPath,
+    `
+export async function createDraft({ platform, workOrder, runner }) {
+  if (workOrder.version !== "draft-upstream-work-order-v1" || !workOrder.checklist?.some((item) => item.id === "save-draft")) {
+    throw new Error("handler received an incomplete work order");
+  }
+
+  return {
+    ok: true,
+    remoteId: platform + "-handler-" + workOrder.remoteId,
+    url: "https://automation-handler.example.test/" + platform + "/drafts/" + workOrder.remoteId,
+    state: "ready",
+    detail: platform + " handler saved draft for " + runner.completedBy,
+  };
+}
+`.trim(),
+    "utf8",
+  );
+
+  const automation = startService("draft-automation-service-script-check", ["scripts/start-draft-automation-service.mjs"], {
+    DRAFT_AUTOMATION_SERVICE_PORT: String(automationPort),
+    DRAFT_AUTOMATION_SERVICE_OUTBOX_DIR: outboxDir,
+    DRAFT_AUTOMATION_SERVICE_API_KEY: apiKey,
+    DRAFT_AUTOMATION_SERVICE_HANDLER_MODULE: handlerPath,
+  });
+  const authHeaders = {
+    authorization: `Bearer ${apiKey}`,
+  };
+
+  try {
+    const health = await waitForAuthorizedHealth(automation, `${automationBaseUrl}/health`, "Draft automation service script", apiKey);
+    const contract = await requestAbsoluteJson(`${automationBaseUrl}/contract`, { headers: authHeaders });
+    const workOrder = {
+      version: "draft-upstream-work-order-v1",
+      platform: "zhihu",
+      remoteId: "zhihu-sandbox-script-check",
+      accountId: "acct_zhihu_main",
+      connector: {
+        draftId: "zhihu-draft-script-check",
+        draftUrl: "https://connector.example.test/zhihu/drafts/zhihu-draft-script-check",
+        statusCallbackUrl: "https://connector.example.test/zhihu/drafts/zhihu-draft-script-check/status",
+      },
+      draft: {
+        title: "Automation service script check",
+        summary: "Verify handler module handoff.",
+        body: "Synthetic body.",
+        hashtags: ["automation"],
+        renderedBody: "Synthetic body.",
+      },
+      automation: {
+        mode: "creator-center-draft-fill",
+        safeMode: true,
+      },
+      callbackPayloadTemplate: {
+        state: "ready",
+        remoteId: "<real-platform-draft-id>",
+        url: "<real-platform-draft-url>",
+      },
+      checklist: [{ id: "save-draft", label: "Save draft.", required: true }],
+    };
+    const created = await requestAbsoluteJson(`${automationBaseUrl}/drafts`, {
+      method: "POST",
+      headers: {
+        ...authHeaders,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        platform: "zhihu",
+        accountId: "acct_zhihu_main",
+        workOrder,
+        requestedAt: new Date().toISOString(),
+        runner: {
+          completedBy: "automation-service-script-check",
+          safeMode: true,
+        },
+      }),
+    });
+    const list = await requestAbsoluteJson(`${automationBaseUrl}/drafts`, { headers: authHeaders });
+    const detail = await requestAbsoluteJson(`${automationBaseUrl}/zhihu/drafts/${created.automationDraft.automationDraftId}`, {
+      headers: authHeaders,
+    });
+
+    if (
+      health.status !== "ok" ||
+      health.handlerConfigured !== true ||
+      contract.version !== "draft-automation-service-v1" ||
+      !created.remoteId?.startsWith("zhihu-handler-zhihu-sandbox-script-check") ||
+      created.url !== "https://automation-handler.example.test/zhihu/drafts/zhihu-sandbox-script-check" ||
+      list.total !== 1 ||
+      detail.mode !== "handler" ||
+      detail.workOrder?.version !== "draft-upstream-work-order-v1"
+    ) {
+      throw new Error(
+        `Draft automation service script check failed: ${JSON.stringify({
+          health,
+          contract,
+          created,
+          list,
+          detail,
+        })}`,
+      );
+    }
+
+    return {
+      contractVersion: contract.version,
+      handlerConfigured: health.handlerConfigured,
+      remoteId: created.remoteId,
+      url: created.url,
+      mode: detail.mode,
+    };
+  } finally {
+    await stopService(automation);
+    fs.rmSync(automationDir, { recursive: true, force: true });
+  }
+}
+
 async function runUpstreamSandboxCallbackCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -879,17 +925,19 @@ async function runUpstreamSandboxCallbackCheck() {
   const automationPort = await getFreePort();
   const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
   const sandboxBaseUrl = `http://127.0.0.1:${sandboxPort}`;
+  const automationBaseUrl = `http://127.0.0.1:${automationPort}`;
   const queueName = `mp-publishing-draft-upstream-sandbox-callback-e2e-${Date.now()}`;
   const outboxDir = path.join(runtimeDir, `draft-upstream-sandbox-callback-outbox-e2e-${Date.now()}`);
   const sandboxOutboxDir = path.join(runtimeDir, `draft-upstream-sandbox-callback-proxy-e2e-${Date.now()}`);
+  const automationOutboxDir = path.join(runtimeDir, `draft-automation-service-e2e-${Date.now()}`);
   const connectorApiKey = "draft-secret";
   const connectorCallbackApiKey = "callback-secret";
   const sandboxApiKey = "sandbox-secret";
-  const automation = await startFakeWorkOrderAutomationService(automationPort, "automation-secret");
 
   apiBaseUrl = `http://127.0.0.1:${apiPort}`;
   fs.rmSync(outboxDir, { recursive: true, force: true });
   fs.rmSync(sandboxOutboxDir, { recursive: true, force: true });
+  fs.rmSync(automationOutboxDir, { recursive: true, force: true });
 
   const upstreamEndpointEnv = Object.fromEntries(
     platforms.flatMap((platform) => {
@@ -930,6 +978,11 @@ async function runUpstreamSandboxCallbackCheck() {
     DRAFT_CONNECTOR_API_KEY: "",
     DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY: connectorCallbackApiKey,
   });
+  const automation = startService("draft-automation-service-callback", ["scripts/start-draft-automation-service.mjs"], {
+    DRAFT_AUTOMATION_SERVICE_PORT: String(automationPort),
+    DRAFT_AUTOMATION_SERVICE_OUTBOX_DIR: automationOutboxDir,
+    DRAFT_AUTOMATION_SERVICE_API_KEY: "automation-secret",
+  });
   const api = startService("api-draft-upstream-sandbox-callback", ["apps/api/dist/main.js"], apiAndWorkerEnv);
   const { PORT: _apiPort, ...workerEnv } = apiAndWorkerEnv;
   const worker = startService("worker-draft-upstream-sandbox-callback", ["apps/worker/dist/main.js"], workerEnv);
@@ -937,6 +990,10 @@ async function runUpstreamSandboxCallbackCheck() {
 
   try {
     await waitForAuthorizedHealth(sandbox, `${sandboxBaseUrl}/health`, "Draft upstream sandbox callback", sandboxApiKey);
+    const automationHealth = await waitForAuthorizedHealth(automation, `${automationBaseUrl}/health`, "Draft automation service", "automation-secret");
+    if (automationHealth.status !== "ok" || automationHealth.handlerConfigured !== false) {
+      throw new Error(`Draft automation service did not start in local handoff mode: ${JSON.stringify(automationHealth)}`);
+    }
     const connectorHealth = await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector upstream sandbox callback");
     if (
       platforms.some((platform) => {
@@ -1082,7 +1139,7 @@ async function runUpstreamSandboxCallbackCheck() {
       "--api-key",
       sandboxApiKey,
       "--automation-endpoint",
-      `${automation.baseUrl}/drafts`,
+      `${automationBaseUrl}/drafts`,
       "--automation-api-key",
       "automation-secret",
       "--require-automation",
@@ -1097,21 +1154,32 @@ async function runUpstreamSandboxCallbackCheck() {
       runnerResult.items?.some(
         (item) =>
           item.source !== "automation" ||
-          item.automationEndpoint !== `${automation.baseUrl}/drafts` ||
+          item.automationEndpoint !== `${automationBaseUrl}/drafts` ||
           item.callbackStatus !== 200 ||
           !item.callbackOk,
-      ) ||
-      automation.requests.length !== platforms.length ||
-      automation.requests.some((request) => request.completedBy !== "e2e-work-order-runner")
+      )
     ) {
       throw new Error(
         `Draft work-order runner did not delegate and complete every sandbox work order: ${JSON.stringify({
           runnerResult,
-          automationRequests: automation.requests,
         })}`,
       );
     }
     const workOrderCompletions = runnerResult.items;
+    const automationOutbox = await requestAbsoluteJson(`${automationBaseUrl}/drafts`, {
+      headers: { authorization: "Bearer automation-secret" },
+    });
+    if (
+      automationOutbox.total !== platforms.length ||
+      automationOutbox.items?.some(
+        (item) =>
+          item.mode !== "local-handoff" ||
+          item.url !== `${automationBaseUrl}/${item.platform}/drafts/${item.automationDraftId}` ||
+          !item.workOrderId?.startsWith(`${item.platform}-sandbox-`),
+      )
+    ) {
+      throw new Error(`Draft automation service did not persist every delegated work order: ${JSON.stringify(automationOutbox)}`);
+    }
 
     const completedCallbackDrafts = [];
     for (let attempt = 0; attempt < 30; attempt += 1) {
@@ -1162,7 +1230,12 @@ async function runUpstreamSandboxCallbackCheck() {
       callbackKeyDraftCreateRejected,
       callbackDrafts,
       workOrderCompletions,
-      automationRequests: automation.requests,
+      automationDrafts: automationOutbox.items.map((item) => ({
+        platform: item.platform,
+        automationDraftId: item.automationDraftId,
+        mode: item.mode,
+        url: item.url,
+      })),
       sandboxCallbacks: sandboxOutbox.items.map((item) => ({
         platform: item.platform,
         remoteId: item.remoteId,
@@ -1170,9 +1243,10 @@ async function runUpstreamSandboxCallbackCheck() {
       })),
     };
   } finally {
-    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector), stopService(sandbox), automation.close()]);
+    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector), stopService(sandbox), stopService(automation)]);
     fs.rmSync(outboxDir, { recursive: true, force: true });
     fs.rmSync(sandboxOutboxDir, { recursive: true, force: true });
+    fs.rmSync(automationOutboxDir, { recursive: true, force: true });
     apiBaseUrl = previousApiBaseUrl;
   }
 }
@@ -3773,6 +3847,7 @@ const workspaceEnvCheck = await runDraftConnectorWorkspaceEnvCheck();
 const publicBaseRuntime = await runDraftConnectorPublicBaseRuntimeCheck();
 const upstreamContractCheck = await runUpstreamContractCheckScriptCheck();
 const upstreamSandboxCheck = await runUpstreamSandboxScriptCheck();
+const draftAutomationServiceCheck = await runDraftAutomationServiceScriptCheck();
 const upstreamSandboxCallback = await runUpstreamSandboxCallbackCheck();
 const upstreamProxyEnablement = await runUpstreamProxyEnablementCheck();
 const localEnablement = await runLocalDraftEnablementCheck();
@@ -4205,6 +4280,7 @@ try {
     publicBaseRuntime,
     upstreamContractCheck,
     upstreamSandboxCheck,
+    draftAutomationServiceCheck,
     upstreamSandboxCallback,
     upstreamProxyEnablement,
     localEnablement,

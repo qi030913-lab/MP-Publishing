@@ -38,6 +38,8 @@
 
 补充：`pnpm drafts:run-work-orders` 已从单纯的沙箱 completion runner 推进到可委托自动化服务的进程骨架；配置 `DRAFT_WORK_ORDER_AUTOMATION_ENDPOINT` 或平台级 `DRAFT_WORK_ORDER_<PLATFORM>_AUTOMATION_ENDPOINT` 后，runner 会把完整 `draft-upstream-work-order-v1` 工单 POST 给 Playwright/官方 API worker，并使用其返回的真实草稿 id/url 调用 work-order completion。未配置自动化端点时仍会生成沙箱草稿链接，便于本地联调；当前 e2e 覆盖了这条 automation 委托和回调链路。
 
+补充：`pnpm drafts:automation-service` 提供了本地可启动的 automation endpoint，默认把 runner 投递的工单保存为可浏览的本地 handoff draft，并暴露 `/health`、`/contract`、`/drafts` 和 `/:platform/drafts/:automationDraftId`；配置 `DRAFT_AUTOMATION_SERVICE_HANDLER_MODULE` 后可以由外部 ESM handler 接管真实 Playwright 或官方 API 创建草稿逻辑，同时保持 runner、sandbox completion 和 connector callback 契约不变。
+
 ## 1. 目标
 
 面向公众号、知乎、B站、小红书等内容平台，提供一个统一的创作与发布工具，解决以下问题：
