@@ -67,6 +67,25 @@ type DraftSummary = {
   url: string;
 };
 
+type UpstreamDraftConfig = {
+  endpoint: string;
+  apiKey?: string;
+  includeCredential: boolean;
+};
+
+type UpstreamDraftResponse = {
+  ok?: boolean;
+  draftId?: string;
+  remoteId?: string;
+  externalDraftId?: string;
+  url?: string;
+  externalUrl?: string;
+  state?: string;
+  detail?: string;
+  message?: string;
+  issues?: unknown[];
+};
+
 const supportedPlatforms = new Set(["zhihu", "bilibili", "xiaohongshu"]);
 const supportedDraftStates = new Set<DraftState>([
   "draft",
@@ -104,6 +123,19 @@ const outboxDir = process.env.DRAFT_CONNECTOR_OUTBOX_DIR
 
 function createDraftId(platform: string) {
   return `${platform}-draft-${randomUUID()}`;
+}
+
+function readEnvValue(key: string) {
+  const value = process.env[key]?.trim();
+  return value && value.length > 0 ? value : undefined;
+}
+
+function isEnvEnabled(key: string) {
+  return readEnvValue(key)?.toLowerCase() === "true";
+}
+
+function createIssue(code: string, message: string, severity: ValidationIssue["severity"] = "error"): ValidationIssue {
+  return { code, message, severity };
 }
 
 async function readJsonBody(request: IncomingMessage) {
@@ -160,6 +192,10 @@ function createDraftUrl(platform: string, draftId: string, request: IncomingMess
   return `${resolvePublicBaseUrl(request)}/${platform}/drafts/${draftId}`;
 }
 
+function createStatusCallbackUrl(platform: string, draftId: string, request: IncomingMessage) {
+  return `${createDraftUrl(platform, draftId, request)}/status`;
+}
+
 function requireAuthorized(request: IncomingMessage) {
   const apiKey = process.env.DRAFT_CONNECTOR_API_KEY?.trim();
   if (!apiKey) {
@@ -208,12 +244,16 @@ function isValidationIssue(value: unknown): value is ValidationIssue {
   );
 }
 
+function normalizeIssues(value: unknown) {
+  return Array.isArray(value) ? value.filter(isValidationIssue) : undefined;
+}
+
 function normalizeStoredDraft(raw: StoredDraft): StoredDraft {
   return {
     ...raw,
     state: normalizeDraftState(raw.state) ?? "draft",
     updatedAt: raw.updatedAt ?? raw.createdAt,
-    statusIssues: Array.isArray(raw.statusIssues) ? raw.statusIssues.filter(isValidationIssue) : undefined,
+    statusIssues: normalizeIssues(raw.statusIssues),
   };
 }
 
@@ -242,6 +282,87 @@ function sanitizeDraftPayload(payload: DraftPayload): DraftPayload {
   const payloadRecord = { ...(payload as Record<string, unknown>) };
   delete payloadRecord.credential;
   return payloadRecord as DraftPayload;
+}
+
+function resolveUpstreamDraftConfig(platform: string): UpstreamDraftConfig | null {
+  const envPrefix = `DRAFT_CONNECTOR_${platform.toUpperCase()}_UPSTREAM`;
+  const endpoint = readEnvValue(`${envPrefix}_DRAFT_ENDPOINT`);
+  if (!endpoint) {
+    return null;
+  }
+
+  return {
+    endpoint,
+    apiKey: readEnvValue(`${envPrefix}_DRAFT_API_KEY`) ?? readEnvValue("DRAFT_CONNECTOR_UPSTREAM_API_KEY"),
+    includeCredential: isEnvEnabled(`${envPrefix}_INCLUDE_CREDENTIAL`),
+  };
+}
+
+function listUpstreamDraftStatuses() {
+  return Array.from(supportedPlatforms).map((platform) => ({
+    platform,
+    draftEndpointConfigured: Boolean(resolveUpstreamDraftConfig(platform)),
+  }));
+}
+
+function createUpstreamPayload(
+  payload: DraftPayload,
+  storedDraft: StoredDraft,
+  request: IncomingMessage,
+  includeCredential: boolean,
+) {
+  return {
+    ...sanitizeDraftPayload(payload),
+    credential: includeCredential ? payload.credential : undefined,
+    connector: {
+      draftId: storedDraft.draftId,
+      draftUrl: createDraftUrl(storedDraft.platform, storedDraft.draftId, request),
+      statusCallbackUrl: createStatusCallbackUrl(storedDraft.platform, storedDraft.draftId, request),
+    },
+  };
+}
+
+async function requestUpstreamDraft(
+  config: UpstreamDraftConfig,
+  payload: DraftPayload,
+  storedDraft: StoredDraft,
+  request: IncomingMessage,
+) {
+  const response = await fetch(config.endpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : {}),
+    },
+    body: JSON.stringify(createUpstreamPayload(payload, storedDraft, request, config.includeCredential)),
+  });
+  const body = await response.text();
+  const upstreamPayload = body ? (JSON.parse(body) as UpstreamDraftResponse) : {};
+
+  if (!response.ok) {
+    throw new Error(`Upstream draft endpoint HTTP ${response.status}: ${body || response.statusText}`);
+  }
+
+  return upstreamPayload;
+}
+
+function applyUpstreamDraftResponse(storedDraft: StoredDraft, payload: UpstreamDraftResponse): StoredDraft {
+  const externalDraftId =
+    readOptionalString(payload.externalDraftId) ?? readOptionalString(payload.remoteId) ?? readOptionalString(payload.draftId);
+  const externalUrl = readOptionalString(payload.externalUrl) ?? readOptionalString(payload.url);
+  const nextState = normalizeDraftState(payload.state) ?? (externalDraftId || externalUrl ? "ready" : storedDraft.state);
+  const statusDetail = readOptionalString(payload.detail) ?? readOptionalString(payload.message) ?? storedDraft.statusDetail;
+  const statusIssues = normalizeIssues(payload.issues);
+
+  return {
+    ...storedDraft,
+    state: nextState,
+    externalDraftId: externalDraftId ?? storedDraft.externalDraftId,
+    externalUrl: externalUrl ?? storedDraft.externalUrl,
+    statusDetail,
+    statusIssues: statusIssues ?? storedDraft.statusIssues,
+    updatedAt: new Date().toISOString(),
+  };
 }
 
 async function readStoredDraft(platform: string, draftId: string) {
@@ -460,11 +581,88 @@ async function handleCreateDraft(platform: string, request: IncomingMessage, res
 
   await writeStoredDraft(storedDraft);
 
+  const draftUrl = createDraftUrl(platform, draftId, request);
+  const upstreamConfig = resolveUpstreamDraftConfig(platform);
+  if (upstreamConfig) {
+    const forwardingDraft: StoredDraft = {
+      ...storedDraft,
+      state: "publishing",
+      statusDetail: `${platform} draft is being forwarded to an upstream draft service.`,
+      updatedAt: new Date().toISOString(),
+    };
+    await writeStoredDraft(forwardingDraft);
+
+    try {
+      const upstreamPayload = await requestUpstreamDraft(upstreamConfig, payload, forwardingDraft, request);
+      const upstreamState = normalizeDraftState(upstreamPayload.state);
+      const upstreamIssues = normalizeIssues(upstreamPayload.issues);
+
+      if (upstreamPayload.ok === false || upstreamState === "failed" || upstreamState === "needs_manual_action") {
+        const rejectedDraft: StoredDraft = {
+          ...applyUpstreamDraftResponse(forwardingDraft, upstreamPayload),
+          state: upstreamState ?? "needs_manual_action",
+          statusIssues: [
+            ...(upstreamIssues ?? []),
+            createIssue(
+              `${platform.toUpperCase()}_UPSTREAM_DRAFT_REJECTED`,
+              upstreamPayload.message ?? upstreamPayload.detail ?? `${platform} upstream draft service rejected the draft.`,
+            ),
+          ],
+        };
+        await writeStoredDraft(rejectedDraft);
+        sendJson(response, 200, {
+          ok: false,
+          draftId,
+          remoteId: rejectedDraft.externalDraftId ?? draftId,
+          url: rejectedDraft.externalUrl ?? draftUrl,
+          message: rejectedDraft.statusDetail ?? `${platform} upstream draft service rejected the draft.`,
+          issues: rejectedDraft.statusIssues,
+        });
+        return;
+      }
+
+      const updatedDraft = applyUpstreamDraftResponse(forwardingDraft, upstreamPayload);
+      await writeStoredDraft(updatedDraft);
+      sendJson(response, 200, {
+        ok: true,
+        draftId,
+        remoteId: updatedDraft.externalDraftId ?? draftId,
+        url: updatedDraft.externalUrl ?? draftUrl,
+        message: updatedDraft.statusDetail ?? `${platform} draft forwarded to upstream draft service.`,
+        issues: updatedDraft.statusIssues,
+      });
+      return;
+    } catch (error) {
+      const failedDraft: StoredDraft = {
+        ...forwardingDraft,
+        state: "needs_manual_action",
+        statusDetail: error instanceof Error ? error.message : `${platform} upstream draft service failed.`,
+        statusIssues: [
+          createIssue(
+            `${platform.toUpperCase()}_UPSTREAM_DRAFT_FAILED`,
+            error instanceof Error ? error.message : `${platform} upstream draft service failed.`,
+          ),
+        ],
+        updatedAt: new Date().toISOString(),
+      };
+      await writeStoredDraft(failedDraft);
+      sendJson(response, 200, {
+        ok: false,
+        draftId,
+        remoteId: draftId,
+        url: draftUrl,
+        message: failedDraft.statusDetail,
+        issues: failedDraft.statusIssues,
+      });
+      return;
+    }
+  }
+
   sendJson(response, 200, {
     ok: true,
     draftId,
     remoteId: draftId,
-    url: createDraftUrl(platform, draftId, request),
+    url: draftUrl,
     message: `${platform} draft stored in local outbox.`,
   });
 }
@@ -615,6 +813,7 @@ const server = createServer((request, response) => {
           status: "ok",
           outboxDir,
           platforms: Array.from(supportedPlatforms),
+          upstreamDrafts: listUpstreamDraftStatuses(),
         });
         return;
       }

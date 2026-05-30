@@ -91,6 +91,16 @@ async function requestAbsoluteText(url) {
   return response.text();
 }
 
+async function readRequestJson(request) {
+  const chunks = [];
+  for await (const chunk of request) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  const raw = Buffer.concat(chunks).toString("utf8");
+  return raw ? JSON.parse(raw) : {};
+}
+
 async function waitForApi(api) {
   for (let i = 0; i < 40; i += 1) {
     if (api.child.exitCode !== null) {
@@ -105,6 +115,69 @@ async function waitForApi(api) {
   }
 
   throw new Error(`API health check did not become ready.\n${tail(api.stderrPath)}`);
+}
+
+async function startFakeUpstreamDraftService(port, expectedApiKey) {
+  const requests = [];
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const server = createServer((request, response) => {
+    void (async () => {
+      const [platform, operation] = new URL(request.url ?? "/", baseUrl).pathname.split("/").filter(Boolean);
+      if (request.method !== "POST" || operation !== "drafts") {
+        response.writeHead(404, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: false, message: "upstream route not found" }));
+        return;
+      }
+
+      if (request.headers.authorization !== `Bearer ${expectedApiKey}`) {
+        response.writeHead(401, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: false, message: "upstream api key is invalid" }));
+        return;
+      }
+
+      const payload = await readRequestJson(request);
+      const connectorDraftId = payload.connector?.draftId;
+      if (!connectorDraftId || !payload.connector?.statusCallbackUrl || !payload.draft?.title) {
+        response.writeHead(422, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: false, message: "upstream payload is missing connector metadata" }));
+        return;
+      }
+
+      const remoteId = `${platform}-upstream-${connectorDraftId}`;
+      const url = `https://upstream.example.test/${platform}/${remoteId}`;
+      requests.push({
+        platform,
+        connectorDraftId,
+        connectorDraftUrl: payload.connector.draftUrl,
+        statusCallbackUrl: payload.connector.statusCallbackUrl,
+        title: payload.draft.title,
+        hasCredential: Boolean(payload.credential),
+      });
+      response.writeHead(200, { "content-type": "application/json" });
+      response.end(
+        JSON.stringify({
+          ok: true,
+          remoteId,
+          url,
+          state: "ready",
+          detail: `${platform} upstream draft accepted.`,
+        }),
+      );
+    })();
+  });
+
+  server.listen(port, "127.0.0.1");
+  await once(server, "listening");
+
+  return {
+    baseUrl,
+    requests,
+    async close() {
+      await new Promise((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+    },
+  };
 }
 
 function ensureBuildOutput() {
@@ -259,6 +332,158 @@ async function runDisabledDraftPreflightCheck() {
   }
 }
 
+async function runUpstreamDraftForwardingCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const upstreamPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const apiPort = await getFreePort();
+  const upstream = await startFakeUpstreamDraftService(upstreamPort, "upstream-secret");
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const upstreamOutboxDir = path.join(runtimeDir, `draft-connector-upstream-e2e-${Date.now()}`);
+  const queueName = `mp-publishing-draft-upstream-e2e-${Date.now()}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+  fs.rmSync(upstreamOutboxDir, { recursive: true, force: true });
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+
+  const connectorEnv = {
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+  };
+  const draftConnectorEnv = {
+    PORT: String(connectorPort),
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    DRAFT_CONNECTOR_OUTBOX_DIR: upstreamOutboxDir,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_UPSTREAM_API_KEY: "upstream-secret",
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/zhihu/drafts`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/bilibili/drafts`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/xiaohongshu/drafts`,
+  };
+
+  const api = startService("api-draft-upstream", ["apps/api/dist/main.js"], connectorEnv);
+  const worker = startService("worker-draft-upstream", ["apps/worker/dist/main.js"], connectorEnv);
+  const draftConnector = startService("draft-connector-upstream", ["apps/draft-connector/dist/main.js"], draftConnectorEnv);
+
+  try {
+    const upstreamHealth = await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector upstream");
+    if (
+      platforms.some(
+        (platform) =>
+          !upstreamHealth.upstreamDrafts?.some((item) => item.platform === platform && item.draftEndpointConfigured),
+      )
+    ) {
+      throw new Error(`Draft connector health did not report every upstream endpoint: ${JSON.stringify(upstreamHealth)}`);
+    }
+    await waitForApi(api);
+    await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
+
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for upstream draft verification: ${JSON.stringify(accounts)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "非公众号平台 upstream 草稿联调验证",
+          summary: "验证本地 draft connector 可以把草稿同步转发给上游平台代理。",
+          body: "这条内容用于确认上游 draft endpoint 成功返回真实平台草稿 ID 和 URL 后，任务目标直接进入外部草稿链接。",
+          tags: ["draft", "upstream", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+
+    let task = created;
+    for (let i = 0; i < 50; i += 1) {
+      await delay(600);
+      task = await requestJson(`/publish/tasks/${created.id}`);
+      if (!["running", "queued"].includes(task.status)) {
+        break;
+      }
+    }
+
+    if (task.status !== "succeeded") {
+      throw new Error(`Upstream draft connector task did not succeed: ${task.status} ${JSON.stringify(task.results)}`);
+    }
+
+    for (const platform of platforms) {
+      const target = task.results.find((item) => item.platform === platform);
+      const expectedPrefix = `${platform}-upstream-${platform}-draft-`;
+      const expectedUrlPrefix = `https://upstream.example.test/${platform}/`;
+      if (
+        !target ||
+        target.status !== "succeeded" ||
+        !target.remoteId?.startsWith(expectedPrefix) ||
+        !target.url?.startsWith(expectedUrlPrefix)
+      ) {
+        throw new Error(`Upstream draft target did not expose external draft data for ${platform}: ${JSON.stringify(target)}`);
+      }
+    }
+
+    if (upstream.requests.length !== platforms.length) {
+      throw new Error(`Upstream draft service did not receive every platform draft: ${JSON.stringify(upstream.requests)}`);
+    }
+
+    for (const request of upstream.requests) {
+      const detail = await requestAbsoluteJson(request.connectorDraftUrl);
+      if (
+        detail.state !== "ready" ||
+        detail.externalDraftId !== `${request.platform}-upstream-${request.connectorDraftId}` ||
+        detail.externalUrl !== `https://upstream.example.test/${request.platform}/${detail.externalDraftId}` ||
+        detail.payload?.credential
+      ) {
+        throw new Error(`Upstream outbox detail is incorrect for ${request.platform}: ${JSON.stringify(detail)}`);
+      }
+    }
+
+    const syncedTask = await requestJson(`/publish/tasks/${created.id}/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    if (syncedTask.status !== "succeeded") {
+      throw new Error(`Upstream draft sync did not preserve succeeded status: ${JSON.stringify(syncedTask)}`);
+    }
+
+    return {
+      taskId: created.id,
+      finalStatus: syncedTask.status,
+      targets: syncedTask.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        remoteId: target.remoteId,
+        url: target.url,
+      })),
+      upstreamRequests: upstream.requests.map((request) => ({
+        platform: request.platform,
+        connectorDraftId: request.connectorDraftId,
+        statusCallbackUrl: request.statusCallbackUrl,
+      })),
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector)]);
+    await upstream.close();
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 ensureBuildOutput();
 
 const connectorPort = await getFreePort();
@@ -284,6 +509,7 @@ const draftConnectorEnv = {
   DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
 };
 const disabledPreflight = await runDisabledDraftPreflightCheck();
+const upstreamForwarding = await runUpstreamDraftForwardingCheck();
 
 const api = startService("api", ["apps/api/dist/main.js"], connectorEnv);
 const worker = startService("worker", ["apps/worker/dist/main.js"], connectorEnv);
@@ -543,6 +769,7 @@ try {
       outboxUrl: initialRuntime.draftConnector.outboxUrl,
     },
     disabledPreflight,
+    upstreamForwarding,
     queue: runtime.queue,
   };
 
