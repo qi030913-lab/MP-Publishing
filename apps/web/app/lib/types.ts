@@ -144,6 +144,13 @@ export type RuntimeStatus = {
     currentTaskId?: string;
     processedCount: number;
   };
+  queue: {
+    waiting: number;
+    active: number;
+    delayed: number;
+    failed: number;
+    completed: number;
+  };
   tasks: {
     total: number;
     queuedCount: number;

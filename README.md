@@ -43,6 +43,14 @@ pnpm --filter @mp-publishing/worker dev
 pnpm --filter @mp-publishing/web dev
 ```
 
+Verify the local publishing chain after a build:
+
+```bash
+pnpm test:publish-flow
+```
+
+This starts the built API and worker, creates a simulated publish task through HTTP, waits for BullMQ consumption, and checks that Postgres task state is updated successfully.
+
 Required local services:
 
 - PostgreSQL: stores accounts, documents, content versions, publish jobs, targets, attempts, worker state, and audit logs.

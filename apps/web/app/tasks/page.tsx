@@ -46,6 +46,13 @@ function runtimeFallback(): RuntimeStatus {
       status: "offline",
       processedCount: 0,
     },
+    queue: {
+      waiting: 0,
+      active: 0,
+      delayed: 0,
+      failed: 0,
+      completed: 0,
+    },
     tasks: {
       total: 0,
       queuedCount: 0,
@@ -168,6 +175,9 @@ export default function TasksPage() {
           <SummaryTile label="任务总数" value={runtime.tasks.total} />
           <SummaryTile label="执行中" value={runtime.tasks.queuedCount + runtime.tasks.runningCount} />
           <SummaryTile label="待处理" value={runtime.tasks.needsRetryCount + runtime.tasks.manualActionCount} />
+          <SummaryTile label="队列等待" value={runtime.queue.waiting + runtime.queue.active} detail={`延迟 ${runtime.queue.delayed}`} />
+          <SummaryTile label="队列失败" value={runtime.queue.failed} />
+          <SummaryTile label="队列完成" value={runtime.queue.completed} />
         </div>
         <div className="runtime-grid" style={{ marginTop: 12 }}>
           <div className="capability-item">
@@ -177,6 +187,10 @@ export default function TasksPage() {
           <div className="capability-item">
             <span>最近心跳</span>
             <strong>{formatTime(runtime.worker.lastHeartbeatAt)}</strong>
+          </div>
+          <div className="capability-item">
+            <span>已处理</span>
+            <strong>{runtime.worker.processedCount}</strong>
           </div>
         </div>
       </section>
