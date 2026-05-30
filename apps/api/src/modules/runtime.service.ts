@@ -75,6 +75,28 @@ function inferLocalDraftConnectorHealthUrl(platform: PlatformName, draftEndpoint
   }
 }
 
+function inferLocalConnectorEndpointFromDraftEndpoint(
+  platform: PlatformName,
+  draftEndpoint: string | undefined,
+  operation: "status",
+) {
+  if (!draftEndpoint) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(draftEndpoint);
+    const pathname = url.pathname.replace(/\/+$/, "");
+    if (!isLocalConnectorHost(url.hostname) || pathname !== `/${platform}/drafts`) {
+      return undefined;
+    }
+
+    return `${url.origin}/${platform}/${operation}`;
+  } catch {
+    return undefined;
+  }
+}
+
 function resolveConnectorEndpoint(envPrefix: string, platform: PlatformName, operation: "drafts" | "status") {
   const endpointKey = `${envPrefix}_${operation === "drafts" ? "DRAFT_ENDPOINT" : "STATUS_ENDPOINT"}`;
   const explicitEndpoint = readEnvValue(endpointKey);
@@ -83,7 +105,19 @@ function resolveConnectorEndpoint(envPrefix: string, platform: PlatformName, ope
   }
 
   const baseUrl = readEnvValue("DRAFT_CONNECTOR_BASE_URL");
-  return baseUrl ? `${trimTrailingSlash(baseUrl)}/${platform}/${operation}` : undefined;
+  if (baseUrl) {
+    return `${trimTrailingSlash(baseUrl)}/${platform}/${operation}`;
+  }
+
+  if (operation === "status") {
+    return inferLocalConnectorEndpointFromDraftEndpoint(
+      platform,
+      readEnvValue(`${envPrefix}_DRAFT_ENDPOINT`),
+      operation,
+    );
+  }
+
+  return undefined;
 }
 
 function resolveDraftConnectorHealthUrl(platforms: DraftConnectorPlatformStatus[]) {

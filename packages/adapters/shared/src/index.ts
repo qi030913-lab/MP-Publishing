@@ -83,6 +83,33 @@ function trimTrailingSlash(value: string) {
   return value.replace(/\/+$/, "");
 }
 
+function isLocalConnectorHost(hostname: string) {
+  const normalized = hostname.toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function inferLocalConnectorEndpointFromDraftEndpoint(
+  platform: PlatformName,
+  draftEndpoint: string | undefined,
+  operation: "status",
+) {
+  if (!draftEndpoint) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(draftEndpoint);
+    const pathname = url.pathname.replace(/\/+$/, "");
+    if (!isLocalConnectorHost(url.hostname) || pathname !== `/${platform}/drafts`) {
+      return undefined;
+    }
+
+    return `${url.origin}/${platform}/${operation}`;
+  } catch {
+    return undefined;
+  }
+}
+
 function resolveConnectorEndpoint(config: NonNullable<AdapterPreset["realDraft"]>, platform: PlatformName, operation: "drafts" | "status") {
   const key = createDraftEnvKey(config.envPrefix, operation === "drafts" ? "DRAFT_ENDPOINT" : "STATUS_ENDPOINT");
   const explicitEndpoint = readEnvValue(key);
@@ -91,7 +118,19 @@ function resolveConnectorEndpoint(config: NonNullable<AdapterPreset["realDraft"]
   }
 
   const baseUrl = readEnvValue("DRAFT_CONNECTOR_BASE_URL");
-  return baseUrl ? `${trimTrailingSlash(baseUrl)}/${platform}/${operation}` : undefined;
+  if (baseUrl) {
+    return `${trimTrailingSlash(baseUrl)}/${platform}/${operation}`;
+  }
+
+  if (operation === "status") {
+    return inferLocalConnectorEndpointFromDraftEndpoint(
+      platform,
+      readEnvValue(createDraftEnvKey(config.envPrefix, "DRAFT_ENDPOINT")),
+      operation,
+    );
+  }
+
+  return undefined;
 }
 
 async function requestJson<T>(url: string, init?: RequestInit): Promise<T> {

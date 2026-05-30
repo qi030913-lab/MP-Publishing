@@ -1045,6 +1045,163 @@ async function runExplicitLocalDraftEndpointPreflightCheck() {
   }
 }
 
+async function runExplicitLocalDraftEndpointStatusSyncCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const apiPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const outboxDir = path.join(runtimeDir, `draft-connector-explicit-local-status-e2e-${Date.now()}`);
+  const queueName = `mp-publishing-draft-explicit-local-status-e2e-${Date.now()}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+
+  const serviceEnv = {
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: "",
+    DRAFT_CONNECTOR_HEALTH_URL: "",
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    ZHIHU_DRAFT_ENDPOINT: `${connectorBaseUrl}/zhihu/drafts`,
+    ZHIHU_STATUS_ENDPOINT: "",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_DRAFT_ENDPOINT: `${connectorBaseUrl}/bilibili/drafts`,
+    BILIBILI_STATUS_ENDPOINT: "",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_DRAFT_ENDPOINT: `${connectorBaseUrl}/xiaohongshu/drafts`,
+    XIAOHONGSHU_STATUS_ENDPOINT: "",
+  };
+  const draftConnectorEnv = {
+    PORT: String(connectorPort),
+    DRAFT_CONNECTOR_BASE_URL: "",
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
+  };
+
+  const api = startService("api-draft-explicit-local-status", ["apps/api/dist/main.js"], serviceEnv);
+  const worker = startService("worker-draft-explicit-local-status", ["apps/worker/dist/main.js"], serviceEnv);
+  const draftConnector = startService(
+    "draft-connector-explicit-local-status",
+    ["apps/draft-connector/dist/main.js"],
+    draftConnectorEnv,
+  );
+
+  try {
+    await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector explicit local status");
+    await waitForApi(api);
+    await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
+
+    const initialRuntime = await requestJson("/runtime/status");
+    if (
+      initialRuntime.draftConnector?.status !== "online" ||
+      initialRuntime.draftConnector?.healthUrl !== `${connectorBaseUrl}/health` ||
+      platforms.some((platform) => {
+        const platformStatus = initialRuntime.draftConnector.platforms.find((item) => item.platform === platform);
+        return (
+          platformStatus?.draftEndpoint !== `${connectorBaseUrl}/${platform}/drafts` ||
+          platformStatus?.statusEndpoint !== `${connectorBaseUrl}/${platform}/status`
+        );
+      })
+    ) {
+      throw new Error(`Explicit local draft endpoints did not infer status endpoints: ${JSON.stringify(initialRuntime.draftConnector)}`);
+    }
+
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for explicit local status sync verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "Explicit local status sync e2e",
+          summary: "Verify explicit local draft endpoints infer status endpoints without DRAFT_CONNECTOR_BASE_URL.",
+          body: "This content confirms Zhihu, Bilibili, and Xiaohongshu can create local connector drafts and then sync status through inferred status endpoints.",
+          tags: ["draft", "explicit-endpoint", "status", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+
+    let task = created;
+    for (let i = 0; i < 50; i += 1) {
+      await delay(600);
+      task = await requestJson(`/publish/tasks/${created.id}`);
+      if (!["running", "queued"].includes(task.status)) {
+        break;
+      }
+    }
+
+    if (
+      task.status !== "succeeded" ||
+      platforms.some((platform) => {
+        const target = task.results.find((item) => item.platform === platform);
+        return (
+          target?.status !== "succeeded" ||
+          !target.remoteId?.startsWith(`${platform}-draft-`) ||
+          !target.url?.startsWith(`${connectorBaseUrl}/${platform}/drafts/${platform}-draft-`)
+        );
+      })
+    ) {
+      throw new Error(`Explicit local endpoint draft creation did not succeed: ${JSON.stringify(task)}`);
+    }
+
+    const synced = await requestJson(`/publish/tasks/${created.id}/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    if (
+      synced.status !== "succeeded" ||
+      platforms.some((platform) => {
+        const target = synced.results.find((item) => item.platform === platform);
+        return (
+          target?.status !== "succeeded" ||
+          !target.remoteId?.startsWith(`${platform}-draft-`) ||
+          !target.url?.startsWith(`${connectorBaseUrl}/${platform}/drafts/${platform}-draft-`)
+        );
+      })
+    ) {
+      throw new Error(`Explicit local endpoint inferred status sync did not succeed: ${JSON.stringify(synced)}`);
+    }
+
+    return {
+      taskId: created.id,
+      finalStatus: synced.status,
+      healthUrl: initialRuntime.draftConnector.healthUrl,
+      inferredStatusEndpoints: platforms.map((platform) => {
+        const platformStatus = initialRuntime.draftConnector.platforms.find((item) => item.platform === platform);
+        return {
+          platform,
+          statusEndpoint: platformStatus.statusEndpoint,
+        };
+      }),
+      targets: synced.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        remoteId: target.remoteId,
+        url: target.url,
+      })),
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector)]);
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runCredentialForwardingMismatchPreflightCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -2501,6 +2658,7 @@ const credentialPreflight = await runCredentialPreflightCheck();
 const credentialMismatchPreflight = await runCredentialForwardingMismatchPreflightCheck();
 const offlinePreflight = await runOfflineDraftConnectorPreflightCheck();
 const explicitLocalEndpointPreflight = await runExplicitLocalDraftEndpointPreflightCheck();
+const explicitLocalEndpointStatusSync = await runExplicitLocalDraftEndpointStatusSyncCheck();
 const offlineUpstreamPreflight = await runOfflineUpstreamDraftPreflightCheck();
 const offlineUpstreamRecovery = await runOfflineUpstreamDraftRecoveryCheck();
 const upstreamForwarding = await runUpstreamDraftForwardingCheck();
@@ -2773,6 +2931,7 @@ try {
     credentialMismatchPreflight,
     offlinePreflight,
     explicitLocalEndpointPreflight,
+    explicitLocalEndpointStatusSync,
     offlineUpstreamPreflight,
     offlineUpstreamRecovery,
     upstreamForwarding,
