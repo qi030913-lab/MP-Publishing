@@ -175,6 +175,11 @@ export type RuntimeStatus = {
       platform: PlatformName;
       realPublishEnabled: boolean;
       draftReady: boolean;
+      draftReadinessIssues: Array<{
+        code: string;
+        message: string;
+        severity: "info" | "warning" | "error";
+      }>;
       draftEndpoint?: string;
       statusEndpoint?: string;
       upstreamDraftEndpointConfigured?: boolean;

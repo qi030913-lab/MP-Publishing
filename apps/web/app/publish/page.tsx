@@ -262,6 +262,11 @@ export default function PublishPage() {
                             </>
                           ) : null}
                         </p>
+                        {!connectorReady && platformStatus.draftReadinessIssues.length > 0 ? (
+                          <p className="page-description">
+                            Action: {platformStatus.draftReadinessIssues.map((issue) => issue.message).join(" ")}
+                          </p>
+                        ) : null}
                       </div>
                     </div>
                   );

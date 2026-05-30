@@ -1,6 +1,6 @@
 import { Injectable } from "@nestjs/common";
 import { getRuntimeStats } from "@mp-publishing/task-runtime";
-import type { PlatformName } from "@mp-publishing/platform-sdk";
+import type { PlatformName, ValidationIssue } from "@mp-publishing/platform-sdk";
 
 type DraftConnectorStatus = "online" | "offline" | "configured" | "unconfigured";
 
@@ -8,6 +8,7 @@ type DraftConnectorPlatformStatus = {
   platform: PlatformName;
   realPublishEnabled: boolean;
   draftReady: boolean;
+  draftReadinessIssues: ValidationIssue[];
   draftEndpoint?: string;
   statusEndpoint?: string;
   upstreamDraftEndpointConfigured?: boolean;
@@ -159,24 +160,85 @@ function inferBaseUrlFromHealthUrl(healthUrl: string | undefined) {
   }
 }
 
-function resolveDraftReady(
+function createReadinessIssue(code: string, message: string, severity: ValidationIssue["severity"] = "error"): ValidationIssue {
+  return { code, message, severity };
+}
+
+function resolveEnvPrefix(platform: PlatformName) {
+  return draftConnectorPlatforms.find((item) => item.platform === platform)?.envPrefix ?? platform.toUpperCase();
+}
+
+function resolveDraftReadiness(
   platformStatus: DraftConnectorPlatformStatus,
   connectorStatus: DraftConnectorStatus,
+  envPrefix: string,
   upstreamStatus?: NonNullable<DraftConnectorHealthPayload["upstreamDrafts"]>[number],
 ) {
-  if (!platformStatus.realPublishEnabled || !platformStatus.draftEndpoint) {
-    return false;
+  const issues: ValidationIssue[] = [];
+
+  if (!platformStatus.realPublishEnabled) {
+    issues.push(
+      createReadinessIssue(
+        `${platformStatus.platform.toUpperCase()}_REAL_PUBLISH_DISABLED`,
+        `Set ${envPrefix}_REAL_PUBLISH_ENABLED=true before creating a real ${platformStatus.platform} draft.`,
+      ),
+    );
   }
 
-  if (connectorStatus === "offline" || connectorStatus === "unconfigured") {
-    return false;
+  if (!platformStatus.draftEndpoint) {
+    issues.push(
+      createReadinessIssue(
+        `${platformStatus.platform.toUpperCase()}_DRAFT_ENDPOINT_MISSING`,
+        `Configure ${envPrefix}_DRAFT_ENDPOINT or DRAFT_CONNECTOR_BASE_URL before creating a real ${platformStatus.platform} draft.`,
+      ),
+    );
+  }
+
+  if (connectorStatus === "offline") {
+    issues.push(
+      createReadinessIssue(
+        `${platformStatus.platform.toUpperCase()}_DRAFT_CONNECTOR_OFFLINE`,
+        `Start the draft connector before creating a real ${platformStatus.platform} draft.`,
+      ),
+    );
+  }
+
+  if (connectorStatus === "unconfigured" && issues.length === 0) {
+    issues.push(
+      createReadinessIssue(
+        `${platformStatus.platform.toUpperCase()}_DRAFT_CONNECTOR_UNCONFIGURED`,
+        `Set DRAFT_CONNECTOR_BASE_URL or ${envPrefix}_DRAFT_ENDPOINT before creating a real ${platformStatus.platform} draft.`,
+      ),
+    );
   }
 
   if (upstreamStatus?.draftEndpointConfigured && upstreamStatus.status === "offline") {
-    return false;
+    issues.push(
+      createReadinessIssue(
+        `${platformStatus.platform.toUpperCase()}_UPSTREAM_DRAFT_CONNECTOR_OFFLINE`,
+        upstreamStatus.detail ??
+          `${platformStatus.platform} upstream draft connector health check failed before creating a real draft.`,
+      ),
+    );
   }
 
-  return true;
+  if (
+    upstreamStatus?.draftEndpointConfigured &&
+    upstreamStatus.credentialForwardingEnabled &&
+    !isEnabled(`${envPrefix}_DRAFT_INCLUDE_CREDENTIAL`)
+  ) {
+    issues.push(
+      createReadinessIssue(
+        `${platformStatus.platform.toUpperCase()}_DRAFT_CREDENTIAL_FORWARDING_DISABLED`,
+        `Enable ${envPrefix}_DRAFT_INCLUDE_CREDENTIAL=true because the local draft connector is configured to forward credentials to the ${platformStatus.platform} upstream draft service.`,
+      ),
+    );
+  }
+
+  return {
+    draftReady: issues.length === 0,
+    draftReadinessIssues: issues,
+  };
 }
 
 @Injectable()
@@ -186,6 +248,7 @@ export class RuntimeService {
       platform,
       realPublishEnabled: isEnabled(`${envPrefix}_REAL_PUBLISH_ENABLED`),
       draftReady: false,
+      draftReadinessIssues: [],
       draftEndpoint: resolveConnectorEndpoint(envPrefix, platform, "drafts"),
       statusEndpoint: resolveConnectorEndpoint(envPrefix, platform, "status"),
     }));
@@ -202,7 +265,7 @@ export class RuntimeService {
           : "Set DRAFT_CONNECTOR_BASE_URL to enable local draft connector health checks.",
         platforms: platforms.map((platformStatus) => ({
           ...platformStatus,
-          draftReady: resolveDraftReady(platformStatus, status),
+          ...resolveDraftReadiness(platformStatus, status, resolveEnvPrefix(platformStatus.platform)),
         })),
       } satisfies {
         status: DraftConnectorStatus;
@@ -228,7 +291,7 @@ export class RuntimeService {
 
         return {
           ...platformStatus,
-          draftReady: resolveDraftReady(platformStatus, status, upstreamStatus),
+          ...resolveDraftReadiness(platformStatus, status, resolveEnvPrefix(platformStatus.platform), upstreamStatus),
           upstreamDraftEndpointConfigured: upstreamStatus?.draftEndpointConfigured,
           upstreamStatusEndpointConfigured: upstreamStatus?.statusEndpointConfigured,
           upstreamCredentialForwardingEnabled: upstreamStatus?.credentialForwardingEnabled,
@@ -259,7 +322,7 @@ export class RuntimeService {
         detail: error instanceof Error ? error.message : "Draft connector health check failed.",
         platforms: platforms.map((platformStatus) => ({
           ...platformStatus,
-          draftReady: resolveDraftReady(platformStatus, "offline"),
+          ...resolveDraftReadiness(platformStatus, "offline", resolveEnvPrefix(platformStatus.platform)),
         })),
       };
     } finally {

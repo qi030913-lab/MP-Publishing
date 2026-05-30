@@ -530,6 +530,8 @@ async function runLocalDraftEnablementCheck() {
         return (
           !platformStatus?.realPublishEnabled ||
           !platformStatus.draftReady ||
+          !Array.isArray(platformStatus.draftReadinessIssues) ||
+          platformStatus.draftReadinessIssues.length > 0 ||
           platformStatus.draftEndpoint !== `${connectorBaseUrl}/${platform}/drafts`
         );
       })
@@ -689,6 +691,20 @@ async function runDisabledDraftPreflightCheck() {
       runtimeAfterRetry.queue.failed > 0
     ) {
       throw new Error(`Draft preflight retry should not enqueue work while connector is disabled: ${JSON.stringify(runtimeAfterRetry.queue)}`);
+    }
+
+    if (
+      platforms.some((platform) => {
+        const platformStatus = runtimeAfterRetry.draftConnector.platforms.find((item) => item.platform === platform);
+        const issueCodes = platformStatus?.draftReadinessIssues?.map((issue) => issue.code) ?? [];
+        return (
+          platformStatus?.draftReady !== false ||
+          !issueCodes.includes(`${platform.toUpperCase()}_REAL_PUBLISH_DISABLED`) ||
+          !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_ENDPOINT_MISSING`)
+        );
+      })
+    ) {
+      throw new Error(`Disabled runtime should expose draft readiness blockers: ${JSON.stringify(runtimeAfterRetry.draftConnector)}`);
     }
 
     return {
@@ -1350,6 +1366,19 @@ async function runCredentialForwardingMismatchPreflightCheck() {
       );
     }
 
+    if (
+      platforms.some((platform) => {
+        const platformStatus = runtimeAfterRetry.draftConnector.platforms.find((item) => item.platform === platform);
+        const issueCodes = platformStatus?.draftReadinessIssues?.map((issue) => issue.code) ?? [];
+        return (
+          platformStatus?.draftReady !== false ||
+          !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_CREDENTIAL_FORWARDING_DISABLED`)
+        );
+      })
+    ) {
+      throw new Error(`Credential mismatch runtime should expose draft readiness blockers: ${JSON.stringify(runtimeAfterRetry.draftConnector)}`);
+    }
+
     return {
       taskId: created.id,
       status: retried.status,
@@ -1485,7 +1514,12 @@ async function runOfflineUpstreamDraftPreflightCheck() {
     if (
       platforms.some((platform) => {
         const platformStatus = runtimeAfterRetry.draftConnector.platforms.find((item) => item.platform === platform);
-        return platformStatus?.draftReady !== false || platformStatus?.upstreamDraftStatus !== "offline";
+        const issueCodes = platformStatus?.draftReadinessIssues?.map((issue) => issue.code) ?? [];
+        return (
+          platformStatus?.draftReady !== false ||
+          platformStatus?.upstreamDraftStatus !== "offline" ||
+          !issueCodes.includes(`${platform.toUpperCase()}_UPSTREAM_DRAFT_CONNECTOR_OFFLINE`)
+        );
       })
     ) {
       throw new Error(`Offline upstream runtime should mark draft targets as not ready: ${JSON.stringify(runtimeAfterRetry.draftConnector)}`);
