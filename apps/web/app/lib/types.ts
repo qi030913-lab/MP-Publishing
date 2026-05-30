@@ -175,6 +175,10 @@ export type RuntimeStatus = {
       realPublishEnabled: boolean;
       draftEndpoint?: string;
       statusEndpoint?: string;
+      upstreamDraftEndpointConfigured?: boolean;
+      upstreamDraftStatus?: "unconfigured" | "configured" | "online" | "offline";
+      upstreamDraftDetail?: string;
+      upstreamDraftHealthEndpoint?: string;
     }>;
   };
 };

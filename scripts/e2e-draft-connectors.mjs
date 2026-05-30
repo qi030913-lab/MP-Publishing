@@ -122,7 +122,21 @@ async function startFakeUpstreamDraftService(port, expectedApiKey) {
   const baseUrl = `http://127.0.0.1:${port}`;
   const server = createServer((request, response) => {
     void (async () => {
-      const [platform, operation] = new URL(request.url ?? "/", baseUrl).pathname.split("/").filter(Boolean);
+      const pathname = new URL(request.url ?? "/", baseUrl).pathname;
+      const [platform, operation] = pathname.split("/").filter(Boolean);
+
+      if (request.method === "GET" && pathname === "/health") {
+        if (request.headers.authorization !== `Bearer ${expectedApiKey}`) {
+          response.writeHead(401, { "content-type": "application/json" });
+          response.end(JSON.stringify({ ok: false, message: "upstream api key is invalid" }));
+          return;
+        }
+
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: true, status: "ok" }));
+        return;
+      }
+
       if (request.method !== "POST" || operation !== "drafts") {
         response.writeHead(404, { "content-type": "application/json" });
         response.end(JSON.stringify({ ok: false, message: "upstream route not found" }));
@@ -425,6 +439,121 @@ async function runOfflineDraftConnectorPreflightCheck() {
   }
 }
 
+async function runOfflineUpstreamDraftPreflightCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const apiPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const offlineUpstreamPort = await getFreePort();
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const upstreamBaseUrl = `http://127.0.0.1:${offlineUpstreamPort}`;
+  const outboxDir = path.join(runtimeDir, `draft-connector-offline-upstream-e2e-${Date.now()}`);
+  const queueName = `mp-publishing-draft-offline-upstream-e2e-${Date.now()}`;
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+
+  const api = startService("api-draft-offline-upstream", ["apps/api/dist/main.js"], {
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+  });
+  const draftConnector = startService("draft-connector-offline-upstream", ["apps/draft-connector/dist/main.js"], {
+    PORT: String(connectorPort),
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_UPSTREAM_API_KEY: "upstream-secret",
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_ENDPOINT: `${upstreamBaseUrl}/zhihu/drafts`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_HEALTH_ENDPOINT: `${upstreamBaseUrl}/health`,
+  });
+
+  try {
+    const connectorHealth = await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector offline upstream");
+    const upstreamStatus = connectorHealth.upstreamDrafts?.find((item) => item.platform === "zhihu");
+    if (!upstreamStatus?.draftEndpointConfigured || upstreamStatus.status !== "offline") {
+      throw new Error(`Draft connector health did not expose offline upstream status: ${JSON.stringify(connectorHealth)}`);
+    }
+
+    await waitForApi(api);
+    const accountsResponse = await requestJson("/accounts");
+    const zhihuAccount = accountsResponse.items.find((account) => account.platform === "zhihu");
+    if (!zhihuAccount) {
+      throw new Error(`Missing zhihu account for offline upstream preflight verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "非公众号平台真实草稿上游离线预检验证",
+          summary: "验证上游草稿服务离线时不会把真实草稿任务排入 worker。",
+          body: "这条内容用于确认本地 draft connector 在线但 upstream health 失败时，API 会在入队前要求人工处理。",
+          tags: ["draft", "upstream", "offline", "e2e"],
+        },
+        platforms: ["zhihu"],
+        accountIds: [zhihuAccount.id],
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+    const target = created.results.find((item) => item.platform === "zhihu");
+    const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+
+    if (
+      created.status !== "needs_manual_action" ||
+      target?.status !== "needs_manual_action" ||
+      !issueCodes.includes("ZHIHU_UPSTREAM_DRAFT_CONNECTOR_OFFLINE")
+    ) {
+      throw new Error(`Draft preflight did not hold an offline upstream target correctly: ${JSON.stringify(created)}`);
+    }
+
+    const retried = await requestJson(`/publish/tasks/${created.id}/retry`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ platform: "zhihu" }),
+    });
+    const retryTarget = retried.results.find((item) => item.platform === "zhihu");
+    const retryIssueCodes = retryTarget?.issues?.map((issue) => issue.code) ?? [];
+    const runtimeAfterRetry = await requestJson("/runtime/status");
+
+    if (
+      retried.status !== "needs_manual_action" ||
+      retryTarget?.status !== "needs_manual_action" ||
+      !retryIssueCodes.includes("ZHIHU_UPSTREAM_DRAFT_CONNECTOR_OFFLINE")
+    ) {
+      throw new Error(`Draft preflight retry did not keep offline upstream target on manual action: ${JSON.stringify(retried)}`);
+    }
+
+    if (
+      runtimeAfterRetry.queue.waiting > 0 ||
+      runtimeAfterRetry.queue.active > 0 ||
+      runtimeAfterRetry.queue.delayed > 0 ||
+      runtimeAfterRetry.queue.failed > 0
+    ) {
+      throw new Error(`Offline upstream retry should not enqueue work: ${JSON.stringify(runtimeAfterRetry.queue)}`);
+    }
+
+    return {
+      taskId: created.id,
+      status: retried.status,
+      targetStatus: retryTarget.status,
+      attemptCount: retryTarget.attemptCount,
+      issueCodes: retryIssueCodes,
+      upstreamStatus: upstreamStatus.status,
+      queue: runtimeAfterRetry.queue,
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(draftConnector)]);
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runUpstreamDraftForwardingCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -458,8 +587,11 @@ async function runUpstreamDraftForwardingCheck() {
     DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
     DRAFT_CONNECTOR_UPSTREAM_API_KEY: "upstream-secret",
     DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/zhihu/drafts`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
     DRAFT_CONNECTOR_BILIBILI_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/bilibili/drafts`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
     DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/xiaohongshu/drafts`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
   };
 
   const api = startService("api-draft-upstream", ["apps/api/dist/main.js"], connectorEnv);
@@ -471,7 +603,9 @@ async function runUpstreamDraftForwardingCheck() {
     if (
       platforms.some(
         (platform) =>
-          !upstreamHealth.upstreamDrafts?.some((item) => item.platform === platform && item.draftEndpointConfigured),
+          !upstreamHealth.upstreamDrafts?.some(
+            (item) => item.platform === platform && item.draftEndpointConfigured && item.status === "online",
+          ),
       )
     ) {
       throw new Error(`Draft connector health did not report every upstream endpoint: ${JSON.stringify(upstreamHealth)}`);
@@ -603,6 +737,7 @@ const draftConnectorEnv = {
 };
 const disabledPreflight = await runDisabledDraftPreflightCheck();
 const offlinePreflight = await runOfflineDraftConnectorPreflightCheck();
+const offlineUpstreamPreflight = await runOfflineUpstreamDraftPreflightCheck();
 const upstreamForwarding = await runUpstreamDraftForwardingCheck();
 
 const api = startService("api", ["apps/api/dist/main.js"], connectorEnv);
@@ -864,6 +999,7 @@ try {
     },
     disabledPreflight,
     offlinePreflight,
+    offlineUpstreamPreflight,
     upstreamForwarding,
     queue: runtime.queue,
   };

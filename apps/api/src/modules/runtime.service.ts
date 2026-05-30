@@ -9,6 +9,22 @@ type DraftConnectorPlatformStatus = {
   realPublishEnabled: boolean;
   draftEndpoint?: string;
   statusEndpoint?: string;
+  upstreamDraftEndpointConfigured?: boolean;
+  upstreamDraftStatus?: "unconfigured" | "configured" | "online" | "offline";
+  upstreamDraftDetail?: string;
+  upstreamDraftHealthEndpoint?: string;
+};
+
+type DraftConnectorHealthPayload = {
+  status?: string;
+  outboxDir?: string;
+  upstreamDrafts?: Array<{
+    platform?: PlatformName;
+    draftEndpointConfigured?: boolean;
+    healthEndpoint?: string;
+    status?: "unconfigured" | "configured" | "online" | "offline";
+    detail?: string;
+  }>;
 };
 
 const draftConnectorPlatforms: Array<{ platform: PlatformName; envPrefix: string }> = [
@@ -73,7 +89,20 @@ export class RuntimeService {
 
     try {
       const response = await fetch(`${normalizedBaseUrl}/health`, { signal: controller.signal });
-      const payload = response.ok ? ((await response.json()) as { status?: string; outboxDir?: string }) : {};
+      const payload = response.ok
+        ? ((await response.json().catch(() => ({}))) as DraftConnectorHealthPayload)
+        : {};
+      const platformsWithUpstream = platforms.map((platformStatus) => {
+        const upstreamStatus = payload.upstreamDrafts?.find((item) => item.platform === platformStatus.platform);
+
+        return {
+          ...platformStatus,
+          upstreamDraftEndpointConfigured: upstreamStatus?.draftEndpointConfigured,
+          upstreamDraftStatus: upstreamStatus?.status,
+          upstreamDraftDetail: upstreamStatus?.detail,
+          upstreamDraftHealthEndpoint: upstreamStatus?.healthEndpoint,
+        };
+      });
 
       return {
         status: response.ok ? "online" : "offline",
@@ -83,7 +112,7 @@ export class RuntimeService {
           ? `Draft connector is ${payload.status ?? "reachable"}.`
           : `Draft connector health check returned HTTP ${response.status}.`,
         outboxDir: payload.outboxDir,
-        platforms,
+        platforms: platformsWithUpstream,
       };
     } catch (error) {
       return {

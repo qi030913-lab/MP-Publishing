@@ -69,8 +69,17 @@ type DraftSummary = {
 
 type UpstreamDraftConfig = {
   endpoint: string;
+  healthEndpoint?: string;
   apiKey?: string;
   includeCredential: boolean;
+};
+
+type UpstreamDraftStatus = {
+  platform: string;
+  draftEndpointConfigured: boolean;
+  healthEndpoint?: string;
+  status: "unconfigured" | "configured" | "online" | "offline";
+  detail?: string;
 };
 
 type UpstreamDraftResponse = {
@@ -293,16 +302,64 @@ function resolveUpstreamDraftConfig(platform: string): UpstreamDraftConfig | nul
 
   return {
     endpoint,
+    healthEndpoint: readEnvValue(`${envPrefix}_HEALTH_ENDPOINT`) ?? readEnvValue("DRAFT_CONNECTOR_UPSTREAM_HEALTH_ENDPOINT"),
     apiKey: readEnvValue(`${envPrefix}_DRAFT_API_KEY`) ?? readEnvValue("DRAFT_CONNECTOR_UPSTREAM_API_KEY"),
     includeCredential: isEnvEnabled(`${envPrefix}_INCLUDE_CREDENTIAL`),
   };
 }
 
-function listUpstreamDraftStatuses() {
-  return Array.from(supportedPlatforms).map((platform) => ({
-    platform,
-    draftEndpointConfigured: Boolean(resolveUpstreamDraftConfig(platform)),
-  }));
+async function probeUpstreamDraftStatus(platform: string): Promise<UpstreamDraftStatus> {
+  const config = resolveUpstreamDraftConfig(platform);
+  if (!config) {
+    return {
+      platform,
+      draftEndpointConfigured: false,
+      status: "unconfigured",
+    };
+  }
+
+  if (!config.healthEndpoint) {
+    return {
+      platform,
+      draftEndpointConfigured: true,
+      status: "configured",
+      detail: "Upstream draft endpoint is configured; no health endpoint is configured.",
+    };
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 1500);
+
+  try {
+    const response = await fetch(config.healthEndpoint, {
+      headers: config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : undefined,
+      signal: controller.signal,
+    });
+
+    return {
+      platform,
+      draftEndpointConfigured: true,
+      healthEndpoint: config.healthEndpoint,
+      status: response.ok ? "online" : "offline",
+      detail: response.ok
+        ? `Upstream draft health check returned HTTP ${response.status}.`
+        : `Upstream draft health check failed with HTTP ${response.status}.`,
+    };
+  } catch (error) {
+    return {
+      platform,
+      draftEndpointConfigured: true,
+      healthEndpoint: config.healthEndpoint,
+      status: "offline",
+      detail: error instanceof Error ? error.message : "Upstream draft health check failed.",
+    };
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+async function listUpstreamDraftStatuses() {
+  return Promise.all(Array.from(supportedPlatforms).map((platform) => probeUpstreamDraftStatus(platform)));
 }
 
 function createUpstreamPayload(
@@ -813,7 +870,7 @@ const server = createServer((request, response) => {
           status: "ok",
           outboxDir,
           platforms: Array.from(supportedPlatforms),
-          upstreamDrafts: listUpstreamDraftStatuses(),
+          upstreamDrafts: await listUpstreamDraftStatuses(),
         });
         return;
       }

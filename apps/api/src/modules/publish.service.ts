@@ -34,6 +34,15 @@ const draftConnectorPlatforms: Partial<Record<PlatformName, { envPrefix: string 
   xiaohongshu: { envPrefix: "XIAOHONGSHU" },
 };
 
+type DraftConnectorHealthPayload = {
+  upstreamDrafts?: Array<{
+    platform?: PlatformName;
+    draftEndpointConfigured?: boolean;
+    status?: "unconfigured" | "configured" | "online" | "offline";
+    detail?: string;
+  }>;
+};
+
 function readEnvValue(key: string) {
   const value = process.env[key]?.trim();
   return value && value.length > 0 ? value : undefined;
@@ -145,16 +154,28 @@ export class PublishService {
 
     try {
       const response = await fetch(`${trimTrailingSlash(baseUrl)}/health`, { signal: controller.signal });
-      if (response.ok) {
-        return [];
+      if (!response.ok) {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_DRAFT_CONNECTOR_OFFLINE`,
+            `Draft connector health check returned HTTP ${response.status}; start the connector before creating a real ${platform} draft.`,
+          ),
+        ];
       }
 
-      return [
-        this.createIssue(
-          `${platform.toUpperCase()}_DRAFT_CONNECTOR_OFFLINE`,
-          `Draft connector health check returned HTTP ${response.status}; start the connector before creating a real ${platform} draft.`,
-        ),
-      ];
+      const payload = (await response.json().catch(() => ({}))) as DraftConnectorHealthPayload;
+      const upstreamStatus = payload.upstreamDrafts?.find((item) => item.platform === platform);
+      if (upstreamStatus?.draftEndpointConfigured && upstreamStatus.status === "offline") {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_UPSTREAM_DRAFT_CONNECTOR_OFFLINE`,
+            upstreamStatus.detail ??
+              `${platform} upstream draft connector health check failed before creating a real draft.`,
+          ),
+        ];
+      }
+
+      return [];
     } catch (error) {
       return [
         this.createIssue(
