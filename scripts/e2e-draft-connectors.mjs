@@ -332,6 +332,99 @@ async function runDisabledDraftPreflightCheck() {
   }
 }
 
+async function runOfflineDraftConnectorPreflightCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const preflightApiPort = await getFreePort();
+  const offlineConnectorPort = await getFreePort();
+  const preflightQueueName = `mp-publishing-draft-offline-e2e-${Date.now()}`;
+  apiBaseUrl = `http://127.0.0.1:${preflightApiPort}`;
+  const api = startService("api-draft-offline", ["apps/api/dist/main.js"], {
+    PORT: String(preflightApiPort),
+    PUBLISH_QUEUE_NAME: preflightQueueName,
+    DRAFT_CONNECTOR_BASE_URL: `http://127.0.0.1:${offlineConnectorPort}`,
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    ZHIHU_DRAFT_ENDPOINT: "",
+  });
+
+  try {
+    await waitForApi(api);
+    const accountsResponse = await requestJson("/accounts");
+    const zhihuAccount = accountsResponse.items.find((account) => account.platform === "zhihu");
+    if (!zhihuAccount) {
+      throw new Error(`Missing zhihu account for offline connector preflight verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "非公众号平台真实草稿离线连接器预检验证",
+          summary: "验证本地连接器离线时不会把真实草稿任务排入 worker。",
+          body: "这条内容用于确认 API 会在创建真实草稿任务时探测本地 draft connector health。",
+          tags: ["draft", "offline", "e2e"],
+        },
+        platforms: ["zhihu"],
+        accountIds: [zhihuAccount.id],
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+    const target = created.results.find((item) => item.platform === "zhihu");
+    const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+
+    if (
+      created.status !== "needs_manual_action" ||
+      target?.status !== "needs_manual_action" ||
+      !issueCodes.includes("ZHIHU_DRAFT_CONNECTOR_OFFLINE")
+    ) {
+      throw new Error(`Draft preflight did not hold an offline connector target correctly: ${JSON.stringify(created)}`);
+    }
+
+    const retried = await requestJson(`/publish/tasks/${created.id}/retry`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ platform: "zhihu" }),
+    });
+    const retryTarget = retried.results.find((item) => item.platform === "zhihu");
+    const retryIssueCodes = retryTarget?.issues?.map((issue) => issue.code) ?? [];
+    const runtimeAfterRetry = await requestJson("/runtime/status");
+
+    if (
+      retried.status !== "needs_manual_action" ||
+      retryTarget?.status !== "needs_manual_action" ||
+      !retryIssueCodes.includes("ZHIHU_DRAFT_CONNECTOR_OFFLINE")
+    ) {
+      throw new Error(`Draft preflight retry did not keep offline connector target on manual action: ${JSON.stringify(retried)}`);
+    }
+
+    if (
+      runtimeAfterRetry.queue.waiting > 0 ||
+      runtimeAfterRetry.queue.active > 0 ||
+      runtimeAfterRetry.queue.delayed > 0 ||
+      runtimeAfterRetry.queue.failed > 0
+    ) {
+      throw new Error(`Offline connector retry should not enqueue work: ${JSON.stringify(runtimeAfterRetry.queue)}`);
+    }
+
+    return {
+      taskId: created.id,
+      status: retried.status,
+      targetStatus: retryTarget.status,
+      attemptCount: retryTarget.attemptCount,
+      issueCodes: retryIssueCodes,
+      queue: runtimeAfterRetry.queue,
+    };
+  } finally {
+    await stopService(api);
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runUpstreamDraftForwardingCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -509,6 +602,7 @@ const draftConnectorEnv = {
   DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
 };
 const disabledPreflight = await runDisabledDraftPreflightCheck();
+const offlinePreflight = await runOfflineDraftConnectorPreflightCheck();
 const upstreamForwarding = await runUpstreamDraftForwardingCheck();
 
 const api = startService("api", ["apps/api/dist/main.js"], connectorEnv);
@@ -769,6 +863,7 @@ try {
       outboxUrl: initialRuntime.draftConnector.outboxUrl,
     },
     disabledPreflight,
+    offlinePreflight,
     upstreamForwarding,
     queue: runtime.queue,
   };

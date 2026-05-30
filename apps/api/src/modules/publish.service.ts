@@ -57,6 +57,10 @@ function resolveDraftEndpoint(platform: PlatformName, envPrefix: string) {
   return baseUrl ? `${trimTrailingSlash(baseUrl)}/${platform}/drafts` : undefined;
 }
 
+function usesInferredDraftConnectorEndpoint(envPrefix: string) {
+  return !readEnvValue(`${envPrefix}_DRAFT_ENDPOINT`) && Boolean(readEnvValue("DRAFT_CONNECTOR_BASE_URL"));
+}
+
 @Injectable()
 export class PublishService {
   private createTimestamp() {
@@ -126,7 +130,46 @@ export class PublishService {
     return { code, message, severity };
   }
 
-  private preflightRealDraftTarget(platform: PlatformName) {
+  private async probeDraftConnectorHealth(platform: PlatformName, envPrefix: string) {
+    if (!usesInferredDraftConnectorEndpoint(envPrefix)) {
+      return [];
+    }
+
+    const baseUrl = readEnvValue("DRAFT_CONNECTOR_BASE_URL");
+    if (!baseUrl) {
+      return [];
+    }
+
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 1500);
+
+    try {
+      const response = await fetch(`${trimTrailingSlash(baseUrl)}/health`, { signal: controller.signal });
+      if (response.ok) {
+        return [];
+      }
+
+      return [
+        this.createIssue(
+          `${platform.toUpperCase()}_DRAFT_CONNECTOR_OFFLINE`,
+          `Draft connector health check returned HTTP ${response.status}; start the connector before creating a real ${platform} draft.`,
+        ),
+      ];
+    } catch (error) {
+      return [
+        this.createIssue(
+          `${platform.toUpperCase()}_DRAFT_CONNECTOR_OFFLINE`,
+          error instanceof Error
+            ? error.message
+            : `Draft connector health check failed before creating a real ${platform} draft.`,
+        ),
+      ];
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+
+  private async preflightRealDraftTarget(platform: PlatformName) {
     const connectorConfig = draftConnectorPlatforms[platform];
     const issues: ValidationIssue[] = [];
 
@@ -152,6 +195,8 @@ export class PublishService {
         ),
       );
     }
+
+    issues.push(...(await this.probeDraftConnectorHealth(platform, connectorConfig.envPrefix)));
 
     return issues;
   }
@@ -243,10 +288,10 @@ export class PublishService {
     const document = this.createBaseDocument(input);
     const contentSnapshot = await createContentSnapshot(document);
 
-    const targets = input.platforms.map((platform) => {
-        const matchedAccount = accounts.find((account) => account.platform === platform) ?? null;
-        const preflightIssues = mode === "real-publish" ? this.preflightRealDraftTarget(platform) : [];
-        const initialStatus = this.resolveInitialTargetStatus(matchedAccount);
+    const targets = await Promise.all(input.platforms.map(async (platform) => {
+      const matchedAccount = accounts.find((account) => account.platform === platform) ?? null;
+      const preflightIssues = mode === "real-publish" ? await this.preflightRealDraftTarget(platform) : [];
+      const initialStatus = this.resolveInitialTargetStatus(matchedAccount);
         const targetStatus =
           initialStatus === "queued" && preflightIssues.length > 0 ? "needs_manual_action" : initialStatus;
         const baseLogs = [
@@ -282,7 +327,7 @@ export class PublishService {
           issues: preflightIssues,
           logs: baseLogs,
         } satisfies PublishTaskTargetRecord;
-      });
+      }));
 
     const task: PublishTaskRecord = {
       id: `task_${Date.now()}`,
@@ -394,7 +439,7 @@ export class PublishService {
       const initialStatus = this.resolveInitialTargetStatus(target.account);
       const preflightIssues =
         refreshedTask.mode === "real-publish" && initialStatus === "queued"
-          ? this.preflightRealDraftTarget(target.platform)
+          ? await this.preflightRealDraftTarget(target.platform)
           : [];
       target.status =
         initialStatus === "queued" && preflightIssues.length > 0 ? "needs_manual_action" : initialStatus;
