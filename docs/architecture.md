@@ -46,6 +46,8 @@
 
 补充：`pnpm drafts:capture-playwright-session -- --platform <platform> --url <creator-draft-url> --save-env` 已用于采集真实创作者中心登录态：脚本会打开 Playwright 浏览器供人工完成登录，默认把 storage state 保存到被 git 忽略的 `.runtime/draft-sessions`，并可只把草稿页 URL、storage-state 路径、`REQUIRE_SESSION=true` 和 selector 文件路径写入 `.env`。当前 e2e 已覆盖该捕获脚本的 session 保存、`.env` 指针更新和敏感 cookie 不落盘到 `.env` 的约束。
 
+补充：`pnpm drafts:capture-playwright-selectors -- --platform <platform> --url <creator-draft-url> --fields title,body,saveDraft --save-env` 已补上真实页面 selector 采集步骤：脚本复用上一步的 session 打开创作者草稿页，在页面内注入点击捕获层，让操作者依次点选标题、正文、保存草稿等元素，生成可直接给 `playwright-draft-handler` 使用的扁平 JSON selector 文件，并把 `DRAFT_AUTOMATION_<PLATFORM>_PLAYWRIGHT_SELECTORS_PATH` 写入 `.env`。当前 e2e 已覆盖 selector 文件格式、`.env` 指针更新、可跳过可选字段和敏感 cookie 不落入 `.env`。
+
 ## 1. 目标
 
 面向公众号、知乎、B站、小红书等内容平台，提供一个统一的创作与发布工具，解决以下问题：

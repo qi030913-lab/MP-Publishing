@@ -16,6 +16,7 @@
     "drafts:upstream-sandbox": "node scripts/start-draft-upstream-sandbox.mjs",
     "drafts:automation-service": "node scripts/start-draft-automation-service.mjs",
     "drafts:capture-playwright-session": "node scripts/capture-draft-playwright-session.mjs",
+    "drafts:capture-playwright-selectors": "node scripts/capture-draft-playwright-selectors.mjs",
     "drafts:check-playwright": "node scripts/check-draft-playwright-setup.mjs",
     "drafts:run-work-orders": "node scripts/run-draft-work-order-runner.mjs",
     "drafts:check-upstream": "node scripts/check-draft-upstream-contract.mjs",

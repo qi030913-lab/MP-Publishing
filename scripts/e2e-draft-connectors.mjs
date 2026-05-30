@@ -1448,6 +1448,177 @@ export const chromium = {
   }
 }
 
+async function runDraftPlaywrightSelectorCaptureCheck() {
+  const captureDir = path.join(runtimeDir, `draft-playwright-selector-capture-e2e-${Date.now()}`);
+  const fakePlaywrightPath = path.join(captureDir, "fake-playwright.mjs");
+  const operationLogPath = path.join(captureDir, "operations.json");
+  const selectorsPath = path.join(captureDir, "zhihu-selectors.json");
+  const targetEnvPath = path.join(captureDir, ".env.capture");
+  fs.rmSync(captureDir, { recursive: true, force: true });
+  fs.mkdirSync(captureDir, { recursive: true });
+  fs.writeFileSync(
+    fakePlaywrightPath,
+    `
+import fs from "node:fs";
+
+const logPath = process.env.FAKE_PLAYWRIGHT_LOG_PATH;
+const operations = [];
+const exposed = {};
+let currentUrl = "";
+const selectorsByKey = {
+  title: "#title-input",
+  body: 'div[aria-label="Body"]',
+  saveDraft: 'button[data-testid="save-draft"]',
+};
+
+function log(entry) {
+  operations.push(entry);
+  fs.writeFileSync(logPath, JSON.stringify(operations, null, 2), "utf8");
+}
+
+function locator(selector) {
+  return {
+    async waitFor(options) {
+      log({ action: "waitFor", selector, timeout: options?.timeout });
+    },
+  };
+}
+
+export const chromium = {
+  async launch(options) {
+    log({ action: "launch", headless: options?.headless, channel: options?.channel });
+    return {
+      async newContext(options) {
+        log({ action: "newContext", hasStorageState: Boolean(options?.storageState) });
+        return {
+          async addCookies(cookies) {
+            log({ action: "addCookies", names: cookies.map((cookie) => cookie.name) });
+          },
+          async newPage() {
+            log({ action: "newPage" });
+            return {
+              setDefaultTimeout(timeout) {
+                log({ action: "setDefaultTimeout", timeout });
+              },
+              async goto(url, options) {
+                currentUrl = url + "?selectors=1";
+                log({ action: "goto", url, waitUntil: options?.waitUntil, timeout: options?.timeout });
+              },
+              locator,
+              async exposeFunction(name, callback) {
+                exposed[name] = callback;
+                log({ action: "exposeFunction", name });
+              },
+              async evaluate(fn, arg) {
+                log({ action: arg?.key ? "evaluateStep" : "evaluateInstall", key: arg?.key, required: arg?.required });
+                if (arg?.key) {
+                  const payload =
+                    arg.key === "summary"
+                      ? { action: "skip", key: arg.key }
+                      : { action: "capture", key: arg.key, selector: selectorsByKey[arg.key], tagName: "input", text: arg.key };
+                  await Promise.resolve();
+                  exposed.__mpDraftSelectorCaptureResult(payload);
+                }
+              },
+              url() {
+                return currentUrl;
+              },
+            };
+          },
+        };
+      },
+      async close() {
+        log({ action: "close" });
+      },
+    };
+  },
+};
+`.trim(),
+    "utf8",
+  );
+
+  try {
+    const command = await runNodeCommand(
+      "draft playwright selector capture",
+      [
+        path.join(root, "scripts/capture-draft-playwright-selectors.mjs"),
+        "--platform",
+        "zhihu",
+        "--url",
+        "https://creator.zhihu.example.test/drafts/new",
+        "--output",
+        selectorsPath,
+        "--fields",
+        "title,body,saveDraft,summary",
+        "--wait-for-selector",
+        "#account-menu",
+        "--timeout-ms",
+        "2468",
+        "--headless",
+        "--save-env",
+        "--target-env-file",
+        targetEnvPath,
+      ],
+      {
+        DRAFT_AUTOMATION_PLAYWRIGHT_MODULE: pathToFileURL(fakePlaywrightPath).href,
+        DRAFT_AUTOMATION_PLAYWRIGHT_BROWSER_CHANNEL: "chrome",
+        DRAFT_AUTOMATION_ZHIHU_COOKIES: "SESSION=zhihu-selector-secret",
+        DRAFT_AUTOMATION_ZHIHU_STORAGE_STATE_JSON: "{\"cookies\":[],\"origins\":[]}",
+        FAKE_PLAYWRIGHT_LOG_PATH: operationLogPath,
+      },
+    );
+    const result = JSON.parse(command.stdout);
+    const operations = JSON.parse(fs.readFileSync(operationLogPath, "utf8"));
+    const envContent = fs.readFileSync(targetEnvPath, "utf8");
+    const selectorsContent = JSON.parse(fs.readFileSync(selectorsPath, "utf8"));
+    const relativeSelectorsPath = path.relative(root, selectorsPath).replaceAll("\\", "/");
+
+    if (
+      result.ok !== true ||
+      result.platform !== "zhihu" ||
+      result.savedEnv !== true ||
+      result.hasInitialStorageState !== true ||
+      result.hasCookieSeed !== true ||
+      result.headless !== true ||
+      result.finalUrl !== "https://creator.zhihu.example.test/drafts/new?selectors=1" ||
+      result.captured?.length !== 3 ||
+      !result.skipped?.includes("summary") ||
+      selectorsContent.title !== "#title-input" ||
+      selectorsContent.body !== 'div[aria-label="Body"]' ||
+      selectorsContent.saveDraft !== 'button[data-testid="save-draft"]' ||
+      selectorsContent.selectors ||
+      !envContent.includes('DRAFT_AUTOMATION_ZHIHU_CREATOR_DRAFT_URL="https://creator.zhihu.example.test/drafts/new"') ||
+      !envContent.includes(`DRAFT_AUTOMATION_ZHIHU_PLAYWRIGHT_SELECTORS_PATH="${relativeSelectorsPath}"`) ||
+      envContent.includes("zhihu-selector-secret") ||
+      !operations.some((item) => item.action === "launch" && item.headless === true && item.channel === "chrome") ||
+      !operations.some((item) => item.action === "newContext" && item.hasStorageState === true) ||
+      !operations.some((item) => item.action === "addCookies" && item.names.includes("SESSION")) ||
+      !operations.some((item) => item.action === "waitFor" && item.selector === "#account-menu" && item.timeout === 2468) ||
+      !operations.some((item) => item.action === "exposeFunction" && item.name === "__mpDraftSelectorCaptureResult") ||
+      !["title", "body", "saveDraft", "summary"].every((key) => operations.some((item) => item.action === "evaluateStep" && item.key === key))
+    ) {
+      throw new Error(
+        `Draft Playwright selector capture did not save selectors and env pointers correctly: ${JSON.stringify({
+          result,
+          operations,
+          envContent,
+          selectorsContent,
+        })}`,
+      );
+    }
+
+    return {
+      platform: result.platform,
+      savedEnv: result.savedEnv,
+      selectorKeys: ["title", "body", "saveDraft"].filter((key) => Boolean(selectorsContent[key])),
+      skipped: result.skipped,
+      envUpdated: envContent.includes(relativeSelectorsPath),
+    };
+  } finally {
+    fs.rmSync(captureDir, { recursive: true, force: true });
+  }
+}
+
 async function runDraftPlaywrightHandlerCheck() {
   const automationPort = await getFreePort();
   const automationBaseUrl = `http://127.0.0.1:${automationPort}`;
@@ -4587,6 +4758,7 @@ const upstreamSandboxCheck = await runUpstreamSandboxScriptCheck();
 const draftAutomationServiceCheck = await runDraftAutomationServiceScriptCheck();
 const draftAutomationDirectUpstreamCheck = await runDraftAutomationDirectUpstreamCheck();
 const draftPlaywrightSessionCaptureCheck = await runDraftPlaywrightSessionCaptureCheck();
+const draftPlaywrightSelectorCaptureCheck = await runDraftPlaywrightSelectorCaptureCheck();
 const draftPlaywrightSetupCheck = await runDraftPlaywrightSetupCheckScriptCheck();
 const draftPlaywrightHandlerCheck = await runDraftPlaywrightHandlerCheck();
 const upstreamSandboxCallback = await runUpstreamSandboxCallbackCheck();
@@ -5024,6 +5196,7 @@ try {
     draftAutomationServiceCheck,
     draftAutomationDirectUpstreamCheck,
     draftPlaywrightSessionCaptureCheck,
+    draftPlaywrightSelectorCaptureCheck,
     draftPlaywrightSetupCheck,
     draftPlaywrightHandlerCheck,
     upstreamSandboxCallback,
