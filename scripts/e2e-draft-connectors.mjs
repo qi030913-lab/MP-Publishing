@@ -2126,6 +2126,173 @@ async function runStatusCredentialForwardingMismatchSyncCheck() {
   }
 }
 
+async function runOfflineUpstreamStatusSyncPreflightCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const upstreamPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const apiPort = await getFreePort();
+  const upstream = await startFakeUpstreamDraftService(upstreamPort, "status-offline-upstream-secret");
+  let upstreamClosed = false;
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const outboxDir = path.join(runtimeDir, `draft-connector-status-offline-e2e-${Date.now()}`);
+  const queueName = `mp-publishing-draft-status-offline-e2e-${Date.now()}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+
+  const connectorEnv = {
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+  };
+  const draftConnectorEnv = {
+    PORT: String(connectorPort),
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_UPSTREAM_API_KEY: "status-offline-upstream-secret",
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/zhihu/drafts`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_STATUS_ENDPOINT: `${upstream.baseUrl}/zhihu/status`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/bilibili/drafts`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_STATUS_ENDPOINT: `${upstream.baseUrl}/bilibili/status`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/xiaohongshu/drafts`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_STATUS_ENDPOINT: `${upstream.baseUrl}/xiaohongshu/status`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+  };
+
+  const api = startService("api-draft-status-offline", ["apps/api/dist/main.js"], connectorEnv);
+  const worker = startService("worker-draft-status-offline", ["apps/worker/dist/main.js"], connectorEnv);
+  const draftConnector = startService("draft-connector-status-offline", ["apps/draft-connector/dist/main.js"], draftConnectorEnv);
+
+  try {
+    const connectorHealth = await waitForHealth(
+      draftConnector,
+      `${connectorBaseUrl}/health`,
+      "Draft connector upstream status offline",
+    );
+    if (
+      platforms.some(
+        (platform) =>
+          !connectorHealth.upstreamDrafts?.some(
+            (item) => item.platform === platform && item.statusEndpointConfigured && item.status === "online",
+          ),
+      )
+    ) {
+      throw new Error(`Draft connector health did not expose online upstream status services: ${JSON.stringify(connectorHealth)}`);
+    }
+
+    await waitForApi(api);
+    await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
+
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for offline upstream status verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "Offline upstream status e2e",
+          summary: "Verify status sync is held when the upstream status service becomes unavailable.",
+          body: "This content confirms manual sync does not call an offline upstream status service after drafts have been created.",
+          tags: ["draft", "status", "offline", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+
+    let task = created;
+    for (let i = 0; i < 50; i += 1) {
+      await delay(600);
+      task = await requestJson(`/publish/tasks/${created.id}`);
+      if (!["running", "queued"].includes(task.status)) {
+        break;
+      }
+    }
+
+    if (task.status !== "succeeded" || upstream.requests.length !== platforms.length) {
+      throw new Error(`Offline upstream status setup did not create upstream drafts: ${JSON.stringify({ task, upstreamRequests: upstream.requests })}`);
+    }
+
+    await upstream.close();
+    upstreamClosed = true;
+
+    const offlineHealth = await requestAbsoluteJson(`${connectorBaseUrl}/health`);
+    if (
+      platforms.some(
+        (platform) =>
+          !offlineHealth.upstreamDrafts?.some(
+            (item) => item.platform === platform && item.statusEndpointConfigured && item.status === "offline",
+          ),
+      )
+    ) {
+      throw new Error(`Draft connector health did not expose offline upstream status services: ${JSON.stringify(offlineHealth)}`);
+    }
+
+    const synced = await requestJson(`/publish/tasks/${created.id}/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    if (
+      synced.status !== "needs_manual_action" ||
+      platforms.some((platform) => {
+        const target = synced.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return (
+          target?.status !== "needs_manual_action" ||
+          !target.remoteId?.startsWith(`${platform}-upstream-${platform}-draft-`) ||
+          !target.url?.startsWith(`https://upstream.example.test/${platform}/`) ||
+          !issueCodes.includes(`${platform.toUpperCase()}_UPSTREAM_STATUS_CONNECTOR_OFFLINE`)
+        );
+      })
+    ) {
+      throw new Error(`Offline upstream status sync was not held for manual action: ${JSON.stringify(synced)}`);
+    }
+
+    if (upstream.statusRequests.length > 0) {
+      throw new Error(`Offline upstream status sync should not call upstream status: ${JSON.stringify(upstream.statusRequests)}`);
+    }
+
+    return {
+      taskId: created.id,
+      finalStatus: synced.status,
+      targets: synced.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        remoteId: target.remoteId,
+        url: target.url,
+        issueCodes: target.issues.map((issue) => issue.code),
+      })),
+      upstreamDraftRequests: upstream.requests.map((request) => request.platform).sort(),
+      upstreamStatusRequests: upstream.statusRequests.length,
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector)]);
+    if (!upstreamClosed) {
+      await upstream.close();
+    }
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runCredentialForwardingCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -2339,6 +2506,7 @@ const offlineUpstreamRecovery = await runOfflineUpstreamDraftRecoveryCheck();
 const upstreamForwarding = await runUpstreamDraftForwardingCheck();
 const upstreamRejectionManualAction = await runUpstreamDraftRejectionManualActionCheck();
 const statusCredentialMismatch = await runStatusCredentialForwardingMismatchSyncCheck();
+const offlineUpstreamStatusSync = await runOfflineUpstreamStatusSyncPreflightCheck();
 const credentialForwarding = await runCredentialForwardingCheck();
 
 const api = startService("api", ["apps/api/dist/main.js"], connectorEnv);
@@ -2610,6 +2778,7 @@ try {
     upstreamForwarding,
     upstreamRejectionManualAction,
     statusCredentialMismatch,
+    offlineUpstreamStatusSync,
     credentialForwarding,
     queue: runtime.queue,
   };

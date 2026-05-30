@@ -312,6 +312,16 @@ export class PublishService {
 
       const payload = (await response.json().catch(() => ({}))) as DraftConnectorHealthPayload;
       const upstreamStatus = payload.upstreamDrafts?.find((item) => item.platform === platform);
+      if (upstreamStatus?.statusEndpointConfigured && upstreamStatus.status === "offline") {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_UPSTREAM_STATUS_CONNECTOR_OFFLINE`,
+            upstreamStatus.detail ??
+              `${platform} upstream status connector health check failed before syncing draft status.`,
+          ),
+        ];
+      }
+
       if (
         upstreamStatus?.statusEndpointConfigured &&
         upstreamStatus.statusCredentialForwardingEnabled &&
