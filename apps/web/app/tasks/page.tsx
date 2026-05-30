@@ -9,6 +9,7 @@ import { platformLabel } from "../lib/platforms";
 import type { PlatformName, PublishTaskDetail, PublishTaskSummary, RuntimeStatus, TaskStatus } from "../lib/types";
 import {
   EmptyState,
+  IssueList,
   LoadingInline,
   PageHeader,
   PlatformBadge,
@@ -349,6 +350,8 @@ export default function TasksPage() {
                           {resultLinkLabel(result.url)}
                         </a>
                       ) : null}
+
+                      {result.issues.length > 0 ? <IssueList issues={result.issues} /> : null}
 
                       {result.status !== "succeeded" ? (
                         <button

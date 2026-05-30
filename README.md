@@ -50,6 +50,7 @@ With `DRAFT_CONNECTOR_BASE_URL=http://localhost:3010`, per-platform draft and st
 The local connector returns browsable draft detail URLs such as `http://localhost:3010/zhihu/drafts/<id>` and outbox list views at `http://localhost:3010/drafts` or `/:platform/drafts`; set `DRAFT_CONNECTOR_PUBLIC_BASE_URL` when it runs behind a proxy.
 The API exposes connector readiness in `/runtime/status`, and the publish page shows whether the draft connector is online before creating real draft tasks.
 When a real draft target is not enabled or has no draft endpoint, the API marks that target as needing manual action before it reaches the worker queue.
+Task details show target-level validation issues so connector preflight failures are visible without reading raw logs.
 
 Verify the local publishing chain after a build:
 
