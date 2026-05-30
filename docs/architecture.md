@@ -1,5 +1,38 @@
 # 多平台内容同步发布工具架构设计
 
+## 0. 当前实现快照（2026-05-30）
+
+当前工程已经从“架构建议”推进到一个可本地演示的 MVP 工作台。现状不是生产架构闭环，而是用轻量 runtime 先把创作、预览、模拟发布、任务推进、账号状态这些关键交互跑通。
+
+已落地：
+
+- **Monorepo**：`pnpm workspace + Turborepo`
+- **前端**：`apps/web`，Next.js App Router，已拆成核心页面：
+  - `/`：创作台
+  - `/preview`：多平台预览台
+  - `/publish`：发布确认页
+  - `/tasks`：任务中心
+  - `/accounts`：账号管理页
+- **后端 API**：`apps/api`，NestJS，提供平台能力、预览、账号、发布任务和 runtime 状态接口
+- **Worker**：`apps/worker`，本地轮询任务并推进 `queued -> running -> succeeded / needs_retry / needs_manual_action`
+- **内容模型**：`packages/content-model`，提供 Canonical Content Model、输入转换和纯文本导出
+- **平台协议**：`packages/platform-sdk`，定义平台能力、草稿、校验、模拟发布、发布结果等类型
+- **适配器注册中心**：`packages/adapter-core`，注册并调度 4 个平台 adapter
+- **平台 adapters**：微信公众号、知乎、B站、小红书均已有 demo adapter
+- **本地 runtime**：`packages/task-runtime`，用 `.runtime/publish-state.json` 暂存 demo 账号、任务和 worker 状态
+
+暂未落地，仍属于生产化目标：
+
+- PostgreSQL + Prisma 的持久化数据模型
+- Redis + BullMQ 的真实任务队列
+- S3 兼容对象存储
+- Playwright 真实页面预演和截图验收
+- AI 改写/标签建议层 `ai-orchestrator`
+- OAuth / Cookie Session / Token 的真实授权、刷新和加密存储
+- 平台真实发布 API、Webhook 回执、状态同步和审计日志
+
+当前 adapter 的 `simulatePublish` 和 `publish` 都是 mock/demo 行为：模拟发布返回 `simulation://...`，mock 发布返回 `dry-run-*` 和 `https://example.com/...`。因此当前系统适合验证产品流程和模块边界，不应用作真实内容发布。
+
 ## 1. 目标
 
 面向公众号、知乎、B站、小红书等内容平台，提供一个统一的创作与发布工具，解决以下问题：
@@ -103,6 +136,8 @@
 
 ## 5. 总体架构
 
+### 5.1 生产目标架构
+
 ```mermaid
 flowchart LR
     U["创作者"] --> W["Web App<br/>编辑/预览/发布台"]
@@ -123,6 +158,27 @@ flowchart LR
     BL --> EXT
     XHS --> EXT
 ```
+
+### 5.2 当前 MVP 实现架构
+
+```mermaid
+flowchart LR
+    U["创作者"] --> WEB["Next.js Web<br/>5 个核心页面"]
+    WEB --> API["NestJS API<br/>preview / publish / accounts"]
+    API --> REG["Adapter Registry"]
+    REG --> WX["Wechat demo adapter"]
+    REG --> ZH["Zhihu demo adapter"]
+    REG --> BL["Bilibili demo adapter"]
+    REG --> XHS["Xiaohongshu demo adapter"]
+    API --> RT["task-runtime<br/>.runtime/publish-state.json"]
+    WK["Worker<br/>轮询本地 runtime"] --> RT
+```
+
+当前 MVP 用 `task-runtime` 代替数据库和队列，目的是先验证端到端交互。生产化时应把 runtime 拆成：
+
+- 数据库持久化：账号、文档、版本、任务、尝试记录、审计日志
+- 队列：适配、模拟发布、发布、重试、状态同步
+- 对象存储：素材、截图、回执快照
 
 ## 6. 核心模块设计
 
@@ -368,57 +424,93 @@ packages/
 
 ## 9. API 设计建议
 
-### 内容与预览
+### 9.1 当前已实现 API
+
+当前 API 为 demo/MVP 形态：
+
+- `GET /health`
+- `GET /platforms`
+- `POST /preview`
+- `GET /accounts`
+- `POST /accounts/:accountId/check`
+- `POST /accounts/:accountId/refresh`
+- `POST /accounts/:accountId/mark-needs-login`
+- `POST /publish/simulate`
+- `POST /publish/mock`
+- `GET /publish/tasks`
+- `GET /publish/tasks/:taskId`
+- `POST /publish/tasks/:taskId/retry`
+- `GET /runtime/status`
+
+说明：
+
+- `/preview` 直接从输入生成 Canonical Document 和平台草稿，没有持久化 `ContentDocument`
+- `/publish/simulate` 和 `/publish/mock` 会创建本地任务，由 worker 推进状态
+- `/accounts/*` 操作的是本地 demo 账号健康状态，不是真实平台授权
+- `/runtime/status` 用于前端任务中心展示 worker 心跳和队列统计
+
+### 9.2 生产目标 API
+
+后续引入数据库、队列和真实授权后，API 应逐步演进为资源化设计。
+
+#### 内容与预览
 
 - `POST /documents`
 - `GET /documents/:id`
 - `POST /documents/:id/adapt`
 - `GET /documents/:id/previews`
 
-### 平台账号
+#### 平台账号
 
 - `POST /platform-accounts/connect`
 - `POST /platform-accounts/:id/refresh`
 - `GET /platform-accounts`
 
-### 发布
+#### 发布
 
 - `POST /publish-jobs`
 - `GET /publish-jobs/:id`
 - `POST /publish-jobs/:id/retry`
 - `POST /publish-jobs/:id/simulate`
 
-### 回执
+#### 回执
 
 - `POST /webhooks/:platform`
 
 ## 10. 前端页面建议
 
-MVP 阶段建议只做 5 个核心页面：
+MVP 前端已经从聚合式单页控制台拆成 5 个核心页面：
 
-1. **创作台**
+1. **创作台**：`/`
    - 标题、正文、素材、标签输入
    - 平台选择器
    - 风格策略选择
 
-2. **多平台预览台**
+2. **多平台预览台**：`/preview`
    - 左侧原稿，右侧平台预览
    - 可切换公众号 / 知乎 / B站 / 小红书
    - 显示校验提示和降级说明
 
-3. **发布确认页**
+3. **发布确认页**：`/publish`
    - 选择账号
    - 选择立即发布 / 模拟发布
    - 查看风险项
 
-4. **任务中心**
+4. **任务中心**：`/tasks`
    - 发布中、成功、失败、待处理
    - 支持重试和查看日志
 
-5. **账号管理页**
+5. **账号管理页**：`/accounts`
    - 绑定平台账号
    - 查看凭证状态
    - 触发健康检查
+
+当前页面仍使用浏览器 `localStorage` 保存编辑草稿和最近任务 ID。生产化时建议：
+
+- 草稿保存迁移到 `ContentDocument / ContentVersion`
+- 预览迁移到 `PlatformDraft / AdaptationJob`
+- 任务中心迁移到 `PublishJob / PublishTarget / PublishAttempt`
+- API 地址从硬编码默认值升级为环境变量和部署配置
 
 ## 11. AI 在系统中的正确位置
 
@@ -503,12 +595,29 @@ AI 不适合直接负责：
 
 ## 15. 下一步建议
 
-下一步建议直接进入工程初始化，并优先完成下面几个包：
+工程初始化和基础模块已经完成。下一步建议从 demo MVP 进入“可信闭环”阶段，优先级如下：
 
-1. `packages/content-model`
-2. `packages/adapter-core`
-3. `packages/adapters/xiaohongshu`（先做一个样板平台）
-4. `apps/api`
-5. `apps/web`
+1. **替换本地 runtime**
+   - 引入 PostgreSQL + Prisma
+   - 建立 `User / Workspace / PlatformAccount / ContentDocument / ContentVersion / PublishJob / PublishTarget / PublishAttempt / AuditLog`
+   - 保留 `task-runtime` 作为测试 fixture 或迁移脚手架，而不是业务 runtime
 
-如果继续，我建议下一轮直接把 Monorepo 骨架和基础模块一起搭起来。
+2. **接入真实队列**
+   - 用 Redis + BullMQ 替代 worker 对 `.runtime` 文件的轮询
+   - 把模拟发布、mock 发布、重试、状态同步拆成明确 job
+
+3. **做深一个平台**
+   - 优先选择公众号或知乎作为第一个真实发布平台
+   - 补齐真实 validator、renderer、publisher、status-sync
+   - 明确失败原因、重试策略和人工处理状态
+
+4. **补齐模拟发布**
+   - 引入 Playwright
+   - 生成截图、字段校验报告和风险项
+   - 保证模拟发布不点击最终确认按钮
+
+5. **补测试与可观测性**
+   - adapter 单元测试
+   - API e2e 测试
+   - worker 状态流转测试
+   - 发布链路日志和审计记录
