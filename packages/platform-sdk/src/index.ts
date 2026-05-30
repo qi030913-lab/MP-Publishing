@@ -34,10 +34,25 @@ export type PlatformDraft = {
   warnings: ValidationIssue[];
 };
 
+export type PlatformCredential = {
+  accountId: string;
+  platform: PlatformName;
+  credentialRef: string;
+  authMode: "official-api" | "cookie-session" | "hybrid";
+  appId?: string;
+  appSecret?: string;
+  accessToken?: string;
+  refreshToken?: string;
+  cookies?: string;
+  storageStateJson?: string;
+  expiresAt?: string;
+};
+
 export type PublishInput = {
   accountId: string;
   document: CanonicalDocument;
   dryRun?: boolean;
+  credential?: PlatformCredential;
 };
 
 export type SimulationResult = {
@@ -64,6 +79,14 @@ export type PublishStatus = {
     | "failed"
     | "needs_manual_action";
   detail?: string;
+  remoteId?: string;
+  url?: string;
+  issues?: ValidationIssue[];
+};
+
+export type PublishStatusInput = {
+  accountId?: string;
+  credential?: PlatformCredential;
 };
 
 export interface PlatformAdapter {
@@ -73,5 +96,5 @@ export interface PlatformAdapter {
   adapt(document: CanonicalDocument, options: AdaptOptions): Promise<PlatformDraft>;
   simulatePublish(input: PublishInput): Promise<SimulationResult>;
   publish(input: PublishInput): Promise<PublishResult>;
-  getPublishStatus?(remoteId: string): Promise<PublishStatus>;
+  getPublishStatus?(remoteId: string, input?: PublishStatusInput): Promise<PublishStatus>;
 }

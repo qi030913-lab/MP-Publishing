@@ -39,6 +39,7 @@ export default function PublishPage() {
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([]);
   const [isSimulating, setIsSimulating] = useState(false);
   const [isPublishing, setIsPublishing] = useState(false);
+  const [isRealPublishing, setIsRealPublishing] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const selectedAccounts = useMemo(
@@ -99,6 +100,31 @@ export default function PublishPage() {
     }
   }
 
+  async function submitRealWechat() {
+    if (!draft) {
+      return;
+    }
+
+    const wechatAccount = selectedAccounts.find((account) => account.platform === "wechat");
+    if (!wechatAccount) {
+      setError("请先选择一个公众号账号。");
+      return;
+    }
+
+    setError(null);
+    setIsRealPublishing(true);
+
+    try {
+      const task = await runPublishAction("real", { ...draft, platforms: ["wechat"] }, [wechatAccount.id]);
+      saveActiveTaskId(task.id);
+      router.push("/tasks");
+    } catch {
+      setError("公众号真实发布任务创建失败，请检查 API 服务和公众号凭证配置。");
+    } finally {
+      setIsRealPublishing(false);
+    }
+  }
+
   return (
     <div className="page-shell">
       <PageHeader
@@ -114,6 +140,10 @@ export default function PublishPage() {
             <button className="primary-button" type="button" onClick={() => submit("mock")} disabled={isPublishing}>
               {isPublishing ? <LoadingInline label="提交中" /> : <Rocket size={18} />}
               mock 一键发布
+            </button>
+            <button className="secondary-button" type="button" onClick={submitRealWechat} disabled={isRealPublishing}>
+              {isRealPublishing ? <LoadingInline label="提交中" /> : <Rocket size={18} />}
+              公众号真实草稿
             </button>
           </>
         }

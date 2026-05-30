@@ -7,6 +7,7 @@ import { PrismaClient, type Prisma } from "@prisma/client";
 
 import type { CanonicalDocument } from "@mp-publishing/content-model";
 import type {
+  PlatformCredential,
   PlatformName,
   ValidationIssue,
 } from "@mp-publishing/platform-sdk";
@@ -59,7 +60,7 @@ function loadWorkspaceEnv() {
 loadWorkspaceEnv();
 
 export type PlatformAccountHealth = "healthy" | "expiring" | "needs-login";
-export type PublishTaskMode = "simulate" | "mock-publish";
+export type PublishTaskMode = "simulate" | "mock-publish" | "real-publish";
 export type PublishTaskTargetStatus =
   | "queued"
   | "running"
@@ -82,6 +83,8 @@ export type PlatformAccountRecord = {
   handle: string;
   authMode: "official-api" | "cookie-session" | "hybrid";
   health: PlatformAccountHealth;
+  credentialRef?: string;
+  credentialStatus: "unbound" | "missing" | "configured";
   lastCheckedAt: string;
 };
 
@@ -160,6 +163,7 @@ export type PublishTargetProcessingContext = {
   platform: PlatformName;
   attemptCount: number;
   account: PlatformAccountRecord | null;
+  credential: PlatformCredential | null;
   document: CanonicalDocument;
 };
 
@@ -178,6 +182,8 @@ const defaultAccounts: PlatformAccountRecord[] = [
     handle: "创作者实验室",
     authMode: "official-api",
     health: "healthy",
+    credentialRef: process.env.WECHAT_OFFICIAL_ACCOUNT_CREDENTIAL_REF ?? "env:WECHAT_OFFICIAL_ACCOUNT",
+    credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T22:00:00+08:00",
   },
   {
@@ -187,6 +193,7 @@ const defaultAccounts: PlatformAccountRecord[] = [
     handle: "内容系统设计",
     authMode: "official-api",
     health: "healthy",
+    credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T22:05:00+08:00",
   },
   {
@@ -196,6 +203,7 @@ const defaultAccounts: PlatformAccountRecord[] = [
     handle: "效率创作手记",
     authMode: "hybrid",
     health: "expiring",
+    credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T21:55:00+08:00",
   },
   {
@@ -205,6 +213,7 @@ const defaultAccounts: PlatformAccountRecord[] = [
     handle: "创作效率观察",
     authMode: "hybrid",
     health: "healthy",
+    credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T21:50:00+08:00",
   },
 ];
@@ -240,6 +249,85 @@ function readJsonArray<T>(value: Prisma.JsonValue | null | undefined): T[] {
 
 function readJsonObject<T>(value: Prisma.JsonValue | null | undefined): T {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as T) : ({} as T);
+}
+
+function readEnvValue(key: string) {
+  const value = process.env[key]?.trim();
+  return value && value.length > 0 ? value : undefined;
+}
+
+function readCredentialEnvPrefix(credentialRef?: string) {
+  if (!credentialRef?.startsWith("env:")) {
+    return null;
+  }
+
+  const prefix = credentialRef.slice("env:".length).trim();
+  return prefix.length > 0 ? prefix : null;
+}
+
+function hasUsableCredential(credential: PlatformCredential) {
+  if (credential.authMode === "official-api") {
+    return Boolean(credential.accessToken || (credential.appId && credential.appSecret));
+  }
+
+  if (credential.authMode === "cookie-session") {
+    return Boolean(credential.cookies || credential.storageStateJson);
+  }
+
+  return Boolean(
+    credential.accessToken ||
+      (credential.appId && credential.appSecret) ||
+      credential.cookies ||
+      credential.storageStateJson,
+  );
+}
+
+export function resolvePlatformCredential(account: PlatformAccountRecord | null): PlatformCredential | null {
+  const prefix = readCredentialEnvPrefix(account?.credentialRef);
+  if (!account || !account.credentialRef || !prefix) {
+    return null;
+  }
+
+  const credential: PlatformCredential = {
+    accountId: account.id,
+    platform: account.platform,
+    credentialRef: account.credentialRef,
+    authMode: account.authMode,
+    appId: readEnvValue(`${prefix}_APP_ID`),
+    appSecret: readEnvValue(`${prefix}_APP_SECRET`),
+    accessToken: readEnvValue(`${prefix}_ACCESS_TOKEN`),
+    refreshToken: readEnvValue(`${prefix}_REFRESH_TOKEN`),
+    cookies: readEnvValue(`${prefix}_COOKIES`),
+    storageStateJson: readEnvValue(`${prefix}_STORAGE_STATE_JSON`),
+    expiresAt: readEnvValue(`${prefix}_EXPIRES_AT`),
+  };
+
+  return hasUsableCredential(credential) ? credential : null;
+}
+
+function getCredentialStatus(account: {
+  id: string;
+  platform: string;
+  authMode: string;
+  credentialRef?: string | null;
+}): PlatformAccountRecord["credentialStatus"] {
+  if (!account.credentialRef) {
+    return "unbound";
+  }
+
+  return resolvePlatformCredential({
+    id: account.id,
+    platform: account.platform as PlatformName,
+    displayName: "",
+    handle: "",
+    authMode: account.authMode as PlatformAccountRecord["authMode"],
+    health: "healthy",
+    credentialRef: account.credentialRef,
+    credentialStatus: "missing",
+    lastCheckedAt: createTimestamp(),
+  })
+    ? "configured"
+    : "missing";
 }
 
 function createLog(level: PublishTaskLog["level"], message: string): PublishTaskLog {
@@ -309,6 +397,7 @@ function mapAccount(account: {
   handle: string;
   authMode: string;
   health: string;
+  credentialRef: string | null;
   lastCheckedAt: Date;
 }): PlatformAccountRecord {
   return {
@@ -318,6 +407,8 @@ function mapAccount(account: {
     handle: account.handle,
     authMode: account.authMode as PlatformAccountRecord["authMode"],
     health: account.health as PlatformAccountHealth,
+    credentialRef: account.credentialRef ?? undefined,
+    credentialStatus: getCredentialStatus(account),
     lastCheckedAt: account.lastCheckedAt.toISOString(),
   };
 }
@@ -332,6 +423,7 @@ function mapTarget(target: {
     handle: string;
     authMode: string;
     health: string;
+    credentialRef: string | null;
     lastCheckedAt: Date;
   } | null;
   status: string;
@@ -477,7 +569,9 @@ export async function ensureRuntimeReady() {
   for (const account of defaultAccounts) {
     await prisma.platformAccount.upsert({
       where: { id: account.id },
-      update: {},
+      update: {
+        credentialRef: account.credentialRef,
+      },
       create: {
         id: account.id,
         workspaceId: defaultWorkspaceId,
@@ -486,6 +580,7 @@ export async function ensureRuntimeReady() {
         handle: account.handle,
         authMode: account.authMode,
         health: account.health,
+        credentialRef: account.credentialRef,
         lastCheckedAt: new Date(account.lastCheckedAt),
       },
     });
@@ -617,6 +712,7 @@ export async function updateAccount(
       handle: patch.handle,
       authMode: patch.authMode,
       health: patch.health,
+      credentialRef: patch.credentialRef,
       lastCheckedAt: patch.lastCheckedAt ? new Date(patch.lastCheckedAt) : undefined,
     },
   });
@@ -917,13 +1013,16 @@ export async function startPublishTarget(targetId: string): Promise<PublishTarge
     target.job.version.body,
   );
 
+  const account = target.account ? mapAccount(target.account) : null;
+
   return {
     taskId: target.jobId,
     targetId: target.id,
     mode: target.job.mode as PublishTaskMode,
     platform: target.platform as PlatformName,
     attemptCount: target.attemptCount,
-    account: target.account ? mapAccount(target.account) : null,
+    account,
+    credential: resolvePlatformCredential(account),
     document: {
       id: target.job.documentId ?? target.job.version.document.id,
       title: target.job.version.document.title,

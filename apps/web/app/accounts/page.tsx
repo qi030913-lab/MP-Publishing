@@ -20,6 +20,9 @@ function emptySummary(): AccountSummary {
     healthy: 0,
     expiring: 0,
     needsLogin: 0,
+    credentialsConfigured: 0,
+    credentialsMissing: 0,
+    credentialsUnbound: 0,
   };
 }
 
@@ -33,6 +36,18 @@ function healthLabel(health: PlatformAccount["health"]) {
   if (health === "healthy") return "健康";
   if (health === "expiring") return "即将过期";
   return "需要重新登录";
+}
+
+function credentialTone(status: PlatformAccount["credentialStatus"]): "success" | "warning" | "info" {
+  if (status === "configured") return "success";
+  if (status === "missing") return "warning";
+  return "info";
+}
+
+function credentialLabel(status: PlatformAccount["credentialStatus"]) {
+  if (status === "configured") return "凭证已配置";
+  if (status === "missing") return "凭证缺失";
+  return "未绑定凭证";
 }
 
 export default function AccountsPage() {
@@ -99,6 +114,9 @@ export default function AccountsPage() {
           <SummaryTile label="健康" value={summary.healthy} />
           <SummaryTile label="即将过期" value={summary.expiring} />
           <SummaryTile label="需登录" value={summary.needsLogin} />
+          <SummaryTile label="凭证已配置" value={summary.credentialsConfigured} />
+          <SummaryTile label="凭证缺失" value={summary.credentialsMissing} />
+          <SummaryTile label="未绑定凭证" value={summary.credentialsUnbound} />
         </div>
       </section>
 
@@ -122,9 +140,15 @@ export default function AccountsPage() {
                       <PlatformBadge platform={account.platform} /> {account.handle} · {account.authMode}
                     </p>
                   </div>
-                  <StatusBadge tone={healthTone(account.health)}>{healthLabel(account.health)}</StatusBadge>
+                  <div className="status-stack">
+                    <StatusBadge tone={healthTone(account.health)}>{healthLabel(account.health)}</StatusBadge>
+                    <StatusBadge tone={credentialTone(account.credentialStatus)}>
+                      {credentialLabel(account.credentialStatus)}
+                    </StatusBadge>
+                  </div>
                 </div>
 
+                {account.credentialRef ? <p className="account-meta">凭证引用：{account.credentialRef}</p> : null}
                 <p className="account-meta">上次检查：{new Date(account.lastCheckedAt).toLocaleString("zh-CN")}</p>
 
                 <div className="account-actions">

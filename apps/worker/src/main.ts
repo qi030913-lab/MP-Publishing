@@ -82,6 +82,7 @@ async function processPublishTarget(job: Job<PublishQueueJobData>) {
         accountId: context.account.id,
         document: context.document,
         dryRun: true,
+        credential: context.credential ?? undefined,
       });
 
       if (!result.ok) {
@@ -96,7 +97,8 @@ async function processPublishTarget(job: Job<PublishQueueJobData>) {
       const result = await adapter.publish({
         accountId: context.account.id,
         document: context.document,
-        dryRun: true,
+        dryRun: context.mode !== "real-publish",
+        credential: context.credential ?? undefined,
       });
 
       if (!result.ok) {

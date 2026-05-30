@@ -31,6 +31,9 @@ export class AccountService {
         healthy: accounts.filter((account) => account.health === "healthy").length,
         expiring: accounts.filter((account) => account.health === "expiring").length,
         needsLogin: accounts.filter((account) => account.health === "needs-login").length,
+        credentialsConfigured: accounts.filter((account) => account.credentialStatus === "configured").length,
+        credentialsMissing: accounts.filter((account) => account.credentialStatus === "missing").length,
+        credentialsUnbound: accounts.filter((account) => account.credentialStatus === "unbound").length,
       },
     };
   }

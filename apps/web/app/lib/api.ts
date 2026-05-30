@@ -53,7 +53,7 @@ export function listAccounts() {
   return request<{ items: PlatformAccount[]; summary: AccountSummary }>("/accounts");
 }
 
-export function runPublishAction(mode: "simulate" | "mock", draft: DraftDocument, accountIds: string[]) {
+export function runPublishAction(mode: "simulate" | "mock" | "real", draft: DraftDocument, accountIds: string[]) {
   return request<PublishTaskDetail>(`/publish/${mode}`, {
     method: "POST",
     body: JSON.stringify({
@@ -81,6 +81,13 @@ export function getTask(taskId: string) {
 
 export function retryTask(taskId: string, platform?: PlatformName) {
   return request<PublishTaskDetail>(`/publish/tasks/${taskId}/retry`, {
+    method: "POST",
+    body: JSON.stringify({ platform }),
+  });
+}
+
+export function syncTask(taskId: string, platform?: PlatformName) {
+  return request<PublishTaskDetail>(`/publish/tasks/${taskId}/sync`, {
     method: "POST",
     body: JSON.stringify({ platform }),
   });
