@@ -714,7 +714,7 @@ export class PublishService {
       const preflightIssues =
         refreshedTask.mode === "real-publish" ? await this.preflightDraftStatusSyncTarget(target.platform) : [];
       if (preflightIssues.length > 0) {
-        const message = `${target.platform} 状态同步预检未通过，连接器凭证转发配置需要人工处理。`;
+        const message = `${target.platform} 状态同步预检未通过，连接器状态同步配置或上游可用性需要人工处理。`;
         target.status = "needs_manual_action";
         target.issues = mergeValidationIssues(target.issues, preflightIssues);
         target.logs.push(this.createLog("warning", message));

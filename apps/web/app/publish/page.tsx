@@ -233,6 +233,7 @@ export default function PublishPage() {
                       <p>
                         {platformStatus.realPublishEnabled ? "真实草稿已启用" : "真实草稿未启用"} /{" "}
                         {platformStatus.draftEndpoint ? "draft endpoint 已配置" : "缺少 draft endpoint"}
+                        {platformStatus.statusEndpoint ? " / status endpoint 已配置" : ""}
                         {platformStatus.upstreamDraftEndpointConfigured !== undefined ? (
                           <>
                             {" "}
