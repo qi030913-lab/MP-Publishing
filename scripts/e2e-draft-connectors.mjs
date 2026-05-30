@@ -378,6 +378,32 @@ function expectedExecutionDraftId(platform, execution) {
   return `${platform}-draft-${targetSegment}-attempt-${execution.attemptCount}`;
 }
 
+function writeStoredDraftSeed(outboxDir, platform, storedDraft) {
+  const platformOutboxDir = path.join(outboxDir, platform);
+  fs.mkdirSync(platformOutboxDir, { recursive: true });
+  fs.writeFileSync(path.join(platformOutboxDir, `${storedDraft.draftId}.json`), `${JSON.stringify(storedDraft, null, 2)}\n`);
+}
+
+function createDirectDraftPayload(platform, accountId, execution, title) {
+  return {
+    platform,
+    accountId,
+    execution,
+    document: {
+      id: `doc-${execution.taskId}`,
+      title,
+    },
+    draft: {
+      platform,
+      title,
+      summary: "Connector crash recovery verification.",
+      body: "This draft verifies reserved connector outbox entries can still reach the upstream draft service.",
+      hashtags: ["#draft", "#recovery"],
+    },
+    requestedAt: new Date().toISOString(),
+  };
+}
+
 function createCleanServiceEnv(extraEnv = {}) {
   const env = { ...process.env };
   const isolatedKeys = new Set([
@@ -1912,6 +1938,100 @@ async function runUpstreamDraftForwardingCheck() {
       }
     }
 
+    const resumedDrafts = [];
+    const freshInFlightDrafts = [];
+    const oldTimestamp = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+    for (const platform of platforms) {
+      const account = accounts.find((item) => item.platform === platform);
+      const execution = {
+        taskId: `resume-${created.id}`,
+        targetId: `target-resume-${platform}-${Date.now()}`,
+        attemptCount: 1,
+      };
+      const payload = createDirectDraftPayload(platform, account.id, execution, `Resume stale ${platform} upstream draft`);
+      const draftId = expectedExecutionDraftId(platform, execution);
+      writeStoredDraftSeed(upstreamOutboxDir, platform, {
+        draftId,
+        platform,
+        accountId: account.id,
+        createdAt: oldTimestamp,
+        updatedAt: oldTimestamp,
+        state: "publishing",
+        statusDetail: `${platform} draft is being forwarded to an upstream draft service.`,
+        payload,
+      });
+
+      const resumed = await requestAbsoluteJson(`${connectorBaseUrl}/${platform}/drafts`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer draft-secret",
+        },
+        body: JSON.stringify(payload),
+      });
+      const expectedRemoteId = `${platform}-upstream-${draftId}`;
+      if (
+        resumed.remoteId !== expectedRemoteId ||
+        resumed.url !== `https://upstream.example.test/${platform}/${expectedRemoteId}`
+      ) {
+        throw new Error(`Stale upstream draft reservation was not resumed for ${platform}: ${JSON.stringify(resumed)}`);
+      }
+
+      const detail = await requestAbsoluteJson(`${connectorBaseUrl}/${platform}/drafts/${draftId}`);
+      if (detail.state !== "ready" || detail.externalDraftId !== expectedRemoteId) {
+        throw new Error(`Resumed upstream draft did not persist external data for ${platform}: ${JSON.stringify(detail)}`);
+      }
+
+      resumedDrafts.push({ platform, draftId, remoteId: resumed.remoteId });
+    }
+
+    const requestCountBeforeFreshInFlight = upstream.requests.length;
+    for (const platform of platforms) {
+      const account = accounts.find((item) => item.platform === platform);
+      const execution = {
+        taskId: `fresh-${created.id}`,
+        targetId: `target-fresh-${platform}-${Date.now()}`,
+        attemptCount: 1,
+      };
+      const payload = createDirectDraftPayload(platform, account.id, execution, `Fresh in-flight ${platform} upstream draft`);
+      const draftId = expectedExecutionDraftId(platform, execution);
+      const timestamp = new Date().toISOString();
+      writeStoredDraftSeed(upstreamOutboxDir, platform, {
+        draftId,
+        platform,
+        accountId: account.id,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+        state: "publishing",
+        statusDetail: `${platform} draft is being forwarded to an upstream draft service.`,
+        payload,
+      });
+
+      const reused = await requestAbsoluteJson(`${connectorBaseUrl}/${platform}/drafts`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer draft-secret",
+        },
+        body: JSON.stringify(payload),
+      });
+      if (reused.remoteId !== draftId || !reused.url?.startsWith(`${connectorBaseUrl}/${platform}/drafts/`)) {
+        throw new Error(`Fresh upstream draft reservation should be reused without forwarding for ${platform}: ${JSON.stringify(reused)}`);
+      }
+
+      freshInFlightDrafts.push({ platform, draftId, remoteId: reused.remoteId });
+    }
+
+    if (upstream.requests.length !== requestCountBeforeFreshInFlight) {
+      throw new Error(
+        `Fresh upstream draft reservations should not be forwarded again: ${JSON.stringify({
+          before: requestCountBeforeFreshInFlight,
+          after: upstream.requests.length,
+          requests: upstream.requests,
+        })}`,
+      );
+    }
+
     return {
       taskId: created.id,
       finalStatus: syncedTask.status,
@@ -1931,6 +2051,8 @@ async function runUpstreamDraftForwardingCheck() {
         connectorDraftId: request.connectorDraftId,
         remoteId: request.remoteId,
       })),
+      resumedDrafts,
+      freshInFlightDrafts,
     };
   } finally {
     await Promise.all([stopService(api), stopService(worker), stopService(draftConnector)]);

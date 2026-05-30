@@ -204,6 +204,11 @@ function isEnvEnabled(key: string) {
   return readEnvValue(key)?.toLowerCase() === "true";
 }
 
+function readPositiveIntegerEnv(key: string, fallback: number) {
+  const value = Number(readEnvValue(key));
+  return Number.isInteger(value) && value > 0 ? value : fallback;
+}
+
 function createIssue(code: string, message: string, severity: ValidationIssue["severity"] = "error"): ValidationIssue {
   return { code, message, severity };
 }
@@ -560,6 +565,112 @@ function applyUpstreamDraftResponse(storedDraft: StoredDraft, payload: UpstreamD
   };
 }
 
+function createForwardingDraft(storedDraft: StoredDraft): StoredDraft {
+  return {
+    ...storedDraft,
+    state: "publishing",
+    statusDetail: `${storedDraft.platform} draft is being forwarded to an upstream draft service.`,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+function hasExternalDraft(storedDraft: StoredDraft) {
+  return Boolean(storedDraft.externalDraftId || storedDraft.externalUrl);
+}
+
+function isStalePublishingDraft(storedDraft: StoredDraft) {
+  const resumeAfterMs = readPositiveIntegerEnv("DRAFT_CONNECTOR_UPSTREAM_RESUME_AFTER_MS", 2 * 60 * 1000);
+  const updatedAt = new Date(storedDraft.updatedAt).getTime();
+  return Number.isFinite(updatedAt) && Date.now() - updatedAt >= resumeAfterMs;
+}
+
+function shouldResumeUpstreamForwarding(storedDraft: StoredDraft, upstreamConfig: UpstreamDraftConfig | null) {
+  if (!upstreamConfig || hasExternalDraft(storedDraft)) {
+    return false;
+  }
+
+  if (storedDraft.state === "draft") {
+    return true;
+  }
+
+  return storedDraft.state === "publishing" && isStalePublishingDraft(storedDraft);
+}
+
+async function forwardStoredDraftToUpstream(
+  storedDraft: StoredDraft,
+  payload: DraftPayload,
+  request: IncomingMessage,
+  upstreamConfig: UpstreamDraftConfig,
+) {
+  const draftUrl = createDraftUrl(storedDraft.platform, storedDraft.draftId, request);
+  const forwardingDraft = createForwardingDraft(storedDraft);
+  await writeStoredDraft(forwardingDraft);
+
+  try {
+    const upstreamPayload = await requestUpstreamDraft(upstreamConfig, payload, forwardingDraft, request);
+    const upstreamState = normalizeDraftState(upstreamPayload.state);
+    const upstreamIssues = normalizeIssues(upstreamPayload.issues);
+
+    if (upstreamPayload.ok === false || upstreamState === "failed" || upstreamState === "needs_manual_action") {
+      const rejectedDraft: StoredDraft = {
+        ...applyUpstreamDraftResponse(forwardingDraft, upstreamPayload),
+        state: upstreamState ?? "needs_manual_action",
+        statusIssues: [
+          ...(upstreamIssues ?? []),
+          createIssue(
+            `${storedDraft.platform.toUpperCase()}_UPSTREAM_DRAFT_REJECTED`,
+            upstreamPayload.message ??
+              upstreamPayload.detail ??
+              `${storedDraft.platform} upstream draft service rejected the draft.`,
+          ),
+        ],
+      };
+      await writeStoredDraft(rejectedDraft);
+      return {
+        ok: false,
+        draftId: storedDraft.draftId,
+        remoteId: rejectedDraft.externalDraftId ?? storedDraft.draftId,
+        url: rejectedDraft.externalUrl ?? draftUrl,
+        message: rejectedDraft.statusDetail ?? `${storedDraft.platform} upstream draft service rejected the draft.`,
+        issues: rejectedDraft.statusIssues,
+      };
+    }
+
+    const updatedDraft = applyUpstreamDraftResponse(forwardingDraft, upstreamPayload);
+    await writeStoredDraft(updatedDraft);
+    return {
+      ok: true,
+      draftId: storedDraft.draftId,
+      remoteId: updatedDraft.externalDraftId ?? storedDraft.draftId,
+      url: updatedDraft.externalUrl ?? draftUrl,
+      message: updatedDraft.statusDetail ?? `${storedDraft.platform} draft forwarded to upstream draft service.`,
+      issues: updatedDraft.statusIssues,
+    };
+  } catch (error) {
+    const failedDraft: StoredDraft = {
+      ...forwardingDraft,
+      state: "needs_manual_action",
+      statusDetail: error instanceof Error ? error.message : `${storedDraft.platform} upstream draft service failed.`,
+      statusIssues: [
+        createIssue(
+          `${storedDraft.platform.toUpperCase()}_UPSTREAM_DRAFT_FAILED`,
+          error instanceof Error ? error.message : `${storedDraft.platform} upstream draft service failed.`,
+        ),
+      ],
+      updatedAt: new Date().toISOString(),
+    };
+    await writeStoredDraft(failedDraft);
+    return {
+      ok: false,
+      draftId: storedDraft.draftId,
+      remoteId: storedDraft.draftId,
+      url: draftUrl,
+      message: failedDraft.statusDetail,
+      issues: failedDraft.statusIssues,
+    };
+  }
+}
+
 async function refreshStoredDraftFromUpstreamStatus(
   storedDraft: StoredDraft,
   payload: Record<string, unknown>,
@@ -899,8 +1010,14 @@ async function handleCreateDraft(platform: string, request: IncomingMessage, res
     return;
   }
 
+  const upstreamConfig = resolveUpstreamDraftConfig(platform);
   const existingDraft = await findStoredDraftByExecution(platform, payload.execution);
   if (existingDraft) {
+    if (upstreamConfig && shouldResumeUpstreamForwarding(existingDraft, upstreamConfig)) {
+      sendJson(response, 200, await forwardStoredDraftToUpstream(existingDraft, payload, request, upstreamConfig));
+      return;
+    }
+
     sendJson(response, 200, createStoredDraftResponse(existingDraft, request));
     return;
   }
@@ -913,7 +1030,8 @@ async function handleCreateDraft(platform: string, request: IncomingMessage, res
     accountId: payload.accountId,
     createdAt,
     updatedAt: createdAt,
-    state: "draft",
+    state: upstreamConfig ? "publishing" : "draft",
+    statusDetail: upstreamConfig ? `${platform} draft is being forwarded to an upstream draft service.` : undefined,
     payload: sanitizeDraftPayload(payload),
   };
 
@@ -928,83 +1046,12 @@ async function handleCreateDraft(platform: string, request: IncomingMessage, res
     throw new Error(`${platform} draft ${draftId} was reserved concurrently but could not be read.`);
   }
 
-  const draftUrl = createDraftUrl(platform, draftId, request);
-  const upstreamConfig = resolveUpstreamDraftConfig(platform);
   if (upstreamConfig) {
-    const forwardingDraft: StoredDraft = {
-      ...storedDraft,
-      state: "publishing",
-      statusDetail: `${platform} draft is being forwarded to an upstream draft service.`,
-      updatedAt: new Date().toISOString(),
-    };
-    await writeStoredDraft(forwardingDraft);
-
-    try {
-      const upstreamPayload = await requestUpstreamDraft(upstreamConfig, payload, forwardingDraft, request);
-      const upstreamState = normalizeDraftState(upstreamPayload.state);
-      const upstreamIssues = normalizeIssues(upstreamPayload.issues);
-
-      if (upstreamPayload.ok === false || upstreamState === "failed" || upstreamState === "needs_manual_action") {
-        const rejectedDraft: StoredDraft = {
-          ...applyUpstreamDraftResponse(forwardingDraft, upstreamPayload),
-          state: upstreamState ?? "needs_manual_action",
-          statusIssues: [
-            ...(upstreamIssues ?? []),
-            createIssue(
-              `${platform.toUpperCase()}_UPSTREAM_DRAFT_REJECTED`,
-              upstreamPayload.message ?? upstreamPayload.detail ?? `${platform} upstream draft service rejected the draft.`,
-            ),
-          ],
-        };
-        await writeStoredDraft(rejectedDraft);
-        sendJson(response, 200, {
-          ok: false,
-          draftId,
-          remoteId: rejectedDraft.externalDraftId ?? draftId,
-          url: rejectedDraft.externalUrl ?? draftUrl,
-          message: rejectedDraft.statusDetail ?? `${platform} upstream draft service rejected the draft.`,
-          issues: rejectedDraft.statusIssues,
-        });
-        return;
-      }
-
-      const updatedDraft = applyUpstreamDraftResponse(forwardingDraft, upstreamPayload);
-      await writeStoredDraft(updatedDraft);
-      sendJson(response, 200, {
-        ok: true,
-        draftId,
-        remoteId: updatedDraft.externalDraftId ?? draftId,
-        url: updatedDraft.externalUrl ?? draftUrl,
-        message: updatedDraft.statusDetail ?? `${platform} draft forwarded to upstream draft service.`,
-        issues: updatedDraft.statusIssues,
-      });
-      return;
-    } catch (error) {
-      const failedDraft: StoredDraft = {
-        ...forwardingDraft,
-        state: "needs_manual_action",
-        statusDetail: error instanceof Error ? error.message : `${platform} upstream draft service failed.`,
-        statusIssues: [
-          createIssue(
-            `${platform.toUpperCase()}_UPSTREAM_DRAFT_FAILED`,
-            error instanceof Error ? error.message : `${platform} upstream draft service failed.`,
-          ),
-        ],
-        updatedAt: new Date().toISOString(),
-      };
-      await writeStoredDraft(failedDraft);
-      sendJson(response, 200, {
-        ok: false,
-        draftId,
-        remoteId: draftId,
-        url: draftUrl,
-        message: failedDraft.statusDetail,
-        issues: failedDraft.statusIssues,
-      });
-      return;
-    }
+    sendJson(response, 200, await forwardStoredDraftToUpstream(storedDraft, payload, request, upstreamConfig));
+    return;
   }
 
+  const draftUrl = createDraftUrl(platform, draftId, request);
   sendJson(response, 200, {
     ok: true,
     draftId,
