@@ -65,7 +65,7 @@ pnpm test:draft-connectors
 ```
 
 This starts the built API and worker, creates a simulated publish task through HTTP, waits for BullMQ consumption, and checks that Postgres task state is updated successfully.
-The draft connector test starts the built local draft connector and verifies disabled/offline-connector/offline-upstream preflight behavior, retry preflight queue protection, offline-upstream recovery after retry, connector readiness reporting, Zhihu/Bilibili/Xiaohongshu real-draft task results, synchronous upstream draft forwarding, upstream status sync forwarding, browsable draft detail URLs, external draft URL handoff, outbox list entries, local outbox draft files, and manual status sync results when their connector endpoints are configured.
+The draft connector test starts the built local draft connector and verifies disabled/offline-connector/offline-upstream preflight behavior, retry preflight queue protection, three-platform offline-upstream recovery after retry, connector readiness reporting, Zhihu/Bilibili/Xiaohongshu real-draft task results, synchronous upstream draft forwarding, upstream status sync forwarding, browsable draft detail URLs, external draft URL handoff, outbox list entries, local outbox draft files, and manual status sync results when their connector endpoints are configured.
 
 Required local services:
 

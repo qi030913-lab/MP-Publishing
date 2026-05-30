@@ -599,6 +599,7 @@ async function runOfflineUpstreamDraftRecoveryCheck() {
   const upstreamBaseUrl = `http://127.0.0.1:${upstreamPort}`;
   const outboxDir = path.join(runtimeDir, `draft-connector-upstream-recovery-e2e-${Date.now()}`);
   const queueName = `mp-publishing-draft-upstream-recovery-e2e-${Date.now()}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
   fs.rmSync(outboxDir, { recursive: true, force: true });
   apiBaseUrl = `http://127.0.0.1:${apiPort}`;
 
@@ -608,6 +609,8 @@ async function runOfflineUpstreamDraftRecoveryCheck() {
     DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
     DRAFT_CONNECTOR_API_KEY: "draft-secret",
     ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
   };
   const draftConnectorEnv = {
     PORT: String(connectorPort),
@@ -617,6 +620,10 @@ async function runOfflineUpstreamDraftRecoveryCheck() {
     DRAFT_CONNECTOR_UPSTREAM_API_KEY: "upstream-secret",
     DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_ENDPOINT: `${upstreamBaseUrl}/zhihu/drafts`,
     DRAFT_CONNECTOR_ZHIHU_UPSTREAM_HEALTH_ENDPOINT: `${upstreamBaseUrl}/health`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_DRAFT_ENDPOINT: `${upstreamBaseUrl}/bilibili/drafts`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_HEALTH_ENDPOINT: `${upstreamBaseUrl}/health`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_DRAFT_ENDPOINT: `${upstreamBaseUrl}/xiaohongshu/drafts`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_HEALTH_ENDPOINT: `${upstreamBaseUrl}/health`,
   };
 
   const api = startService("api-draft-upstream-recovery", ["apps/api/dist/main.js"], serviceEnv);
@@ -630,16 +637,24 @@ async function runOfflineUpstreamDraftRecoveryCheck() {
 
   try {
     const offlineHealth = await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector upstream recovery");
-    const offlineStatus = offlineHealth.upstreamDrafts?.find((item) => item.platform === "zhihu");
-    if (!offlineStatus?.draftEndpointConfigured || offlineStatus.status !== "offline") {
+    if (
+      platforms.some(
+        (platform) =>
+          !offlineHealth.upstreamDrafts?.some(
+            (item) => item.platform === platform && item.draftEndpointConfigured && item.status === "offline",
+          ),
+      )
+    ) {
       throw new Error(`Draft connector health did not start with offline upstream status: ${JSON.stringify(offlineHealth)}`);
     }
 
     await waitForApi(api);
+    await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
+
     const accountsResponse = await requestJson("/accounts");
-    const zhihuAccount = accountsResponse.items.find((account) => account.platform === "zhihu");
-    if (!zhihuAccount) {
-      throw new Error(`Missing zhihu account for upstream recovery verification: ${JSON.stringify(accountsResponse.items)}`);
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for upstream recovery verification: ${JSON.stringify(accountsResponse.items)}`);
     }
 
     const created = await requestJson("/publish/real", {
@@ -652,18 +667,19 @@ async function runOfflineUpstreamDraftRecoveryCheck() {
           body: "这条内容用于确认 needs_manual_action 不是死路，修好 upstream 后可以重试并创建真实草稿。",
           tags: ["draft", "upstream", "retry", "e2e"],
         },
-        platforms: ["zhihu"],
-        accountIds: [zhihuAccount.id],
+        platforms,
+        accountIds: accounts.map((account) => account.id),
         toneMode: "keep",
         preserveOriginal: true,
       }),
     });
-    const createdTarget = created.results.find((item) => item.platform === "zhihu");
-    const issueCodes = createdTarget?.issues?.map((issue) => issue.code) ?? [];
     if (
       created.status !== "needs_manual_action" ||
-      createdTarget?.status !== "needs_manual_action" ||
-      !issueCodes.includes("ZHIHU_UPSTREAM_DRAFT_CONNECTOR_OFFLINE")
+      platforms.some((platform) => {
+        const target = created.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return target?.status !== "needs_manual_action" || !issueCodes.includes(`${platform.toUpperCase()}_UPSTREAM_DRAFT_CONNECTOR_OFFLINE`);
+      })
     ) {
       throw new Error(`Upstream recovery precondition did not hold the target: ${JSON.stringify(created)}`);
     }
@@ -672,8 +688,13 @@ async function runOfflineUpstreamDraftRecoveryCheck() {
     for (let i = 0; i < 20; i += 1) {
       await delay(300);
       const onlineHealth = await requestAbsoluteJson(`${connectorBaseUrl}/health`);
-      const onlineStatus = onlineHealth.upstreamDrafts?.find((item) => item.platform === "zhihu");
-      if (onlineStatus?.status === "online") {
+      if (
+        platforms.every((platform) =>
+          onlineHealth.upstreamDrafts?.some(
+            (item) => item.platform === platform && item.draftEndpointConfigured && item.status === "online",
+          ),
+        )
+      ) {
         break;
       }
 
@@ -685,10 +706,9 @@ async function runOfflineUpstreamDraftRecoveryCheck() {
     const retried = await requestJson(`/publish/tasks/${created.id}/retry`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ platform: "zhihu" }),
+      body: JSON.stringify({}),
     });
-    const retryTarget = retried.results.find((item) => item.platform === "zhihu");
-    if (retryTarget?.status !== "queued") {
+    if (platforms.some((platform) => retried.results.find((item) => item.platform === platform)?.status !== "queued")) {
       throw new Error(`Upstream recovery retry should enqueue the target: ${JSON.stringify(retried)}`);
     }
 
@@ -701,14 +721,22 @@ async function runOfflineUpstreamDraftRecoveryCheck() {
       }
     }
 
-    const finalTarget = task.results.find((item) => item.platform === "zhihu");
     if (
       task.status !== "succeeded" ||
-      finalTarget?.status !== "succeeded" ||
-      !finalTarget.remoteId?.startsWith("zhihu-upstream-zhihu-draft-") ||
-      !finalTarget.url?.startsWith("https://upstream.example.test/zhihu/")
+      platforms.some((platform) => {
+        const target = task.results.find((item) => item.platform === platform);
+        return (
+          target?.status !== "succeeded" ||
+          !target.remoteId?.startsWith(`${platform}-upstream-${platform}-draft-`) ||
+          !target.url?.startsWith(`https://upstream.example.test/${platform}/`)
+        );
+      })
     ) {
       throw new Error(`Recovered upstream draft target did not succeed: ${JSON.stringify(task)}`);
+    }
+
+    if (upstream.requests.length !== platforms.length) {
+      throw new Error(`Recovered upstream draft service did not receive every platform draft: ${JSON.stringify(upstream.requests)}`);
     }
 
     const runtimeAfterRecovery = await requestJson("/runtime/status");
@@ -726,12 +754,12 @@ async function runOfflineUpstreamDraftRecoveryCheck() {
       initialStatus: created.status,
       retryStatus: retried.status,
       finalStatus: task.status,
-      target: {
-        platform: finalTarget.platform,
-        status: finalTarget.status,
-        remoteId: finalTarget.remoteId,
-        url: finalTarget.url,
-      },
+      targets: task.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        remoteId: target.remoteId,
+        url: target.url,
+      })),
       upstreamRequests: upstream.requests.map((request) => ({
         platform: request.platform,
         connectorDraftId: request.connectorDraftId,
