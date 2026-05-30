@@ -749,6 +749,207 @@ async function runUpstreamSandboxScriptCheck() {
   }
 }
 
+async function runUpstreamSandboxCallbackCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const apiPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const sandboxPort = await getFreePort();
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const sandboxBaseUrl = `http://127.0.0.1:${sandboxPort}`;
+  const queueName = `mp-publishing-draft-upstream-sandbox-callback-e2e-${Date.now()}`;
+  const outboxDir = path.join(runtimeDir, `draft-upstream-sandbox-callback-outbox-e2e-${Date.now()}`);
+  const sandboxOutboxDir = path.join(runtimeDir, `draft-upstream-sandbox-callback-proxy-e2e-${Date.now()}`);
+  const connectorApiKey = "draft-secret";
+  const sandboxApiKey = "sandbox-secret";
+
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+  fs.rmSync(sandboxOutboxDir, { recursive: true, force: true });
+
+  const upstreamEndpointEnv = Object.fromEntries(
+    platforms.flatMap((platform) => {
+      const prefix = `DRAFT_CONNECTOR_${platform.toUpperCase()}_UPSTREAM`;
+      return [
+        [`${prefix}_DRAFT_ENDPOINT`, `${sandboxBaseUrl}/${platform}/drafts`],
+        [`${prefix}_STATUS_ENDPOINT`, `${sandboxBaseUrl}/${platform}/status`],
+        [`${prefix}_HEALTH_ENDPOINT`, `${sandboxBaseUrl}/health`],
+      ];
+    }),
+  );
+  const apiAndWorkerEnv = {
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_API_KEY: connectorApiKey,
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+  };
+  const draftConnectorEnv = {
+    PORT: String(connectorPort),
+    DRAFT_CONNECTOR_API_KEY: connectorApiKey,
+    DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_UPSTREAM_API_KEY: sandboxApiKey,
+    ...upstreamEndpointEnv,
+  };
+
+  const sandbox = startService("draft-upstream-sandbox-callback", ["scripts/start-draft-upstream-sandbox.mjs"], {
+    DRAFT_UPSTREAM_SANDBOX_PORT: String(sandboxPort),
+    DRAFT_UPSTREAM_SANDBOX_OUTBOX_DIR: sandboxOutboxDir,
+    DRAFT_UPSTREAM_SANDBOX_API_KEY: sandboxApiKey,
+    DRAFT_UPSTREAM_SANDBOX_CALLBACK: "true",
+    DRAFT_UPSTREAM_SANDBOX_CALLBACK_DELAY_MS: "100",
+    DRAFT_UPSTREAM_SANDBOX_ASYNC_RESPONSE: "true",
+    DRAFT_CONNECTOR_API_KEY: connectorApiKey,
+  });
+  const api = startService("api-draft-upstream-sandbox-callback", ["apps/api/dist/main.js"], apiAndWorkerEnv);
+  const { PORT: _apiPort, ...workerEnv } = apiAndWorkerEnv;
+  const worker = startService("worker-draft-upstream-sandbox-callback", ["apps/worker/dist/main.js"], workerEnv);
+  const draftConnector = startService("draft-connector-upstream-sandbox-callback", ["apps/draft-connector/dist/main.js"], draftConnectorEnv);
+
+  try {
+    await waitForAuthorizedHealth(sandbox, `${sandboxBaseUrl}/health`, "Draft upstream sandbox callback", sandboxApiKey);
+    const connectorHealth = await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector upstream sandbox callback");
+    if (
+      platforms.some((platform) => {
+        const upstream = connectorHealth.upstreamDrafts?.find((item) => item.platform === platform);
+        return upstream?.status !== "online" || !upstream.draftEndpointConfigured || !upstream.statusEndpointConfigured;
+      })
+    ) {
+      throw new Error(`Draft connector did not see sandbox upstream services online: ${JSON.stringify(connectorHealth.upstreamDrafts)}`);
+    }
+
+    await waitForApi(api);
+    await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for sandbox callback verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "Sandbox upstream async callback e2e",
+          summary: "Verify an upstream proxy can accept drafts asynchronously and call back with external draft links.",
+          body: "This content confirms the non-WeChat connector draft flow can progress from local outbox links to external draft links through upstream callbacks.",
+          tags: ["draft", "upstream", "callback", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+
+    let task = created;
+    for (let i = 0; i < 50; i += 1) {
+      await delay(600);
+      task = await requestJson(`/publish/tasks/${created.id}`);
+      if (!["running", "queued"].includes(task.status)) {
+        break;
+      }
+    }
+
+    if (
+      task.status !== "succeeded" ||
+      platforms.some((platform) => {
+        const target = task.results.find((item) => item.platform === platform);
+        return (
+          !target ||
+          target.status !== "succeeded" ||
+          !target.remoteId?.startsWith(`${platform}-draft-`) ||
+          !target.url?.startsWith(`${connectorBaseUrl}/${platform}/drafts/`)
+        );
+      })
+    ) {
+      throw new Error(`Async sandbox upstream initial task did not stay on local connector drafts: ${JSON.stringify(task)}`);
+    }
+
+    const callbackDrafts = [];
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      callbackDrafts.length = 0;
+      for (const platform of platforms) {
+        const target = task.results.find((item) => item.platform === platform);
+        const detail = await requestAbsoluteJson(target.url);
+        if (detail.externalDraftId?.startsWith(`${platform}-sandbox-`) && detail.externalUrl?.startsWith(`https://sandbox.example.test/${platform}/`)) {
+          callbackDrafts.push({
+            platform,
+            localDraftId: target.remoteId,
+            externalDraftId: detail.externalDraftId,
+            externalUrl: detail.externalUrl,
+          });
+        }
+      }
+
+      if (callbackDrafts.length === platforms.length) {
+        break;
+      }
+
+      await delay(200);
+    }
+
+    if (callbackDrafts.length !== platforms.length) {
+      throw new Error(`Async sandbox upstream callbacks did not update every connector draft: ${JSON.stringify(callbackDrafts)}`);
+    }
+
+    const syncedTask = await requestJson(`/publish/tasks/${created.id}/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    if (
+      syncedTask.status !== "succeeded" ||
+      platforms.some((platform) => {
+        const target = syncedTask.results.find((item) => item.platform === platform);
+        return (
+          !target ||
+          target.status !== "succeeded" ||
+          !target.remoteId?.startsWith(`${platform}-sandbox-`) ||
+          !target.url?.startsWith(`https://sandbox.example.test/${platform}/`)
+        );
+      })
+    ) {
+      throw new Error(`Async sandbox upstream sync did not expose external draft links: ${JSON.stringify(syncedTask)}`);
+    }
+
+    const sandboxOutbox = await requestAbsoluteJson(`${sandboxBaseUrl}/drafts`, {
+      headers: { authorization: `Bearer ${sandboxApiKey}` },
+    });
+    if (
+      sandboxOutbox.items?.length !== platforms.length ||
+      sandboxOutbox.items.some((item) => item.callback?.ok !== true)
+    ) {
+      throw new Error(`Async sandbox upstream did not persist successful connector callbacks: ${JSON.stringify(sandboxOutbox)}`);
+    }
+
+    return {
+      taskId: created.id,
+      initialStatus: task.status,
+      finalStatus: syncedTask.status,
+      callbackDrafts,
+      sandboxCallbacks: sandboxOutbox.items.map((item) => ({
+        platform: item.platform,
+        remoteId: item.remoteId,
+        callbackStatus: item.callback?.status,
+      })),
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector), stopService(sandbox)]);
+    fs.rmSync(outboxDir, { recursive: true, force: true });
+    fs.rmSync(sandboxOutboxDir, { recursive: true, force: true });
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runUpstreamProxyEnablementCheck() {
   const upstreamPort = await getFreePort();
   const upstream = await startFakeUpstreamDraftService(upstreamPort, "upstream-secret");
@@ -3339,6 +3540,7 @@ const workspaceEnvCheck = await runDraftConnectorWorkspaceEnvCheck();
 const publicBaseRuntime = await runDraftConnectorPublicBaseRuntimeCheck();
 const upstreamContractCheck = await runUpstreamContractCheckScriptCheck();
 const upstreamSandboxCheck = await runUpstreamSandboxScriptCheck();
+const upstreamSandboxCallback = await runUpstreamSandboxCallbackCheck();
 const upstreamProxyEnablement = await runUpstreamProxyEnablementCheck();
 const localEnablement = await runLocalDraftEnablementCheck();
 const disabledPreflight = await runDisabledDraftPreflightCheck();
@@ -3769,6 +3971,7 @@ try {
     publicBaseRuntime,
     upstreamContractCheck,
     upstreamSandboxCheck,
+    upstreamSandboxCallback,
     upstreamProxyEnablement,
     localEnablement,
     disabledPreflight,

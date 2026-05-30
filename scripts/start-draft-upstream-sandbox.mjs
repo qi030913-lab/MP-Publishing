@@ -20,7 +20,9 @@ Options:
   --api-key <key>                  Optional bearer token for health, draft, and status requests.
   --initial-state <state>          Defaults to ready.
   --callback                       POST accepted draft status to connector.statusCallbackUrl.
+  --callback-delay-ms <ms>         Delay callback delivery; defaults to 0.
   --connector-api-key <key>        Bearer token for connector status callbacks.
+  --async-response                 Return publishing without remoteId/url and rely on callback/status sync.
   --help`;
 
 function parseArgs(argv) {
@@ -91,6 +93,15 @@ function parsePort(value) {
   }
 
   return port;
+}
+
+function parseNonNegativeInteger(value, label) {
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isInteger(parsed) || parsed < 0) {
+    throw new Error(`${label} must be a non-negative integer.`);
+  }
+
+  return parsed;
 }
 
 function normalizeState(value) {
@@ -240,7 +251,43 @@ async function postStatusCallback(record, connectorApiKey) {
   };
 }
 
-async function handleCreateDraft({ request, response, platform, outboxDir, initialState, callbackEnabled, connectorApiKey }) {
+function scheduleStatusCallback(outboxDir, record, connectorApiKey, callbackDelayMs) {
+  setTimeout(() => {
+    void (async () => {
+      const latestRecord = (await readRecord(outboxDir, record.platform, record.remoteId)) ?? record;
+      const callback = await postStatusCallback(latestRecord, connectorApiKey);
+      await writeRecord(outboxDir, {
+        ...latestRecord,
+        callback,
+        callbackAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    })().catch(async (error) => {
+      const latestRecord = (await readRecord(outboxDir, record.platform, record.remoteId)) ?? record;
+      await writeRecord(outboxDir, {
+        ...latestRecord,
+        callback: {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        },
+        callbackAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+    });
+  }, callbackDelayMs);
+}
+
+async function handleCreateDraft({
+  request,
+  response,
+  platform,
+  outboxDir,
+  initialState,
+  callbackEnabled,
+  callbackDelayMs,
+  connectorApiKey,
+  asyncResponse,
+}) {
   const payload = await readRequestJson(request);
   const connectorDraftId = payload.connector?.draftId;
   const statusCallbackUrl = payload.connector?.statusCallbackUrl;
@@ -272,12 +319,21 @@ async function handleCreateDraft({ request, response, platform, outboxDir, initi
     updatedAt: now,
   };
 
+  await writeRecord(outboxDir, record);
+
   if (callbackEnabled) {
-    record.callback = await postStatusCallback(record, connectorApiKey);
-    record.updatedAt = new Date().toISOString();
+    scheduleStatusCallback(outboxDir, record, connectorApiKey, callbackDelayMs);
   }
 
-  await writeRecord(outboxDir, record);
+  if (asyncResponse) {
+    sendJson(response, 200, {
+      ok: true,
+      state: "publishing",
+      detail: `${platform} sandbox upstream draft accepted asynchronously.`,
+    });
+    return;
+  }
+
   sendJson(response, 200, {
     ok: true,
     state: record.state,
@@ -338,6 +394,8 @@ async function main() {
   const connectorApiKey = readOption(args, "connector-api-key", ["DRAFT_CONNECTOR_API_KEY"]);
   const initialState = normalizeState(readOption(args, "initial-state", ["DRAFT_UPSTREAM_SANDBOX_INITIAL_STATE"]) ?? "ready");
   const callbackEnabled = readBoolean(args, "callback", ["DRAFT_UPSTREAM_SANDBOX_CALLBACK"]);
+  const callbackDelayMs = parseNonNegativeInteger(readOption(args, "callback-delay-ms", ["DRAFT_UPSTREAM_SANDBOX_CALLBACK_DELAY_MS"]) ?? "0", "--callback-delay-ms");
+  const asyncResponse = readBoolean(args, "async-response", ["DRAFT_UPSTREAM_SANDBOX_ASYNC_RESPONSE"]);
 
   await mkdir(outboxDir, { recursive: true });
 
@@ -381,7 +439,17 @@ async function main() {
         }
 
         if (request.method === "POST" && operation === "drafts") {
-          await handleCreateDraft({ request, response, platform, outboxDir, initialState, callbackEnabled, connectorApiKey });
+          await handleCreateDraft({
+            request,
+            response,
+            platform,
+            outboxDir,
+            initialState,
+            callbackEnabled,
+            callbackDelayMs,
+            connectorApiKey,
+            asyncResponse,
+          });
           return;
         }
 
