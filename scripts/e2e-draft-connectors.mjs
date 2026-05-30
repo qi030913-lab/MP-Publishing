@@ -832,6 +832,159 @@ async function runDisabledDraftPreflightCheck() {
   }
 }
 
+async function runWorkerDraftConfigManualActionCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const apiPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const queueName = `mp-publishing-draft-worker-config-e2e-${Date.now()}`;
+  const outboxDir = path.join(runtimeDir, `draft-worker-config-e2e-${Date.now()}`);
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+
+  const apiEnv = createCleanServiceEnv({
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+  });
+  const workerEnv = createCleanServiceEnv({
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: "",
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    ZHIHU_REAL_PUBLISH_ENABLED: "false",
+    ZHIHU_DRAFT_ENDPOINT: "",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_DRAFT_ENDPOINT: "",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_DRAFT_ENDPOINT: "",
+  });
+  const draftConnectorEnv = createCleanServiceEnv({
+    PORT: String(connectorPort),
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
+  });
+
+  const api = startServiceWithEnv("api-draft-worker-config", ["apps/api/dist/main.js"], root, apiEnv);
+  const worker = startServiceWithEnv("worker-draft-worker-config", ["apps/worker/dist/main.js"], root, workerEnv);
+  const draftConnector = startServiceWithEnv(
+    "draft-connector-worker-config",
+    ["apps/draft-connector/dist/main.js"],
+    root,
+    draftConnectorEnv,
+  );
+
+  try {
+    await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector");
+    await waitForApi(api);
+    await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
+
+    const initialRuntime = await requestJson("/runtime/status");
+    if (
+      initialRuntime.draftConnector?.status !== "online" ||
+      platforms.some((platform) => {
+        const platformStatus = initialRuntime.draftConnector?.platforms?.find((item) => item.platform === platform);
+        return platformStatus?.draftReady !== true;
+      })
+    ) {
+      throw new Error(`Worker config drift check API preflight was not ready: ${JSON.stringify(initialRuntime.draftConnector)}`);
+    }
+
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for worker config drift verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "Worker-side real draft config drift e2e",
+          summary: "Verify queued real draft targets become manual action when worker-side connector config drifts.",
+          body: "This content confirms API preflight is not the only guard for non-WeChat draft publishing.",
+          tags: ["draft", "worker", "manual-action", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+
+    let task = created;
+    for (let i = 0; i < 50; i += 1) {
+      await delay(600);
+      task = await requestJson(`/publish/tasks/${created.id}`);
+      if (!["running", "queued"].includes(task.status)) {
+        break;
+      }
+    }
+
+    let runtime = await requestJson("/runtime/status");
+    for (let i = 0; i < 20; i += 1) {
+      if (runtime.queue.waiting === 0 && runtime.queue.active === 0 && runtime.queue.delayed === 0) {
+        break;
+      }
+
+      await delay(300);
+      runtime = await requestJson("/runtime/status");
+    }
+
+    const expectedIssueCodes = {
+      zhihu: "ZHIHU_REAL_PUBLISH_DISABLED",
+      bilibili: "BILIBILI_DRAFT_ENDPOINT_MISSING",
+      xiaohongshu: "XIAOHONGSHU_DRAFT_ENDPOINT_MISSING",
+    };
+
+    if (
+      task.status !== "needs_manual_action" ||
+      platforms.some((platform) => {
+        const target = task.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return target?.status !== "needs_manual_action" || !issueCodes.includes(expectedIssueCodes[platform]);
+      })
+    ) {
+      throw new Error(`Worker config drift did not hold targets for manual action: ${JSON.stringify(task)}`);
+    }
+
+    const storedDrafts = readDraftOutbox(outboxDir, platforms);
+    if (storedDrafts.length !== 0) {
+      throw new Error(`Worker config drift should not create connector drafts: ${JSON.stringify(storedDrafts)}`);
+    }
+
+    if (runtime.queue.failed > 0 || runtime.queue.waiting > 0 || runtime.queue.active > 0) {
+      throw new Error(`Worker config drift queue did not drain cleanly: ${JSON.stringify(runtime.queue)}`);
+    }
+
+    return {
+      taskId: task.id,
+      status: task.status,
+      targets: task.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        issueCodes: target.issues.map((issue) => issue.code),
+      })),
+      outboxDraftCount: storedDrafts.length,
+      queue: runtime.queue,
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector)]);
+    fs.rmSync(outboxDir, { recursive: true, force: true });
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runCredentialPreflightCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -2921,6 +3074,7 @@ const workspaceEnvCheck = await runDraftConnectorWorkspaceEnvCheck();
 const publicBaseRuntime = await runDraftConnectorPublicBaseRuntimeCheck();
 const localEnablement = await runLocalDraftEnablementCheck();
 const disabledPreflight = await runDisabledDraftPreflightCheck();
+const workerConfigManualAction = await runWorkerDraftConfigManualActionCheck();
 const credentialPreflight = await runCredentialPreflightCheck();
 const credentialMismatchPreflight = await runCredentialForwardingMismatchPreflightCheck();
 const offlinePreflight = await runOfflineDraftConnectorPreflightCheck();
@@ -3332,6 +3486,7 @@ try {
     publicBaseRuntime,
     localEnablement,
     disabledPreflight,
+    workerConfigManualAction,
     credentialPreflight,
     credentialMismatchPreflight,
     offlinePreflight,
