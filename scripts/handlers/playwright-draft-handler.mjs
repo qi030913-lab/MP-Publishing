@@ -64,7 +64,7 @@ async function readSelectors(platform) {
   return undefined;
 }
 
-function validateSelectors(platform, selectors) {
+function validateSelectors(platform, selectors, { requireSaveDraft = false } = {}) {
   if (!selectors || typeof selectors !== "object" || Array.isArray(selectors)) {
     throw new Error(`${platform} Playwright selectors must be configured with *_PLAYWRIGHT_SELECTORS_JSON or *_PLAYWRIGHT_SELECTORS_PATH.`);
   }
@@ -73,6 +73,10 @@ function validateSelectors(platform, selectors) {
     if (!selectorValue(selectors, key)) {
       throw new Error(`${platform} Playwright selectors must include "${key}".`);
     }
+  }
+
+  if (requireSaveDraft && !selectorValue(selectors, "saveDraft")) {
+    throw new Error(`${platform} Playwright selectors must include "saveDraft" when click-save is enabled.`);
   }
 }
 
@@ -330,9 +334,8 @@ export async function createDraft({ platform, workOrder, platformSession, sessio
   }
 
   const selectors = await readSelectors(platform);
-  validateSelectors(platform, selectors);
-
   const { timeout, clickSave } = readPlaywrightSettings(platform);
+  validateSelectors(platform, selectors, { requireSaveDraft: clickSave });
   const { browser, page } = await createDraftPage({ platform, platformSession, creatorDraftUrl });
 
   try {

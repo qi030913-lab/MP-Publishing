@@ -87,6 +87,36 @@ async function runNodeCommand(label, args, extraEnv = {}) {
   return { stdout, stderr };
 }
 
+async function runNodeCommandExpectFailure(label, args, extraEnv = {}) {
+  const env = { ...process.env, ...extraEnv };
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) {
+      delete env[key];
+    }
+  }
+
+  const child = spawn(process.execPath, args, {
+    cwd: root,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk.toString();
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk.toString();
+  });
+
+  const [code] = await once(child, "exit");
+  if (code === 0) {
+    throw new Error(`${label} unexpectedly succeeded.\n${stdout}\n${stderr}`);
+  }
+
+  return { code, stdout, stderr };
+}
+
 async function stopService(service) {
   if (!service || service.child.exitCode !== null) {
     return;
@@ -1818,6 +1848,177 @@ export const chromium = {
   } finally {
     await stopService(automation);
     fs.rmSync(automationDir, { recursive: true, force: true });
+  }
+}
+
+async function runDraftPlaywrightSaveSelectorGuardCheck() {
+  const guardDir = path.join(runtimeDir, `draft-playwright-save-selector-guard-e2e-${Date.now()}`);
+  const fakePlaywrightPath = path.join(guardDir, "fake-playwright.mjs");
+  const operationLogPath = path.join(guardDir, "operations.json");
+  fs.rmSync(guardDir, { recursive: true, force: true });
+  fs.mkdirSync(guardDir, { recursive: true });
+  fs.writeFileSync(
+    fakePlaywrightPath,
+    `
+import fs from "node:fs";
+
+const logPath = process.env.FAKE_PLAYWRIGHT_LOG_PATH;
+const operations = [];
+let currentUrl = "";
+
+function log(entry) {
+  operations.push(entry);
+  fs.writeFileSync(logPath, JSON.stringify(operations, null, 2), "utf8");
+}
+
+function locator(selector) {
+  return {
+    async fill(value) {
+      log({ action: "fill", selector, value });
+    },
+    async click(options) {
+      log({ action: "click", selector, timeout: options?.timeout });
+      currentUrl = "https://creator.zhihu.example.test/drafts/guard-clicked";
+    },
+    async waitFor(options) {
+      log({ action: "waitFor", selector, timeout: options?.timeout });
+    },
+    async getAttribute(attribute) {
+      log({ action: "getAttribute", selector, attribute });
+      return currentUrl;
+    },
+  };
+}
+
+export const chromium = {
+  async launch(options) {
+    log({ action: "launch", headless: options?.headless, channel: options?.channel });
+    return {
+      async newContext(options) {
+        log({ action: "newContext", hasStorageState: Boolean(options?.storageState) });
+        return {
+          async addCookies(cookies) {
+            log({ action: "addCookies", names: cookies.map((cookie) => cookie.name) });
+          },
+          async newPage() {
+            log({ action: "newPage" });
+            return {
+              setDefaultTimeout(timeout) {
+                log({ action: "setDefaultTimeout", timeout });
+              },
+              async goto(url, options) {
+                currentUrl = url;
+                log({ action: "goto", url, waitUntil: options?.waitUntil, timeout: options?.timeout });
+              },
+              locator,
+              url() {
+                return currentUrl;
+              },
+            };
+          },
+        };
+      },
+      async close() {
+        log({ action: "close" });
+      },
+    };
+  },
+};
+`.trim(),
+    "utf8",
+  );
+
+  const commonEnv = {
+    DRAFT_AUTOMATION_PLAYWRIGHT_MODULE: pathToFileURL(fakePlaywrightPath).href,
+    DRAFT_AUTOMATION_PLAYWRIGHT_HEADLESS: "true",
+    DRAFT_AUTOMATION_ZHIHU_REQUIRE_SESSION: "true",
+    DRAFT_AUTOMATION_ZHIHU_COOKIES: "SESSION=zhihu-save-guard-secret",
+    DRAFT_AUTOMATION_ZHIHU_STORAGE_STATE_JSON: "{\"cookies\":[],\"origins\":[]}",
+    DRAFT_AUTOMATION_ZHIHU_CREATOR_DRAFT_URL: "https://creator.zhihu.example.test/drafts/new",
+    DRAFT_AUTOMATION_ZHIHU_PLAYWRIGHT_SELECTORS_JSON: JSON.stringify({
+      title: "#title",
+      body: "#body",
+    }),
+    FAKE_PLAYWRIGHT_LOG_PATH: operationLogPath,
+  };
+
+  try {
+    const rejectedCommand = await runNodeCommandExpectFailure(
+      "draft playwright smoke missing saveDraft selector",
+      [
+        path.join(root, "scripts/smoke-draft-playwright.mjs"),
+        "--platform",
+        "zhihu",
+        "--title",
+        "Missing save selector smoke",
+      ],
+      commonEnv,
+    );
+    const rejected = JSON.parse(rejectedCommand.stdout);
+    const rejectedMessage = rejected.results?.[0]?.message ?? "";
+    const operationsBeforeFillOnly = fs.existsSync(operationLogPath)
+      ? JSON.parse(fs.readFileSync(operationLogPath, "utf8"))
+      : [];
+
+    if (
+      rejected.ok !== false ||
+      rejected.results?.[0]?.platform !== "zhihu" ||
+      !rejectedMessage.includes('"saveDraft"') ||
+      !rejectedMessage.includes("click-save") ||
+      operationsBeforeFillOnly.some((item) => item.action === "launch") ||
+      JSON.stringify(rejected).includes("zhihu-save-guard-secret")
+    ) {
+      throw new Error(
+        `Draft Playwright handler did not reject click-save without a saveDraft selector before browser launch: ${JSON.stringify({
+          rejected,
+          operationsBeforeFillOnly,
+        })}`,
+      );
+    }
+
+    fs.rmSync(operationLogPath, { force: true });
+    const fillOnlyCommand = await runNodeCommand(
+      "draft playwright smoke fill-only without saveDraft selector",
+      [
+        path.join(root, "scripts/smoke-draft-playwright.mjs"),
+        "--platform",
+        "zhihu",
+        "--title",
+        "Fill only smoke",
+        "--body",
+        "Fill only body.",
+        "--no-click-save",
+      ],
+      commonEnv,
+    );
+    const fillOnly = JSON.parse(fillOnlyCommand.stdout);
+    const operations = JSON.parse(fs.readFileSync(operationLogPath, "utf8"));
+    const fillBySelector = new Map(operations.filter((item) => item.action === "fill").map((item) => [item.selector, item.value]));
+
+    if (
+      fillOnly.ok !== true ||
+      fillOnly.results?.[0]?.platform !== "zhihu" ||
+      fillOnly.results?.[0]?.clickSave !== "false" ||
+      fillBySelector.get("#title") !== "Fill only smoke" ||
+      !String(fillBySelector.get("#body")).includes("Fill only body.") ||
+      operations.some((item) => item.action === "click") ||
+      JSON.stringify(fillOnly).includes("zhihu-save-guard-secret")
+    ) {
+      throw new Error(
+        `Draft Playwright fill-only smoke should allow missing saveDraft selector without saving: ${JSON.stringify({
+          fillOnly,
+          operations,
+        })}`,
+      );
+    }
+
+    return {
+      rejectedMissingSaveDraft: true,
+      rejectedBeforeBrowserLaunch: !operationsBeforeFillOnly.some((item) => item.action === "launch"),
+      fillOnlyWithoutSaveDraft: true,
+    };
+  } finally {
+    fs.rmSync(guardDir, { recursive: true, force: true });
   }
 }
 
@@ -5047,6 +5248,7 @@ const draftPlaywrightSessionCaptureCheck = await runDraftPlaywrightSessionCaptur
 const draftPlaywrightSelectorCaptureCheck = await runDraftPlaywrightSelectorCaptureCheck();
 const draftPlaywrightSetupCheck = await runDraftPlaywrightSetupCheckScriptCheck();
 const draftPlaywrightHandlerCheck = await runDraftPlaywrightHandlerCheck();
+const draftPlaywrightSaveSelectorGuardCheck = await runDraftPlaywrightSaveSelectorGuardCheck();
 const draftPlaywrightSmokeCheck = await runDraftPlaywrightSmokeCheck();
 const upstreamSandboxCallback = await runUpstreamSandboxCallbackCheck();
 const upstreamProxyEnablement = await runUpstreamProxyEnablementCheck();
@@ -5487,6 +5689,7 @@ try {
     draftPlaywrightSelectorCaptureCheck,
     draftPlaywrightSetupCheck,
     draftPlaywrightHandlerCheck,
+    draftPlaywrightSaveSelectorGuardCheck,
     draftPlaywrightSmokeCheck,
     upstreamSandboxCallback,
     upstreamProxyEnablement,
