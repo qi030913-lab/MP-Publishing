@@ -799,9 +799,19 @@ async function runDraftAutomationServiceScriptCheck() {
   fs.writeFileSync(
     handlerPath,
     `
-export async function createDraft({ platform, workOrder, runner }) {
+export async function createDraft({ platform, workOrder, runner, platformSession, sessionSummary }) {
   if (workOrder.version !== "draft-upstream-work-order-v1" || !workOrder.checklist?.some((item) => item.id === "save-draft")) {
     throw new Error("handler received an incomplete work order");
+  }
+  if (
+    !platformSession?.accessToken ||
+    !platformSession?.cookies ||
+    !platformSession?.storageStateJson ||
+    !platformSession?.storageStatePath ||
+    !sessionSummary?.hasAccessToken ||
+    sessionSummary.accessToken
+  ) {
+    throw new Error("handler did not receive the expected raw session plus redacted summary");
   }
 
   return {
@@ -821,6 +831,14 @@ export async function createDraft({ platform, workOrder, runner }) {
     DRAFT_AUTOMATION_SERVICE_OUTBOX_DIR: outboxDir,
     DRAFT_AUTOMATION_SERVICE_API_KEY: apiKey,
     DRAFT_AUTOMATION_SERVICE_HANDLER_MODULE: handlerPath,
+    DRAFT_AUTOMATION_ZHIHU_REQUIRE_SESSION: "true",
+    DRAFT_AUTOMATION_ZHIHU_ACCESS_TOKEN: "zhihu-secret-token",
+    DRAFT_AUTOMATION_ZHIHU_COOKIES: "SESSION=zhihu-secret-cookie",
+    DRAFT_AUTOMATION_ZHIHU_STORAGE_STATE_JSON: "{\"cookies\":[],\"origins\":[]}",
+    DRAFT_AUTOMATION_ZHIHU_STORAGE_STATE_PATH: handlerPath,
+    DRAFT_AUTOMATION_ZHIHU_CREATOR_BASE_URL: "https://creator.zhihu.example.test",
+    DRAFT_AUTOMATION_ZHIHU_CREATOR_DRAFT_URL: "https://creator.zhihu.example.test/drafts/new",
+    DRAFT_AUTOMATION_BILIBILI_REQUIRE_SESSION: "true",
   });
   const authHeaders = {
     authorization: `Bearer ${apiKey}`,
@@ -829,6 +847,8 @@ export async function createDraft({ platform, workOrder, runner }) {
   try {
     const health = await waitForAuthorizedHealth(automation, `${automationBaseUrl}/health`, "Draft automation service script", apiKey);
     const contract = await requestAbsoluteJson(`${automationBaseUrl}/contract`, { headers: authHeaders });
+    const zhihuSession = health.platformSessions?.find((item) => item.platform === "zhihu");
+    const bilibiliSession = health.platformSessions?.find((item) => item.platform === "bilibili");
     const workOrder = {
       version: "draft-upstream-work-order-v1",
       platform: "zhihu",
@@ -878,16 +898,57 @@ export async function createDraft({ platform, workOrder, runner }) {
     const detail = await requestAbsoluteJson(`${automationBaseUrl}/zhihu/drafts/${created.automationDraft.automationDraftId}`, {
       headers: authHeaders,
     });
+    let missingSessionRejected = false;
+    try {
+      await requestAbsoluteJson(`${automationBaseUrl}/drafts`, {
+        method: "POST",
+        headers: {
+          ...authHeaders,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          platform: "bilibili",
+          accountId: "acct_bilibili_main",
+          workOrder: { ...workOrder, platform: "bilibili", remoteId: "bilibili-sandbox-script-check" },
+          requestedAt: new Date().toISOString(),
+          runner: {
+            completedBy: "automation-service-script-check",
+            safeMode: true,
+          },
+        }),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("428")) {
+        throw new Error(`Missing automation session failed with an unexpected response: ${message}`);
+      }
+      missingSessionRejected = true;
+    }
 
     if (
-      health.status !== "ok" ||
+      health.status !== "needs_session" ||
       health.handlerConfigured !== true ||
+      !health.missingRequiredSessions?.includes("bilibili") ||
+      zhihuSession?.ready !== true ||
+      zhihuSession?.required !== true ||
+      zhihuSession?.hasAccessToken !== true ||
+      zhihuSession?.hasCookies !== true ||
+      zhihuSession?.hasStorageStateJson !== true ||
+      zhihuSession?.hasStorageStatePath !== true ||
+      zhihuSession?.accessToken ||
+      bilibiliSession?.ready !== false ||
+      bilibiliSession?.required !== true ||
       contract.version !== "draft-automation-service-v1" ||
+      contract.platformSessions?.find((item) => item.platform === "zhihu")?.creatorDraftUrl !==
+        "https://creator.zhihu.example.test/drafts/new" ||
       !created.remoteId?.startsWith("zhihu-handler-zhihu-sandbox-script-check") ||
       created.url !== "https://automation-handler.example.test/zhihu/drafts/zhihu-sandbox-script-check" ||
       list.total !== 1 ||
       detail.mode !== "handler" ||
-      detail.workOrder?.version !== "draft-upstream-work-order-v1"
+      detail.workOrder?.version !== "draft-upstream-work-order-v1" ||
+      JSON.stringify(detail).includes("zhihu-secret-token") ||
+      JSON.stringify(detail).includes("zhihu-secret-cookie") ||
+      !missingSessionRejected
     ) {
       throw new Error(
         `Draft automation service script check failed: ${JSON.stringify({
@@ -903,9 +964,11 @@ export async function createDraft({ platform, workOrder, runner }) {
     return {
       contractVersion: contract.version,
       handlerConfigured: health.handlerConfigured,
+      missingRequiredSessions: health.missingRequiredSessions,
       remoteId: created.remoteId,
       url: created.url,
       mode: detail.mode,
+      sessionReady: zhihuSession.ready,
     };
   } finally {
     await stopService(automation);

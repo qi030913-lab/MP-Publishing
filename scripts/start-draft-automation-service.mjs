@@ -20,6 +20,8 @@ Options:
   --api-key <key>                  Optional bearer token for health, contract, draft, and list routes.
   --handler-module <path>          Optional ESM module exporting createDraft(input) for real platform automation.
   --external-url-template <value>  Optional fallback URL template with {platform}, {remoteId}, {workOrderId}.
+  --require-session                Require a platform session before accepting work orders.
+  --<platform>-require-session     Require a session only for one platform.
   --help
 
 Routes:
@@ -32,7 +34,15 @@ Routes:
 
 Without --handler-module, POST /drafts stores a local automation handoff record and returns
 that inspection URL as the draft URL. A handler module can call Playwright or an official API
-and return the real platform draft id/url while keeping the runner contract unchanged.`;
+and return the real platform draft id/url while keeping the runner contract unchanged.
+
+Session env:
+  DRAFT_AUTOMATION_<PLATFORM>_ACCESS_TOKEN
+  DRAFT_AUTOMATION_<PLATFORM>_COOKIES
+  DRAFT_AUTOMATION_<PLATFORM>_STORAGE_STATE_JSON
+  DRAFT_AUTOMATION_<PLATFORM>_STORAGE_STATE_PATH
+  DRAFT_AUTOMATION_<PLATFORM>_CREATOR_BASE_URL
+  DRAFT_AUTOMATION_<PLATFORM>_CREATOR_DRAFT_URL`;
 
 function parseArgs(argv) {
   const parsed = {};
@@ -75,6 +85,24 @@ function readOption(args, name, envNames = []) {
   }
 
   return undefined;
+}
+
+function readBoolean(args, name, envNames = []) {
+  if (args[name] === true) {
+    return true;
+  }
+
+  if (args[name] !== undefined) {
+    return ["1", "true", "yes", "on"].includes(String(args[name]).toLowerCase());
+  }
+
+  for (const envName of envNames) {
+    if (process.env[envName] !== undefined) {
+      return ["1", "true", "yes", "on"].includes(String(process.env[envName]).toLowerCase());
+    }
+  }
+
+  return false;
 }
 
 function parsePort(value) {
@@ -137,6 +165,70 @@ function hasBearerToken(request, apiKey) {
 
 function isAuthorized(request, apiKey) {
   return !apiKey || hasBearerToken(request, apiKey);
+}
+
+function resolveOptionalPath(value) {
+  if (!value) {
+    return undefined;
+  }
+
+  return path.isAbsolute(value) ? value : path.resolve(root, value);
+}
+
+function readPlatformSession(platform, args) {
+  const envPrefix = `DRAFT_AUTOMATION_${platform.toUpperCase()}`;
+  const required =
+    readBoolean(args, `${platform}-require-session`, [`${envPrefix}_REQUIRE_SESSION`]) ||
+    readBoolean(args, "require-session", ["DRAFT_AUTOMATION_REQUIRE_SESSION"]);
+  const session = {
+    platform,
+    required,
+    accountLabel: readOption(args, `${platform}-account-label`, [`${envPrefix}_ACCOUNT_LABEL`]),
+    creatorBaseUrl: readOption(args, `${platform}-creator-base-url`, [`${envPrefix}_CREATOR_BASE_URL`]),
+    creatorDraftUrl: readOption(args, `${platform}-creator-draft-url`, [`${envPrefix}_CREATOR_DRAFT_URL`]),
+    accessToken: readOption(args, `${platform}-access-token`, [`${envPrefix}_ACCESS_TOKEN`]),
+    cookies: readOption(args, `${platform}-cookies`, [`${envPrefix}_COOKIES`]),
+    storageStateJson: readOption(args, `${platform}-storage-state-json`, [`${envPrefix}_STORAGE_STATE_JSON`]),
+    storageStatePath: resolveOptionalPath(
+      readOption(args, `${platform}-storage-state-path`, [`${envPrefix}_STORAGE_STATE_PATH`, `${envPrefix}_STORAGE_STATE_FILE`]),
+    ),
+  };
+
+  return {
+    ...session,
+    ready: Boolean(session.accessToken || session.cookies || session.storageStateJson || session.storageStatePath),
+  };
+}
+
+function summarizePlatformSession(session) {
+  const authModes = [
+    session.accessToken ? "access-token" : undefined,
+    session.cookies ? "cookies" : undefined,
+    session.storageStateJson ? "storage-state-json" : undefined,
+    session.storageStatePath ? "storage-state-path" : undefined,
+  ].filter(Boolean);
+
+  return {
+    platform: session.platform,
+    required: session.required,
+    ready: session.ready,
+    accountLabel: session.accountLabel,
+    creatorBaseUrl: session.creatorBaseUrl,
+    creatorDraftUrl: session.creatorDraftUrl,
+    authModes,
+    hasAccessToken: Boolean(session.accessToken),
+    hasCookies: Boolean(session.cookies),
+    hasStorageStateJson: Boolean(session.storageStateJson),
+    hasStorageStatePath: Boolean(session.storageStatePath),
+  };
+}
+
+function summarizePlatformSessions(platformSessions) {
+  return Array.from(platformSessions.values()).map(summarizePlatformSession);
+}
+
+function getMissingRequiredSessions(platformSessions) {
+  return Array.from(platformSessions.values()).filter((session) => session.required && !session.ready);
 }
 
 function recordPath(outboxDir, platform, automationDraftId) {
@@ -288,7 +380,7 @@ async function loadHandler(handlerModulePath) {
   return handler;
 }
 
-function createContract({ publicBaseUrl, hasHandler }) {
+function createContract({ publicBaseUrl, hasHandler, platformSessions }) {
   return {
     version: "draft-automation-service-v1",
     purpose: "Receives draft-upstream-work-order-v1 payloads and turns them into platform draft ids/URLs.",
@@ -308,6 +400,11 @@ function createContract({ publicBaseUrl, hasHandler }) {
         completedBy: "Runner identity.",
         safeMode: true,
       },
+      handlerInput: {
+        platformSession:
+          "Sensitive platform session material for the selected platform. Includes accessToken/cookies/storageStateJson/storageStatePath when configured, and is never persisted by the service.",
+        sessionSummary: "Redacted session readiness summary safe for logs and health checks.",
+      },
     },
     response: {
       ok: "false asks the runner to fail the work order instead of completing it.",
@@ -320,11 +417,22 @@ function createContract({ publicBaseUrl, hasHandler }) {
     handler: hasHandler
       ? "custom"
       : "none; default mode stages local handoff records. Set --handler-module to run Playwright or official API automation.",
+    platformSessions: summarizePlatformSessions(platformSessions),
     exampleLocalUrl: `${publicBaseUrl}/zhihu/drafts/<automationDraftId>`,
   };
 }
 
-async function handleCreateDraft({ request, response, outboxDir, publicBaseUrl, apiKey, handler, handlerModulePath, urlTemplates }) {
+async function handleCreateDraft({
+  request,
+  response,
+  outboxDir,
+  publicBaseUrl,
+  apiKey,
+  handler,
+  handlerModulePath,
+  urlTemplates,
+  platformSessions,
+}) {
   if (!isAuthorized(request, apiKey)) {
     sendJson(response, 401, { ok: false, message: "automation api key is invalid" });
     return;
@@ -337,6 +445,17 @@ async function handleCreateDraft({ request, response, outboxDir, publicBaseUrl, 
     ({ platform, workOrder } = validateAutomationPayload(payload));
   } catch (error) {
     sendJson(response, 422, { ok: false, message: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+
+  const platformSession = platformSessions.get(platform);
+  if (platformSession?.required && !platformSession.ready) {
+    sendJson(response, 428, {
+      ok: false,
+      state: "needs_manual_action",
+      message: `${platform} automation session is required but not configured.`,
+      sessionSummary: summarizePlatformSession(platformSession),
+    });
     return;
   }
 
@@ -359,6 +478,8 @@ async function handleCreateDraft({ request, response, outboxDir, publicBaseUrl, 
           workOrder,
           requestedAt: payload.requestedAt ?? now,
           runner: payload.runner ?? {},
+          platformSession,
+          sessionSummary: platformSession ? summarizePlatformSession(platformSession) : undefined,
           context: {
             outboxDir,
             publicBaseUrl,
@@ -425,6 +546,7 @@ async function main() {
   const outboxDir = path.resolve(root, readOption(args, "outbox-dir", ["DRAFT_AUTOMATION_SERVICE_OUTBOX_DIR"]) ?? ".runtime/draft-automation-service");
   const handlerModulePath = readOption(args, "handler-module", ["DRAFT_AUTOMATION_SERVICE_HANDLER_MODULE"]);
   const handler = await loadHandler(handlerModulePath);
+  const platformSessions = new Map(Array.from(supportedPlatforms).map((platform) => [platform, readPlatformSession(platform, args)]));
   const urlTemplates = new Map(
     Array.from(supportedPlatforms)
       .map((platform) => [platform, readUrlTemplate(platform, args)])
@@ -444,18 +566,21 @@ async function main() {
       }
 
       if (request.method === "GET" && url.pathname === "/health") {
+        const missingSessions = getMissingRequiredSessions(platformSessions);
         sendJson(response, 200, {
           ok: true,
-          status: "ok",
+          status: missingSessions.length > 0 ? "needs_session" : "ok",
           supportedPlatforms: Array.from(supportedPlatforms),
           handlerConfigured: Boolean(handler),
+          platformSessions: summarizePlatformSessions(platformSessions),
+          missingRequiredSessions: missingSessions.map((session) => session.platform),
           outboxDir,
         });
         return;
       }
 
       if (request.method === "GET" && url.pathname === "/contract") {
-        sendJson(response, 200, createContract({ publicBaseUrl, hasHandler: Boolean(handler) }));
+        sendJson(response, 200, createContract({ publicBaseUrl, hasHandler: Boolean(handler), platformSessions }));
         return;
       }
 
@@ -466,7 +591,17 @@ async function main() {
       }
 
       if (request.method === "POST" && url.pathname === "/drafts") {
-        await handleCreateDraft({ request, response, outboxDir, publicBaseUrl, apiKey, handler, handlerModulePath, urlTemplates });
+        await handleCreateDraft({
+          request,
+          response,
+          outboxDir,
+          publicBaseUrl,
+          apiKey,
+          handler,
+          handlerModulePath,
+          urlTemplates,
+          platformSessions,
+        });
         return;
       }
 
@@ -505,6 +640,7 @@ async function main() {
         baseUrl: publicBaseUrl,
         outboxDir,
         handlerConfigured: Boolean(handler),
+        platformSessions: summarizePlatformSessions(platformSessions),
       }),
     );
   });
