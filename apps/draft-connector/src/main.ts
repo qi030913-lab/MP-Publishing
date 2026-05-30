@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
 type DraftPayload = {
@@ -110,7 +110,6 @@ const supportedDraftStates = new Set<DraftState>([
   "failed",
   "needs_manual_action",
 ]);
-const port = Number(process.env.PORT ?? 3010);
 
 function findWorkspaceRoot(startDir: string) {
   let currentDir = startDir;
@@ -130,6 +129,38 @@ function findWorkspaceRoot(startDir: string) {
 }
 
 const workspaceRoot = findWorkspaceRoot(process.cwd());
+
+function loadWorkspaceEnv() {
+  const envPath = path.join(workspaceRoot, ".env");
+  if (!existsSync(envPath)) {
+    return;
+  }
+
+  const raw = readFileSync(envPath, "utf8");
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    const separatorIndex = trimmed.indexOf("=");
+    if (separatorIndex < 1) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    const value = trimmed
+      .slice(separatorIndex + 1)
+      .trim()
+      .replace(/^["']|["']$/g, "");
+
+    process.env[key] ??= value;
+  }
+}
+
+loadWorkspaceEnv();
+
+const port = Number(process.env.PORT ?? 3010);
 const outboxDir = process.env.DRAFT_CONNECTOR_OUTBOX_DIR
   ? path.resolve(process.env.DRAFT_CONNECTOR_OUTBOX_DIR)
   : path.join(workspaceRoot, ".runtime", "drafts");
