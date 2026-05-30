@@ -188,6 +188,137 @@ function resolveCreatorDraftUrl({ platformSession, platform }) {
   );
 }
 
+function readPlaywrightSettings(platform) {
+  return {
+    timeout: readInteger("DRAFT_AUTOMATION_PLAYWRIGHT_TIMEOUT_MS", 30000),
+    headless: readBoolean("DRAFT_AUTOMATION_PLAYWRIGHT_HEADLESS", true),
+    clickSave: readBoolean(
+      `DRAFT_AUTOMATION_${platform.toUpperCase()}_PLAYWRIGHT_CLICK_SAVE`,
+      readBoolean("DRAFT_AUTOMATION_PLAYWRIGHT_CLICK_SAVE", true),
+    ),
+    browserChannel: readEnv("DRAFT_AUTOMATION_PLAYWRIGHT_BROWSER_CHANNEL"),
+  };
+}
+
+function summarizeSessionAuthModes(platformSession) {
+  return [
+    platformSession?.appId && platformSession?.appSecret ? "app-secret" : undefined,
+    platformSession?.accessToken ? "access-token" : undefined,
+    platformSession?.refreshToken ? "refresh-token" : undefined,
+    platformSession?.cookies ? "cookies" : undefined,
+    platformSession?.storageStateJson ? "storage-state-json" : undefined,
+    platformSession?.storageStatePath ? "storage-state-path" : undefined,
+  ].filter(Boolean);
+}
+
+async function createDraftPage({ platform, platformSession, creatorDraftUrl }) {
+  const { timeout, headless, browserChannel } = readPlaywrightSettings(platform);
+  const { chromium } = await importPlaywright();
+  const browser = await chromium.launch({
+    headless,
+    ...(browserChannel ? { channel: browserChannel } : {}),
+  });
+
+  const storageState = createStorageState(platformSession);
+  const context = await browser.newContext({
+    ...(storageState ? { storageState } : {}),
+  });
+  const cookies = parseCookieHeader(platformSession?.cookies, platformSession?.creatorBaseUrl ?? creatorDraftUrl);
+  if (cookies.length > 0) {
+    await context.addCookies(cookies);
+  }
+
+  const page = await context.newPage();
+  page.setDefaultTimeout?.(timeout);
+  await page.goto(creatorDraftUrl, { waitUntil: "domcontentloaded", timeout });
+  return { browser, page, timeout };
+}
+
+async function checkSelector(page, selectors, key, timeout, required) {
+  const selector = selectorValue(selectors, key);
+  if (!selector) {
+    return { key, required, configured: false, ok: !required };
+  }
+
+  await page.locator(selector).waitFor({ timeout });
+  return { key, required, configured: true, selector, ok: true };
+}
+
+async function maybeCheckLoggedOutIndicator(page, selectors, timeout) {
+  const selector = selectorValue(selectors, "loggedOutIndicator");
+  if (!selector) {
+    return undefined;
+  }
+
+  const shortTimeout = Math.min(timeout, 1500);
+  try {
+    await page.locator(selector).waitFor({ timeout: shortTimeout });
+    throw new Error("visible");
+  } catch (error) {
+    if (error instanceof Error && error.message === "visible") {
+      throw new Error("Logged-out indicator is visible; refresh the platform session before creating drafts.");
+    }
+    return {
+      key: "loggedOutIndicator",
+      required: false,
+      configured: true,
+      selector,
+      ok: true,
+      detail: "not visible during the short login guard window",
+    };
+  }
+}
+
+export async function checkDraftSetup({ platform, platformSession, screenshotPath, includeOptionalSelectors = true } = {}) {
+  if (!supportedPlatforms.has(platform)) {
+    throw new Error(`Unsupported platform for Playwright draft handler: ${platform}`);
+  }
+
+  const creatorDraftUrl = resolveCreatorDraftUrl({ platformSession, platform });
+  if (!creatorDraftUrl) {
+    throw new Error(`${platform} creator draft URL is required before checking Playwright automation.`);
+  }
+
+  const selectors = await readSelectors(platform);
+  validateSelectors(platform, selectors);
+
+  const { browser, page, timeout } = await createDraftPage({ platform, platformSession, creatorDraftUrl });
+  try {
+    const selectorChecks = [
+      await checkSelector(page, selectors, "title", timeout, true),
+      await checkSelector(page, selectors, "body", timeout, true),
+    ];
+    const optionalKeys = ["summary", "tags", "saveDraft", "savedIndicator", "resultUrl", "loginIndicator"];
+    if (includeOptionalSelectors) {
+      for (const key of optionalKeys) {
+        selectorChecks.push(await checkSelector(page, selectors, key, timeout, false));
+      }
+      const loggedOutCheck = await maybeCheckLoggedOutIndicator(page, selectors, timeout);
+      if (loggedOutCheck) {
+        selectorChecks.push(loggedOutCheck);
+      }
+    }
+
+    if (screenshotPath) {
+      const path = await import("node:path");
+      const fs = await import("node:fs/promises");
+      await fs.mkdir(path.dirname(screenshotPath), { recursive: true });
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+    }
+
+    return {
+      ok: true,
+      platform,
+      creatorDraftUrl: page.url(),
+      sessionAuthModes: summarizeSessionAuthModes(platformSession),
+      selectors: selectorChecks,
+      ...(screenshotPath ? { screenshotPath } : {}),
+    };
+  } finally {
+    await browser.close();
+  }
+}
+
 export async function createDraft({ platform, workOrder, platformSession, sessionSummary }) {
   if (!supportedPlatforms.has(platform)) {
     throw new Error(`Unsupported platform for Playwright draft handler: ${platform}`);
@@ -201,30 +332,10 @@ export async function createDraft({ platform, workOrder, platformSession, sessio
   const selectors = await readSelectors(platform);
   validateSelectors(platform, selectors);
 
-  const timeout = readInteger("DRAFT_AUTOMATION_PLAYWRIGHT_TIMEOUT_MS", 30000);
-  const headless = readBoolean("DRAFT_AUTOMATION_PLAYWRIGHT_HEADLESS", true);
-  const clickSave = readBoolean(`DRAFT_AUTOMATION_${platform.toUpperCase()}_PLAYWRIGHT_CLICK_SAVE`, readBoolean("DRAFT_AUTOMATION_PLAYWRIGHT_CLICK_SAVE", true));
-  const browserChannel = readEnv("DRAFT_AUTOMATION_PLAYWRIGHT_BROWSER_CHANNEL");
-  const { chromium } = await importPlaywright();
-  const browser = await chromium.launch({
-    headless,
-    ...(browserChannel ? { channel: browserChannel } : {}),
-  });
+  const { timeout, clickSave } = readPlaywrightSettings(platform);
+  const { browser, page } = await createDraftPage({ platform, platformSession, creatorDraftUrl });
 
   try {
-    const storageState = createStorageState(platformSession);
-    const context = await browser.newContext({
-      ...(storageState ? { storageState } : {}),
-    });
-    const cookies = parseCookieHeader(platformSession?.cookies, platformSession?.creatorBaseUrl ?? creatorDraftUrl);
-    if (cookies.length > 0) {
-      await context.addCookies(cookies);
-    }
-
-    const page = await context.newPage();
-    page.setDefaultTimeout?.(timeout);
-    await page.goto(creatorDraftUrl, { waitUntil: "domcontentloaded", timeout });
-
     const draft = workOrder.draft ?? {};
     await fillSelector(page, selectorValue(selectors, "title"), draft.title);
     await fillSelector(page, selectorValue(selectors, "summary"), draft.summary);

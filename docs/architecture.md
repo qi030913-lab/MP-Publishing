@@ -42,6 +42,8 @@
 
 补充：`scripts/handlers/playwright-draft-handler.mjs` 是首个可复用 browser automation handler，按平台读取 creator draft URL、session 和 `DRAFT_AUTOMATION_<PLATFORM>_PLAYWRIGHT_SELECTORS_JSON` / `*_SELECTORS_PATH`，只执行打开创作者草稿页、填标题/摘要/正文/标签、点击显式配置的 save-draft selector、等待保存反馈并提取草稿 URL/ID；默认不查找也不点击发布按钮，便于知乎 / B站 / 小红书后续按真实页面 selector 接入。
 
+补充：`pnpm drafts:check-playwright -- --platform <platform>` 会复用同一套 Playwright 配置打开创作者草稿页，只检查登录态、必需 selector（title/body）和已配置的可选 selector，并可输出截图；它不会填写字段、不会点击保存草稿，适合在把知乎 / B站 / 小红书真实 selector 接进 automation service 前做页面预演。
+
 ## 1. 目标
 
 面向公众号、知乎、B站、小红书等内容平台，提供一个统一的创作与发布工具，解决以下问题：

@@ -1139,6 +1139,160 @@ export async function createDraft({ platform, workOrder, runner, platformSession
   }
 }
 
+async function runDraftPlaywrightSetupCheckScriptCheck() {
+  const checkDir = path.join(runtimeDir, `draft-playwright-setup-check-e2e-${Date.now()}`);
+  const fakePlaywrightPath = path.join(checkDir, "fake-playwright.mjs");
+  const operationLogPath = path.join(checkDir, "operations.json");
+  const screenshotDir = path.join(checkDir, "screenshots");
+  fs.rmSync(checkDir, { recursive: true, force: true });
+  fs.mkdirSync(checkDir, { recursive: true });
+  fs.writeFileSync(
+    fakePlaywrightPath,
+    `
+import fs from "node:fs";
+
+const logPath = process.env.FAKE_PLAYWRIGHT_LOG_PATH;
+const operations = [];
+let currentUrl = "";
+
+function log(entry) {
+  operations.push(entry);
+  fs.writeFileSync(logPath, JSON.stringify(operations, null, 2), "utf8");
+}
+
+function locator(selector) {
+  return {
+    async fill(value) {
+      log({ action: "fill", selector, value });
+    },
+    async click(options) {
+      log({ action: "click", selector, timeout: options?.timeout });
+    },
+    async waitFor(options) {
+      log({ action: "waitFor", selector, timeout: options?.timeout });
+    },
+    async getAttribute(attribute) {
+      log({ action: "getAttribute", selector, attribute });
+      return currentUrl;
+    },
+  };
+}
+
+export const chromium = {
+  async launch(options) {
+    log({ action: "launch", headless: options?.headless, channel: options?.channel });
+    return {
+      async newContext(options) {
+        log({ action: "newContext", hasStorageState: Boolean(options?.storageState) });
+        return {
+          async addCookies(cookies) {
+            log({ action: "addCookies", names: cookies.map((cookie) => cookie.name) });
+          },
+          async newPage() {
+            log({ action: "newPage" });
+            return {
+              setDefaultTimeout(timeout) {
+                log({ action: "setDefaultTimeout", timeout });
+              },
+              async goto(url, options) {
+                currentUrl = url;
+                log({ action: "goto", url, waitUntil: options?.waitUntil, timeout: options?.timeout });
+              },
+              locator,
+              async screenshot(options) {
+                log({ action: "screenshot", path: options?.path, fullPage: options?.fullPage });
+                fs.writeFileSync(options.path, "fake screenshot", "utf8");
+              },
+              url() {
+                return currentUrl;
+              },
+            };
+          },
+        };
+      },
+      async close() {
+        log({ action: "close" });
+      },
+    };
+  },
+};
+`.trim(),
+    "utf8",
+  );
+
+  try {
+    const command = await runNodeCommand(
+      "draft playwright setup checker",
+      [
+        path.join(root, "scripts/check-draft-playwright-setup.mjs"),
+        "--platform",
+        "zhihu",
+        "--screenshot-dir",
+        screenshotDir,
+        "--timeout-ms",
+        "2468",
+      ],
+      {
+        DRAFT_AUTOMATION_PLAYWRIGHT_MODULE: pathToFileURL(fakePlaywrightPath).href,
+        DRAFT_AUTOMATION_PLAYWRIGHT_HEADLESS: "true",
+        DRAFT_AUTOMATION_ZHIHU_COOKIES: "SESSION=zhihu-check-cookie",
+        DRAFT_AUTOMATION_ZHIHU_STORAGE_STATE_JSON: "{\"cookies\":[],\"origins\":[]}",
+        DRAFT_AUTOMATION_ZHIHU_CREATOR_DRAFT_URL: "https://creator.zhihu.example.test/drafts/new",
+        DRAFT_AUTOMATION_ZHIHU_CREATOR_BASE_URL: "https://creator.zhihu.example.test",
+        DRAFT_AUTOMATION_ZHIHU_PLAYWRIGHT_SELECTORS_JSON: JSON.stringify({
+          title: "#title",
+          summary: "#summary",
+          body: "#body",
+          tags: "#tags",
+          saveDraft: "#save-draft",
+          savedIndicator: "#saved",
+          resultUrl: "#draft-link",
+          loginIndicator: "#account-menu",
+        }),
+        FAKE_PLAYWRIGHT_LOG_PATH: operationLogPath,
+      },
+    );
+    const result = JSON.parse(command.stdout);
+    const operations = JSON.parse(fs.readFileSync(operationLogPath, "utf8"));
+    const screenshotPath = path.join(screenshotDir, "zhihu-draft-setup.png");
+    const checkedSelectors = new Set(result.results?.[0]?.selectors?.filter((item) => item.configured).map((item) => item.key));
+
+    if (
+      result.ok !== true ||
+      result.results?.[0]?.platform !== "zhihu" ||
+      result.results?.[0]?.session?.hasCookies !== true ||
+      result.results?.[0]?.session?.hasStorageStateJson !== true ||
+      !checkedSelectors.has("title") ||
+      !checkedSelectors.has("body") ||
+      !checkedSelectors.has("loginIndicator") ||
+      !fs.existsSync(screenshotPath) ||
+      !operations.some((item) => item.action === "goto" && item.url === "https://creator.zhihu.example.test/drafts/new") ||
+      !operations.some((item) => item.action === "addCookies" && item.names.includes("SESSION")) ||
+      !operations.some((item) => item.action === "newContext" && item.hasStorageState === true) ||
+      !operations.some((item) => item.action === "waitFor" && item.selector === "#title") ||
+      !operations.some((item) => item.action === "waitFor" && item.selector === "#body") ||
+      !operations.some((item) => item.action === "screenshot" && item.path === screenshotPath) ||
+      operations.some((item) => item.action === "fill" || item.action === "click")
+    ) {
+      throw new Error(
+        `Draft Playwright setup checker did not validate selectors without editing the page: ${JSON.stringify({
+          result,
+          operations,
+        })}`,
+      );
+    }
+
+    return {
+      platform: result.results[0].platform,
+      selectorKeys: Array.from(checkedSelectors).sort(),
+      screenshotCreated: fs.existsSync(screenshotPath),
+      editedPage: operations.some((item) => item.action === "fill" || item.action === "click"),
+    };
+  } finally {
+    fs.rmSync(checkDir, { recursive: true, force: true });
+  }
+}
+
 async function runDraftPlaywrightHandlerCheck() {
   const automationPort = await getFreePort();
   const automationBaseUrl = `http://127.0.0.1:${automationPort}`;
@@ -4277,6 +4431,7 @@ const upstreamContractCheck = await runUpstreamContractCheckScriptCheck();
 const upstreamSandboxCheck = await runUpstreamSandboxScriptCheck();
 const draftAutomationServiceCheck = await runDraftAutomationServiceScriptCheck();
 const draftAutomationDirectUpstreamCheck = await runDraftAutomationDirectUpstreamCheck();
+const draftPlaywrightSetupCheck = await runDraftPlaywrightSetupCheckScriptCheck();
 const draftPlaywrightHandlerCheck = await runDraftPlaywrightHandlerCheck();
 const upstreamSandboxCallback = await runUpstreamSandboxCallbackCheck();
 const upstreamProxyEnablement = await runUpstreamProxyEnablementCheck();
@@ -4712,6 +4867,7 @@ try {
     upstreamSandboxCheck,
     draftAutomationServiceCheck,
     draftAutomationDirectUpstreamCheck,
+    draftPlaywrightSetupCheck,
     draftPlaywrightHandlerCheck,
     upstreamSandboxCallback,
     upstreamProxyEnablement,
