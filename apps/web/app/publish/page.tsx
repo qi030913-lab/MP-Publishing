@@ -5,10 +5,10 @@ import { PlayCircle, RadioTower, Rocket, ShieldCheck } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 
-import { listAccounts, runPublishAction } from "../lib/api";
+import { getRuntimeStatus, listAccounts, runPublishAction } from "../lib/api";
 import { loadDraft, saveActiveTaskId, saveDraft } from "../lib/draft-store";
 import { platformLabel } from "../lib/platforms";
-import type { DraftDocument, PlatformAccount } from "../lib/types";
+import type { DraftDocument, PlatformAccount, RuntimeStatus } from "../lib/types";
 import { PlatformPicker } from "../components/platform-picker";
 import {
   EmptyState,
@@ -32,10 +32,25 @@ function healthLabel(health: PlatformAccount["health"]) {
   return "需要登录";
 }
 
+function connectorTone(status: RuntimeStatus["draftConnector"]["status"]): "success" | "warning" | "danger" | "info" {
+  if (status === "online") return "success";
+  if (status === "configured") return "warning";
+  if (status === "offline") return "danger";
+  return "info";
+}
+
+function connectorLabel(status: RuntimeStatus["draftConnector"]["status"]) {
+  if (status === "online") return "连接器在线";
+  if (status === "configured") return "端点已配置";
+  if (status === "offline") return "连接器离线";
+  return "未配置";
+}
+
 export default function PublishPage() {
   const router = useRouter();
   const [draft, setDraft] = useState<DraftDocument | null>(null);
   const [accounts, setAccounts] = useState<PlatformAccount[]>([]);
+  const [runtime, setRuntime] = useState<RuntimeStatus | null>(null);
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([]);
   const [isSimulating, setIsSimulating] = useState(false);
   const [isPublishing, setIsPublishing] = useState(false);
@@ -56,12 +71,13 @@ export default function PublishPage() {
     const storedDraft = loadDraft();
     setDraft(storedDraft);
 
-    void listAccounts()
-      .then((payload) => {
+    void Promise.all([listAccounts(), getRuntimeStatus()])
+      .then(([payload, runtimePayload]) => {
         setAccounts(payload.items);
         setSelectedAccountIds(payload.items.map((account) => account.id));
+        setRuntime(runtimePayload);
       })
-      .catch(() => setError("读取账号列表失败，请确认 API 服务已经启动。"));
+      .catch(() => setError("读取发布运行状态失败，请确认 API 服务已经启动。"));
   }, []);
 
   function toggleAccount(accountId: string) {
@@ -180,6 +196,41 @@ export default function PublishPage() {
             <div className="field" style={{ marginTop: 18 }}>
               <span>目标平台</span>
               <PlatformPicker value={draft.platforms} onChange={updatePlatforms} />
+            </div>
+
+            <div className="subsection" style={{ marginTop: 18 }}>
+              <div className="panel-header">
+                <div>
+                  <h3>真实草稿连接器</h3>
+                  <p className="page-description">
+                    {runtime?.draftConnector.detail ?? "正在读取连接器状态。"}
+                  </p>
+                </div>
+                {runtime?.draftConnector ? (
+                  <StatusBadge tone={connectorTone(runtime.draftConnector.status)}>
+                    {connectorLabel(runtime.draftConnector.status)}
+                  </StatusBadge>
+                ) : null}
+              </div>
+              <div className="issue-list">
+                {runtime?.draftConnector.platforms.map((platformStatus) => (
+                  <div key={platformStatus.platform} className="issue-item info">
+                    <RadioTower size={18} />
+                    <div>
+                      <strong>{platformLabel(platformStatus.platform)}</strong>
+                      <p>
+                        {platformStatus.realPublishEnabled ? "真实草稿已启用" : "真实草稿未启用"} /{" "}
+                        {platformStatus.draftEndpoint ? "draft endpoint 已配置" : "缺少 draft endpoint"}
+                      </p>
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {runtime?.draftConnector.outboxUrl ? (
+                <a className="secondary-button compact" href={runtime.draftConnector.outboxUrl} target="_blank" rel="noreferrer">
+                  打开草稿收件箱
+                </a>
+              ) : null}
             </div>
 
             <div className="subsection" style={{ marginTop: 18 }}>

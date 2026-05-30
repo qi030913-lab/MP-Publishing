@@ -61,6 +61,11 @@ function runtimeFallback(): RuntimeStatus {
       manualActionCount: 0,
       succeededCount: 0,
     },
+    draftConnector: {
+      status: "unconfigured",
+      detail: "Draft connector status is unavailable while the API is offline.",
+      platforms: [],
+    },
   };
 }
 

@@ -48,6 +48,7 @@ pnpm --filter @mp-publishing/web dev
 For local Zhihu, Bilibili, and Xiaohongshu draft publishing, run `apps/draft-connector` and set the corresponding `*_REAL_PUBLISH_ENABLED=true`.
 With `DRAFT_CONNECTOR_BASE_URL=http://localhost:3010`, per-platform draft and status endpoints are inferred automatically.
 The local connector returns browsable draft detail URLs such as `http://localhost:3010/zhihu/drafts/<id>` and outbox list views at `http://localhost:3010/drafts` or `/:platform/drafts`; set `DRAFT_CONNECTOR_PUBLIC_BASE_URL` when it runs behind a proxy.
+The API exposes connector readiness in `/runtime/status`, and the publish page shows whether the draft connector is online before creating real draft tasks.
 
 Verify the local publishing chain after a build:
 
@@ -57,7 +58,7 @@ pnpm test:draft-connectors
 ```
 
 This starts the built API and worker, creates a simulated publish task through HTTP, waits for BullMQ consumption, and checks that Postgres task state is updated successfully.
-The draft connector test starts the built local draft connector and verifies that Zhihu, Bilibili, and Xiaohongshu can create real-draft task results, browsable draft detail URLs, outbox list entries, local outbox draft files, and manual status sync results when their connector endpoints are configured.
+The draft connector test starts the built local draft connector and verifies connector readiness reporting, Zhihu/Bilibili/Xiaohongshu real-draft task results, browsable draft detail URLs, outbox list entries, local outbox draft files, and manual status sync results when their connector endpoints are configured.
 
 Required local services:
 

@@ -191,6 +191,11 @@ const draftConnector = startService("draft-connector", ["apps/draft-connector/di
 try {
   await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector");
   await waitForApi(api);
+  const initialRuntime = await requestJson("/runtime/status");
+  if (initialRuntime.draftConnector?.status !== "online" || initialRuntime.draftConnector?.outboxUrl !== `${connectorBaseUrl}/drafts`) {
+    throw new Error(`API runtime did not report the draft connector as online: ${JSON.stringify(initialRuntime.draftConnector)}`);
+  }
+
   await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
 
   const accountsResponse = await requestJson("/accounts");
@@ -343,6 +348,10 @@ try {
       title: item.title,
       url: item.url,
     })),
+    draftConnector: {
+      status: initialRuntime.draftConnector.status,
+      outboxUrl: initialRuntime.draftConnector.outboxUrl,
+    },
     queue: runtime.queue,
   };
 

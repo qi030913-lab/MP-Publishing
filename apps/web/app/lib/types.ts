@@ -164,4 +164,17 @@ export type RuntimeStatus = {
     manualActionCount: number;
     succeededCount: number;
   };
+  draftConnector: {
+    status: "online" | "offline" | "configured" | "unconfigured";
+    baseUrl?: string;
+    outboxUrl?: string;
+    outboxDir?: string;
+    detail: string;
+    platforms: Array<{
+      platform: PlatformName;
+      realPublishEnabled: boolean;
+      draftEndpoint?: string;
+      statusEndpoint?: string;
+    }>;
+  };
 };
