@@ -575,6 +575,63 @@ async function runDraftConnectorPublicBaseRuntimeCheck() {
   }
 }
 
+async function runUpstreamContractCheckScriptCheck() {
+  const upstreamPort = await getFreePort();
+  const upstream = await startFakeUpstreamDraftService(upstreamPort, "upstream-secret");
+
+  try {
+    const command = await runNodeCommand("draft upstream contract checker", [
+      path.join(root, "scripts/check-draft-upstream-contract.mjs"),
+      "--platform",
+      "zhihu",
+      "--draft-endpoint",
+      `${upstream.baseUrl}/zhihu/drafts`,
+      "--status-endpoint",
+      `${upstream.baseUrl}/zhihu/status`,
+      "--health-endpoint",
+      `${upstream.baseUrl}/health`,
+      "--api-key",
+      "upstream-secret",
+      "--include-credential",
+      "--status-include-credential",
+    ]);
+    const result = JSON.parse(command.stdout);
+
+    if (
+      !result.ok ||
+      result.version !== "draft-connector-upstream-v1" ||
+      result.platform !== "zhihu" ||
+      result.health?.ok !== true ||
+      result.draft?.state !== "ready" ||
+      !result.draft?.remoteId?.startsWith("zhihu-upstream-") ||
+      result.status?.state !== "succeeded" ||
+      upstream.requests.length !== 1 ||
+      upstream.statusRequests.length !== 1 ||
+      !upstream.requests[0].hasCredential ||
+      !upstream.statusRequests[0].hasCredential
+    ) {
+      throw new Error(
+        `Draft upstream contract checker did not validate the fake upstream service: ${JSON.stringify({
+          result,
+          draftRequests: upstream.requests,
+          statusRequests: upstream.statusRequests,
+        })}`,
+      );
+    }
+
+    return {
+      platform: result.platform,
+      draftRemoteId: result.draft.remoteId,
+      statusState: result.status.state,
+      healthStatus: result.health.status,
+      draftCredentialForwarded: upstream.requests[0].hasCredential,
+      statusCredentialForwarded: upstream.statusRequests[0].hasCredential,
+    };
+  } finally {
+    await upstream.close();
+  }
+}
+
 async function runLocalDraftEnablementCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -3079,6 +3136,7 @@ const draftConnectorEnv = {
 };
 const workspaceEnvCheck = await runDraftConnectorWorkspaceEnvCheck();
 const publicBaseRuntime = await runDraftConnectorPublicBaseRuntimeCheck();
+const upstreamContractCheck = await runUpstreamContractCheckScriptCheck();
 const localEnablement = await runLocalDraftEnablementCheck();
 const disabledPreflight = await runDisabledDraftPreflightCheck();
 const workerConfigManualAction = await runWorkerDraftConfigManualActionCheck();
@@ -3506,6 +3564,7 @@ try {
     },
     workspaceEnvCheck,
     publicBaseRuntime,
+    upstreamContractCheck,
     localEnablement,
     disabledPreflight,
     workerConfigManualAction,
