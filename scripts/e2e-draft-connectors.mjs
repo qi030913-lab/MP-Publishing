@@ -56,6 +56,36 @@ function startServiceWithEnv(name, args, cwd, env) {
   return { name, child, stdoutPath, stderrPath };
 }
 
+async function runNodeCommand(label, args, extraEnv = {}) {
+  const env = { ...process.env, ...extraEnv };
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) {
+      delete env[key];
+    }
+  }
+
+  const child = spawn(process.execPath, args, {
+    cwd: root,
+    env,
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk) => {
+    stdout += chunk.toString();
+  });
+  child.stderr.on("data", (chunk) => {
+    stderr += chunk.toString();
+  });
+
+  const [code] = await once(child, "exit");
+  if (code !== 0) {
+    throw new Error(`${label} failed with exit code ${code}.\n${stdout}\n${stderr}`);
+  }
+
+  return { stdout, stderr };
+}
+
 async function stopService(service) {
   if (!service || service.child.exitCode !== null) {
     return;
@@ -300,6 +330,32 @@ function readDraftOutbox(outboxDir, platforms) {
   });
 }
 
+function createCleanServiceEnv(extraEnv = {}) {
+  const env = { ...process.env };
+  const isolatedKeys = new Set([
+    "PORT",
+    "PUBLISH_QUEUE_NAME",
+    "ZHIHU_REAL_PUBLISH_ENABLED",
+    "ZHIHU_DRAFT_ENDPOINT",
+    "BILIBILI_REAL_PUBLISH_ENABLED",
+    "BILIBILI_DRAFT_ENDPOINT",
+    "XIAOHONGSHU_REAL_PUBLISH_ENABLED",
+    "XIAOHONGSHU_DRAFT_ENDPOINT",
+  ]);
+
+  for (const key of Object.keys(env)) {
+    if (isolatedKeys.has(key) || key.startsWith("DRAFT_CONNECTOR_")) {
+      delete env[key];
+    }
+  }
+
+  return {
+    ...env,
+    REDIS_URL: process.env.REDIS_URL ?? "redis://127.0.0.1:6380",
+    ...extraEnv,
+  };
+}
+
 async function runDraftConnectorWorkspaceEnvCheck() {
   const connectorPort = await getFreePort();
   const upstreamPort = await getFreePort();
@@ -364,6 +420,139 @@ async function runDraftConnectorWorkspaceEnvCheck() {
   } finally {
     await stopService(service);
     fs.rmSync(workspaceEnvDir, { recursive: true, force: true });
+  }
+}
+
+async function runLocalDraftEnablementCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const apiPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const queueName = `mp-publishing-draft-enable-local-e2e-${Date.now()}`;
+  const workspaceDir = path.join(runtimeDir, `draft-enable-local-e2e-${Date.now()}`);
+  const envPath = path.join(workspaceDir, ".env");
+  const outboxDir = path.join(workspaceDir, "outbox");
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.mkdirSync(workspaceDir, { recursive: true });
+  fs.writeFileSync(path.join(workspaceDir, "pnpm-workspace.yaml"), "packages: []\n");
+
+  await runNodeCommand(
+    "enable local draft connectors",
+    [
+      path.join(root, "scripts/enable-local-draft-connectors.mjs"),
+      "--target-env-file",
+      envPath,
+    ],
+    {
+      LOCAL_DRAFT_ENV_FILE: "",
+      LOCAL_DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+      LOCAL_DRAFT_OUTBOX_DIR: outboxDir,
+    },
+  );
+
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+  const api = startServiceWithEnv(
+    "api-draft-enable-local",
+    [path.join(root, "apps/api/dist/main.js")],
+    workspaceDir,
+    createCleanServiceEnv({ PORT: String(apiPort), PUBLISH_QUEUE_NAME: queueName }),
+  );
+  const worker = startServiceWithEnv(
+    "worker-draft-enable-local",
+    [path.join(root, "apps/worker/dist/main.js")],
+    workspaceDir,
+    createCleanServiceEnv({ PUBLISH_QUEUE_NAME: queueName }),
+  );
+  const draftConnector = startServiceWithEnv(
+    "draft-connector-enable-local",
+    [path.join(root, "apps/draft-connector/dist/main.js")],
+    workspaceDir,
+    createCleanServiceEnv({ PORT: String(connectorPort) }),
+  );
+
+  try {
+    const health = await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector enable-local");
+    if (path.resolve(health.outboxDir) !== path.resolve(outboxDir)) {
+      throw new Error(`Enable-local connector did not use generated outbox dir: ${JSON.stringify(health)}`);
+    }
+
+    await waitForApi(api);
+    const runtime = await requestJson("/runtime/status");
+    if (
+      runtime.draftConnector?.status !== "online" ||
+      platforms.some((platform) => {
+        const platformStatus = runtime.draftConnector.platforms.find((item) => item.platform === platform);
+        return !platformStatus?.realPublishEnabled || platformStatus.draftEndpoint !== `${connectorBaseUrl}/${platform}/drafts`;
+      })
+    ) {
+      throw new Error(`Enable-local runtime did not expose ready connector platforms: ${JSON.stringify(runtime.draftConnector)}`);
+    }
+
+    await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for enable-local verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "本地启用脚本三平台草稿验证",
+          summary: "验证 pnpm drafts:enable-local 生成的 .env 可以直接驱动三平台 connector 草稿。",
+          body: "这条内容用于确认本地启用脚本不仅会改配置，也能让知乎、B站、小红书进入草稿连接器链路。",
+          tags: ["draft", "enable-local", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+
+    let task = created;
+    for (let i = 0; i < 50; i += 1) {
+      await delay(600);
+      task = await requestJson(`/publish/tasks/${created.id}`);
+      if (!["running", "queued"].includes(task.status)) {
+        break;
+      }
+    }
+
+    const storedDrafts = readDraftOutbox(outboxDir, platforms);
+    if (
+      task.status !== "succeeded" ||
+      storedDrafts.length !== platforms.length ||
+      platforms.some((platform) => task.results.find((item) => item.platform === platform)?.status !== "succeeded")
+    ) {
+      throw new Error(`Enable-local draft task did not create every platform draft: ${JSON.stringify({ task, storedDrafts })}`);
+    }
+
+    return {
+      taskId: task.id,
+      finalStatus: task.status,
+      platforms: task.results.map((target) => target.platform),
+      storedDrafts: storedDrafts.map((draft) => ({
+        platform: draft.platform,
+        draftId: draft.draftId,
+      })),
+      draftConnector: {
+        status: runtime.draftConnector.status,
+        outboxUrl: runtime.draftConnector.outboxUrl,
+      },
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector)]);
+    fs.rmSync(workspaceDir, { recursive: true, force: true });
+    apiBaseUrl = previousApiBaseUrl;
   }
 }
 
@@ -1112,6 +1301,7 @@ const draftConnectorEnv = {
   DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
 };
 const workspaceEnvCheck = await runDraftConnectorWorkspaceEnvCheck();
+const localEnablement = await runLocalDraftEnablementCheck();
 const disabledPreflight = await runDisabledDraftPreflightCheck();
 const offlinePreflight = await runOfflineDraftConnectorPreflightCheck();
 const offlineUpstreamPreflight = await runOfflineUpstreamDraftPreflightCheck();
@@ -1376,6 +1566,7 @@ try {
       outboxUrl: initialRuntime.draftConnector.outboxUrl,
     },
     workspaceEnvCheck,
+    localEnablement,
     disabledPreflight,
     offlinePreflight,
     offlineUpstreamPreflight,

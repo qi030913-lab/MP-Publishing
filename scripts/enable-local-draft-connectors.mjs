@@ -5,13 +5,15 @@ import { fileURLToPath } from "node:url";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 
-const defaultUpdates = new Map([
-  ["DRAFT_CONNECTOR_BASE_URL", "http://localhost:3010"],
-  ["DRAFT_CONNECTOR_OUTBOX_DIR", ".runtime/drafts"],
-  ["ZHIHU_REAL_PUBLISH_ENABLED", "true"],
-  ["BILIBILI_REAL_PUBLISH_ENABLED", "true"],
-  ["XIAOHONGSHU_REAL_PUBLISH_ENABLED", "true"],
-]);
+function createDefaultUpdates() {
+  return new Map([
+    ["DRAFT_CONNECTOR_BASE_URL", process.env.LOCAL_DRAFT_CONNECTOR_BASE_URL ?? "http://localhost:3010"],
+    ["DRAFT_CONNECTOR_OUTBOX_DIR", process.env.LOCAL_DRAFT_OUTBOX_DIR ?? ".runtime/drafts"],
+    ["ZHIHU_REAL_PUBLISH_ENABLED", "true"],
+    ["BILIBILI_REAL_PUBLISH_ENABLED", "true"],
+    ["XIAOHONGSHU_REAL_PUBLISH_ENABLED", "true"],
+  ]);
+}
 
 function parseEnvPath() {
   if (process.env.LOCAL_DRAFT_ENV_FILE) {
@@ -39,7 +41,7 @@ function quoteEnvValue(value) {
 }
 
 function updateEnvContent(content) {
-  const remaining = new Map(defaultUpdates);
+  const remaining = createDefaultUpdates();
   const lines = content.split(/\r?\n/).map((line) => {
     const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=/);
     if (!match) {
