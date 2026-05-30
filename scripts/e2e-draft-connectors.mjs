@@ -993,35 +993,29 @@ async function runUpstreamSandboxCallbackCheck() {
       throw new Error(`Async sandbox upstream did not persist successful connector callbacks: ${JSON.stringify(sandboxOutbox)}`);
     }
 
-    const workOrderCompletions = [];
-    for (const item of sandboxOutbox.items) {
-      const externalDraftId = `${item.platform}-creator-draft-${created.id}`;
-      const externalUrl = `https://creator.example.test/${item.platform}/drafts/${externalDraftId}`;
-      const completion = await requestAbsoluteJson(`${sandboxBaseUrl}/${item.platform}/work-orders/${item.remoteId}/complete`, {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          authorization: `Bearer ${sandboxApiKey}`,
-        },
-        body: JSON.stringify({
-          remoteId: externalDraftId,
-          url: externalUrl,
-          state: "ready",
-          completedBy: "e2e-work-order-completion",
-          detail: `${item.platform} creator-center draft completed through work-order e2e.`,
-        }),
-      });
-      if (!completion.ok || completion.remoteId !== externalDraftId || completion.url !== externalUrl || completion.callback?.status !== 200) {
-        throw new Error(`Sandbox work-order completion did not callback connector: ${JSON.stringify(completion)}`);
-      }
-
-      workOrderCompletions.push({
-        platform: item.platform,
-        workOrderId: item.remoteId,
-        externalDraftId,
-        externalUrl,
-      });
+    const runner = await runNodeCommand("draft work-order runner", [
+      path.join(root, "scripts/run-draft-work-order-runner.mjs"),
+      "--sandbox-base-url",
+      sandboxBaseUrl,
+      "--api-key",
+      sandboxApiKey,
+      "--external-base-url",
+      "https://creator.example.test",
+      "--external-id-prefix",
+      created.id,
+      "--completed-by",
+      "e2e-work-order-runner",
+      "--once",
+    ]);
+    const runnerResult = JSON.parse(runner.stdout);
+    if (
+      !runnerResult.ok ||
+      runnerResult.completedCount !== platforms.length ||
+      runnerResult.items?.some((item) => item.callbackStatus !== 200 || !item.callbackOk)
+    ) {
+      throw new Error(`Draft work-order runner did not complete every sandbox work order: ${JSON.stringify(runnerResult)}`);
     }
+    const workOrderCompletions = runnerResult.items;
 
     const completedCallbackDrafts = [];
     for (let attempt = 0; attempt < 30; attempt += 1) {
