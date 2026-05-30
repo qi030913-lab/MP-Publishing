@@ -391,20 +391,54 @@ export class PublishService {
       const runtimeAccount = target.account?.id ? await findAccountById(target.account.id) : null;
       target.account = runtimeAccount ?? target.account;
       target.attemptCount += 1;
-      target.status = this.resolveInitialTargetStatus(target.account);
+      const initialStatus = this.resolveInitialTargetStatus(target.account);
+      const preflightIssues =
+        refreshedTask.mode === "real-publish" && initialStatus === "queued"
+          ? this.preflightRealDraftTarget(target.platform)
+          : [];
+      target.status =
+        initialStatus === "queued" && preflightIssues.length > 0 ? "needs_manual_action" : initialStatus;
+      if (refreshedTask.mode === "real-publish") {
+        target.issues = preflightIssues;
+      }
       target.startedAt = undefined;
       target.completedAt = undefined;
       target.logs.push(this.createLog("info", `已执行第 ${target.attemptCount} 次重试。`));
       refreshedTask.timeline.push(
         this.createEvent("retrying", "info", `${target.platform} 已执行第 ${target.attemptCount} 次重试。`, target.platform),
       );
-      if (!target.account) {
+      if (preflightIssues.length > 0) {
+        target.logs.push(
+          this.createLog(
+            "warning",
+            `${target.platform} real draft preflight did not pass on retry; connector configuration still needs manual action.`,
+          ),
+        );
+        refreshedTask.timeline.push(
+          this.createEvent(
+            "needs_manual_action",
+            "warning",
+            `${target.platform} retry was held before queueing because draft connector preflight did not pass.`,
+            target.platform,
+          ),
+        );
+      } else if (!target.account) {
         target.logs.push(this.createLog("warning", `${target.platform} 缺少账号绑定，重试后仍需人工处理。`));
         refreshedTask.timeline.push(
           this.createEvent(
             "needs_manual_action",
             "warning",
             `${target.platform} 重试后仍缺少账号绑定。`,
+            target.platform,
+          ),
+        );
+      } else if (target.account.health === "needs-login") {
+        target.logs.push(this.createLog("warning", `${target.platform} 账号需要登录，重试后仍需人工处理。`));
+        refreshedTask.timeline.push(
+          this.createEvent(
+            "needs_manual_action",
+            "warning",
+            `${target.platform} 重试后账号仍需要登录。`,
             target.platform,
           ),
         );

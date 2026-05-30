@@ -212,11 +212,40 @@ async function runDisabledDraftPreflightCheck() {
       throw new Error(`Draft preflight did not mark disabled connector target correctly: ${JSON.stringify(created)}`);
     }
 
+    const retried = await requestJson(`/publish/tasks/${created.id}/retry`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ platform: "zhihu" }),
+    });
+    const retryTarget = retried.results.find((item) => item.platform === "zhihu");
+    const retryIssueCodes = retryTarget?.issues?.map((issue) => issue.code) ?? [];
+    const runtimeAfterRetry = await requestJson("/runtime/status");
+
+    if (
+      retried.status !== "needs_manual_action" ||
+      retryTarget?.status !== "needs_manual_action" ||
+      !retryIssueCodes.includes("ZHIHU_REAL_PUBLISH_DISABLED") ||
+      !retryIssueCodes.includes("ZHIHU_DRAFT_ENDPOINT_MISSING")
+    ) {
+      throw new Error(`Draft preflight retry did not keep disabled connector target on manual action: ${JSON.stringify(retried)}`);
+    }
+
+    if (
+      runtimeAfterRetry.queue.waiting > 0 ||
+      runtimeAfterRetry.queue.active > 0 ||
+      runtimeAfterRetry.queue.delayed > 0 ||
+      runtimeAfterRetry.queue.failed > 0
+    ) {
+      throw new Error(`Draft preflight retry should not enqueue work while connector is disabled: ${JSON.stringify(runtimeAfterRetry.queue)}`);
+    }
+
     return {
       taskId: created.id,
-      status: created.status,
-      targetStatus: target.status,
-      issueCodes,
+      status: retried.status,
+      targetStatus: retryTarget.status,
+      attemptCount: retryTarget.attemptCount,
+      issueCodes: retryIssueCodes,
+      queue: runtimeAfterRetry.queue,
     };
   } finally {
     await stopService(api);

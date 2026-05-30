@@ -51,6 +51,7 @@ The local connector returns browsable draft detail URLs such as `http://localhos
 The API exposes connector readiness in `/runtime/status`, and the publish page shows whether the draft connector is online before creating real draft tasks.
 When a real draft target is not enabled or has no draft endpoint, the API marks that target as needing manual action before it reaches the worker queue.
 Task details show target-level validation issues so connector preflight failures are visible without reading raw logs.
+Retrying a real draft target reruns connector preflight first, so unresolved connector configuration issues stay in manual action instead of entering the worker queue.
 
 Verify the local publishing chain after a build:
 
@@ -60,7 +61,7 @@ pnpm test:draft-connectors
 ```
 
 This starts the built API and worker, creates a simulated publish task through HTTP, waits for BullMQ consumption, and checks that Postgres task state is updated successfully.
-The draft connector test starts the built local draft connector and verifies disabled-connector preflight behavior, connector readiness reporting, Zhihu/Bilibili/Xiaohongshu real-draft task results, browsable draft detail URLs, outbox list entries, local outbox draft files, and manual status sync results when their connector endpoints are configured.
+The draft connector test starts the built local draft connector and verifies disabled-connector preflight behavior, retry preflight queue protection, connector readiness reporting, Zhihu/Bilibili/Xiaohongshu real-draft task results, browsable draft detail URLs, outbox list entries, local outbox draft files, and manual status sync results when their connector endpoints are configured.
 
 Required local services:
 
