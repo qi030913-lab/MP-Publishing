@@ -19,7 +19,7 @@ function parseEnvPath() {
   }
 
   const args = process.argv.slice(2);
-  const index = args.findIndex((arg) => arg === "--env-file" || arg.startsWith("--env-file="));
+  const index = args.findIndex((arg) => arg === "--target-env-file" || arg.startsWith("--target-env-file="));
 
   if (index === -1) {
     return path.join(root, ".env");
@@ -28,7 +28,7 @@ function parseEnvPath() {
   const arg = args[index];
   const value = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : args[index + 1];
   if (!value) {
-    throw new Error("Missing value for --env-file.");
+    throw new Error("Missing value for --target-env-file.");
   }
 
   return path.resolve(root, value);
