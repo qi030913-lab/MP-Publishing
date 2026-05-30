@@ -76,7 +76,8 @@ function taskModeLabel(mode: PublishTaskSummary["mode"] | PublishTaskDetail["mod
   return "mock 发布";
 }
 
-function resultLinkLabel(url: string) {
+function resultLinkLabel(url: string, mode: PublishTaskDetail["mode"]) {
+  if (mode === "real-publish") return "打开草稿";
   if (url.includes("/drafts/") || url.startsWith("draft-outbox://") || url.includes("://draft/")) return "打开草稿";
   if (url.startsWith("https://example.com/")) return "打开 mock 链接";
   return "打开发布结果";
@@ -347,7 +348,7 @@ export default function TasksPage() {
 
                       {result.url ? (
                         <a className="ghost-button compact" href={result.url} target="_blank" rel="noreferrer">
-                          {resultLinkLabel(result.url)}
+                          {resultLinkLabel(result.url, activeTask.mode)}
                         </a>
                       ) : null}
 
