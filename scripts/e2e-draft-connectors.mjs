@@ -1844,7 +1844,12 @@ async function runUpstreamDraftRejectionManualActionCheck() {
       headers: { "content-type": "application/json" },
       body: JSON.stringify({}),
     });
-    if (platforms.some((platform) => retried.results.find((item) => item.platform === platform)?.status !== "queued")) {
+    if (
+      platforms.some((platform) => {
+        const target = retried.results.find((item) => item.platform === platform);
+        return target?.status !== "queued" || target.remoteId || target.url;
+      })
+    ) {
       throw new Error(`Rejected upstream retry should enqueue every platform after upstream recovery: ${JSON.stringify(retried)}`);
     }
 

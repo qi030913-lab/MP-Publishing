@@ -518,6 +518,11 @@ export class PublishService {
       if (refreshedTask.mode === "real-publish") {
         target.issues = preflightIssues;
       }
+      if (target.status === "queued") {
+        target.remoteId = undefined;
+        target.url = undefined;
+        target.screenshots = [];
+      }
       target.startedAt = undefined;
       target.completedAt = undefined;
       target.logs.push(this.createLog("info", `已执行第 ${target.attemptCount} 次重试。`));
