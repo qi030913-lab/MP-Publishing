@@ -4,6 +4,7 @@ import { createServer } from "node:http";
 import path from "node:path";
 import { once } from "node:events";
 import { setTimeout as delay } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
 
 const root = process.cwd();
 const runtimeDir = path.join(root, ".runtime");
@@ -969,6 +970,208 @@ export async function createDraft({ platform, workOrder, runner, platformSession
       url: created.url,
       mode: detail.mode,
       sessionReady: zhihuSession.ready,
+    };
+  } finally {
+    await stopService(automation);
+    fs.rmSync(automationDir, { recursive: true, force: true });
+  }
+}
+
+async function runDraftPlaywrightHandlerCheck() {
+  const automationPort = await getFreePort();
+  const automationBaseUrl = `http://127.0.0.1:${automationPort}`;
+  const automationDir = path.join(runtimeDir, `draft-playwright-handler-e2e-${Date.now()}`);
+  const outboxDir = path.join(automationDir, "outbox");
+  const fakePlaywrightPath = path.join(automationDir, "fake-playwright.mjs");
+  const operationLogPath = path.join(automationDir, "operations.json");
+  const apiKey = "automation-secret";
+  fs.rmSync(automationDir, { recursive: true, force: true });
+  fs.mkdirSync(automationDir, { recursive: true });
+  fs.writeFileSync(
+    fakePlaywrightPath,
+    `
+import fs from "node:fs";
+
+const logPath = process.env.FAKE_PLAYWRIGHT_LOG_PATH;
+const operations = [];
+let currentUrl = "";
+
+function log(entry) {
+  operations.push(entry);
+  fs.writeFileSync(logPath, JSON.stringify(operations, null, 2), "utf8");
+}
+
+function locator(selector) {
+  return {
+    async fill(value) {
+      log({ action: "fill", selector, value });
+    },
+    async click(options) {
+      log({ action: "click", selector, timeout: options?.timeout });
+      currentUrl = "https://creator.zhihu.example.test/drafts/real-zhihu-draft-777";
+    },
+    async waitFor(options) {
+      log({ action: "waitFor", selector, timeout: options?.timeout });
+    },
+    async getAttribute(attribute) {
+      log({ action: "getAttribute", selector, attribute });
+      return currentUrl;
+    },
+  };
+}
+
+export const chromium = {
+  async launch(options) {
+    log({ action: "launch", headless: options?.headless, channel: options?.channel });
+    return {
+      async newContext(options) {
+        log({ action: "newContext", hasStorageState: Boolean(options?.storageState) });
+        return {
+          async addCookies(cookies) {
+            log({ action: "addCookies", names: cookies.map((cookie) => cookie.name) });
+          },
+          async newPage() {
+            log({ action: "newPage" });
+            return {
+              setDefaultTimeout(timeout) {
+                log({ action: "setDefaultTimeout", timeout });
+              },
+              async goto(url, options) {
+                currentUrl = url;
+                log({ action: "goto", url, waitUntil: options?.waitUntil, timeout: options?.timeout });
+              },
+              locator,
+              async waitForURL(pattern, options) {
+                log({ action: "waitForURL", pattern, timeout: options?.timeout });
+              },
+              url() {
+                return currentUrl;
+              },
+            };
+          },
+        };
+      },
+      async close() {
+        log({ action: "close" });
+      },
+    };
+  },
+};
+`.trim(),
+    "utf8",
+  );
+
+  const automation = startService("draft-playwright-handler-check", ["scripts/start-draft-automation-service.mjs"], {
+    DRAFT_AUTOMATION_SERVICE_PORT: String(automationPort),
+    DRAFT_AUTOMATION_SERVICE_OUTBOX_DIR: outboxDir,
+    DRAFT_AUTOMATION_SERVICE_API_KEY: apiKey,
+    DRAFT_AUTOMATION_SERVICE_HANDLER_MODULE: path.join(root, "scripts/handlers/playwright-draft-handler.mjs"),
+    DRAFT_AUTOMATION_PLAYWRIGHT_MODULE: pathToFileURL(fakePlaywrightPath).href,
+    DRAFT_AUTOMATION_PLAYWRIGHT_TIMEOUT_MS: "4321",
+    DRAFT_AUTOMATION_PLAYWRIGHT_HEADLESS: "true",
+    DRAFT_AUTOMATION_ZHIHU_REQUIRE_SESSION: "true",
+    DRAFT_AUTOMATION_ZHIHU_COOKIES: "SESSION=zhihu-playwright-cookie",
+    DRAFT_AUTOMATION_ZHIHU_STORAGE_STATE_JSON: "{\"cookies\":[],\"origins\":[]}",
+    DRAFT_AUTOMATION_ZHIHU_CREATOR_DRAFT_URL: "https://creator.zhihu.example.test/drafts/new",
+    DRAFT_AUTOMATION_ZHIHU_CREATOR_BASE_URL: "https://creator.zhihu.example.test",
+    DRAFT_AUTOMATION_ZHIHU_PLAYWRIGHT_SELECTORS_JSON: JSON.stringify({
+      title: "#title",
+      summary: "#summary",
+      body: "#body",
+      tags: "#tags",
+      saveDraft: "#save-draft",
+      savedIndicator: "#saved",
+      resultUrl: "#draft-link",
+      resultUrlAttribute: "href",
+      remoteIdRegex: "drafts/([^/?#]+)",
+    }),
+    FAKE_PLAYWRIGHT_LOG_PATH: operationLogPath,
+  });
+  const authHeaders = {
+    authorization: `Bearer ${apiKey}`,
+  };
+
+  try {
+    const health = await waitForAuthorizedHealth(automation, `${automationBaseUrl}/health`, "Draft Playwright handler", apiKey);
+    const workOrder = {
+      version: "draft-upstream-work-order-v1",
+      platform: "zhihu",
+      remoteId: "zhihu-sandbox-playwright-check",
+      accountId: "acct_zhihu_main",
+      connector: {
+        draftId: "zhihu-draft-playwright-check",
+        draftUrl: "https://connector.example.test/zhihu/drafts/zhihu-draft-playwright-check",
+        statusCallbackUrl: "https://connector.example.test/zhihu/drafts/zhihu-draft-playwright-check/status",
+      },
+      draft: {
+        title: "Playwright handler check",
+        summary: "Verify configurable creator-center filling.",
+        body: "Fallback body.",
+        hashtags: ["playwright", "draft"],
+        renderedBody: "Rendered body for Playwright.",
+      },
+      automation: {
+        mode: "creator-center-draft-fill",
+        safeMode: true,
+      },
+      callbackPayloadTemplate: {
+        state: "ready",
+        remoteId: "<real-platform-draft-id>",
+        url: "<real-platform-draft-url>",
+      },
+      checklist: [{ id: "save-draft", label: "Save draft.", required: true }],
+    };
+    const created = await requestAbsoluteJson(`${automationBaseUrl}/drafts`, {
+      method: "POST",
+      headers: {
+        ...authHeaders,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        platform: "zhihu",
+        accountId: "acct_zhihu_main",
+        workOrder,
+        requestedAt: new Date().toISOString(),
+        runner: {
+          completedBy: "playwright-handler-check",
+          safeMode: true,
+        },
+      }),
+    });
+    const detail = await requestAbsoluteJson(`${automationBaseUrl}/zhihu/drafts/${created.automationDraft.automationDraftId}`, {
+      headers: authHeaders,
+    });
+    const operations = JSON.parse(fs.readFileSync(operationLogPath, "utf8"));
+    const fillBySelector = new Map(operations.filter((item) => item.action === "fill").map((item) => [item.selector, item.value]));
+
+    if (
+      health.status !== "ok" ||
+      created.remoteId !== "real-zhihu-draft-777" ||
+      created.url !== "https://creator.zhihu.example.test/drafts/real-zhihu-draft-777" ||
+      detail.mode !== "handler" ||
+      fillBySelector.get("#title") !== "Playwright handler check" ||
+      fillBySelector.get("#summary") !== "Verify configurable creator-center filling." ||
+      fillBySelector.get("#body") !== "Rendered body for Playwright." ||
+      fillBySelector.get("#tags") !== "playwright draft" ||
+      !operations.some((item) => item.action === "click" && item.selector === "#save-draft") ||
+      !operations.some((item) => item.action === "addCookies" && item.names.includes("SESSION")) ||
+      JSON.stringify(detail).includes("zhihu-playwright-cookie")
+    ) {
+      throw new Error(
+        `Draft Playwright handler did not fill and persist the expected draft handoff: ${JSON.stringify({
+          health,
+          created,
+          detail,
+          operations,
+        })}`,
+      );
+    }
+
+    return {
+      remoteId: created.remoteId,
+      url: created.url,
+      filledSelectors: Array.from(fillBySelector.keys()).sort(),
+      clickedSaveDraft: operations.some((item) => item.action === "click" && item.selector === "#save-draft"),
     };
   } finally {
     await stopService(automation);
@@ -3911,6 +4114,7 @@ const publicBaseRuntime = await runDraftConnectorPublicBaseRuntimeCheck();
 const upstreamContractCheck = await runUpstreamContractCheckScriptCheck();
 const upstreamSandboxCheck = await runUpstreamSandboxScriptCheck();
 const draftAutomationServiceCheck = await runDraftAutomationServiceScriptCheck();
+const draftPlaywrightHandlerCheck = await runDraftPlaywrightHandlerCheck();
 const upstreamSandboxCallback = await runUpstreamSandboxCallbackCheck();
 const upstreamProxyEnablement = await runUpstreamProxyEnablementCheck();
 const localEnablement = await runLocalDraftEnablementCheck();
@@ -4344,6 +4548,7 @@ try {
     upstreamContractCheck,
     upstreamSandboxCheck,
     draftAutomationServiceCheck,
+    draftPlaywrightHandlerCheck,
     upstreamSandboxCallback,
     upstreamProxyEnablement,
     localEnablement,

@@ -40,6 +40,8 @@
 
 补充：`pnpm drafts:automation-service` 提供了本地可启动的 automation endpoint，默认把 runner 投递的工单保存为可浏览的本地 handoff draft，并暴露 `/health`、`/contract`、`/drafts` 和 `/:platform/drafts/:automationDraftId`；配置 `DRAFT_AUTOMATION_SERVICE_HANDLER_MODULE` 后可以由外部 ESM handler 接管真实 Playwright 或官方 API 创建草稿逻辑，同时保持 runner、sandbox completion 和 connector callback 契约不变。该服务还定义了平台级 session 输入：`DRAFT_AUTOMATION_<PLATFORM>_ACCESS_TOKEN`、`*_COOKIES`、`*_STORAGE_STATE_JSON`、`*_STORAGE_STATE_PATH` 和 creator URL 会以 `platformSession` 传给 handler，健康检查和 contract 只暴露脱敏摘要；配置 `DRAFT_AUTOMATION_<PLATFORM>_REQUIRE_SESSION=true` 时，缺少登录态会在调用 handler 前拒绝工单。
 
+补充：`scripts/handlers/playwright-draft-handler.mjs` 是首个可复用 browser automation handler，按平台读取 creator draft URL、session 和 `DRAFT_AUTOMATION_<PLATFORM>_PLAYWRIGHT_SELECTORS_JSON` / `*_SELECTORS_PATH`，只执行打开创作者草稿页、填标题/摘要/正文/标签、点击显式配置的 save-draft selector、等待保存反馈并提取草稿 URL/ID；默认不查找也不点击发布按钮，便于知乎 / B站 / 小红书后续按真实页面 selector 接入。
+
 ## 1. 目标
 
 面向公众号、知乎、B站、小红书等内容平台，提供一个统一的创作与发布工具，解决以下问题：
