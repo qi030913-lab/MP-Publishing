@@ -59,6 +59,23 @@ function trimTrailingSlash(value: string) {
   return value.replace(/\/+$/, "");
 }
 
+function mergeValidationIssues(current: ValidationIssue[], incoming: ValidationIssue[] = []) {
+  const seen = new Set<string>();
+  const merged: ValidationIssue[] = [];
+
+  for (const issue of [...current, ...incoming]) {
+    const key = `${issue.code}\u0000${issue.severity}\u0000${issue.message}`;
+    if (seen.has(key)) {
+      continue;
+    }
+
+    seen.add(key);
+    merged.push(issue);
+  }
+
+  return merged;
+}
+
 function isLocalConnectorHost(hostname: string) {
   const normalized = hostname.toLowerCase();
   return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
@@ -651,7 +668,7 @@ export class PublishService {
       target.status = nextTargetStatus;
       target.remoteId = status.remoteId ?? target.remoteId;
       target.url = status.url ?? target.url;
-      target.issues = [...target.issues, ...(status.issues ?? [])];
+      target.issues = mergeValidationIssues(target.issues, status.issues);
       target.logs.push(this.createLog(nextTargetStatus === "failed" ? "error" : "info", message));
       target.completedAt = nextTargetStatus === "running" ? undefined : this.createTimestamp();
       refreshedTask.timeline.push(

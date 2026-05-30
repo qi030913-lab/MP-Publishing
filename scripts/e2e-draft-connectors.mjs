@@ -1838,6 +1838,39 @@ async function runUpstreamDraftRejectionManualActionCheck() {
       }
     }
 
+    const syncedRejected = await requestJson(`/publish/tasks/${created.id}/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const resyncedRejected = await requestJson(`/publish/tasks/${created.id}/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    for (const platform of platforms) {
+      const beforeSync = task.results.find((item) => item.platform === platform);
+      const afterSync = syncedRejected.results.find((item) => item.platform === platform);
+      const afterSecondSync = resyncedRejected.results.find((item) => item.platform === platform);
+      if (
+        !beforeSync ||
+        afterSync?.status !== "needs_manual_action" ||
+        afterSecondSync?.status !== "needs_manual_action" ||
+        afterSync.remoteId !== beforeSync.remoteId ||
+        afterSecondSync.remoteId !== beforeSync.remoteId ||
+        afterSync.url !== beforeSync.url ||
+        afterSecondSync.url !== beforeSync.url ||
+        afterSync.issues.length !== beforeSync.issues.length ||
+        afterSecondSync.issues.length !== beforeSync.issues.length
+      ) {
+        throw new Error(`Rejected upstream status sync should preserve state and dedupe issues for ${platform}: ${JSON.stringify({
+          beforeSync,
+          afterSync,
+          afterSecondSync,
+        })}`);
+      }
+    }
+
     upstreamOptions.rejectDrafts = false;
     const retried = await requestJson(`/publish/tasks/${created.id}/retry`, {
       method: "POST",
@@ -1897,6 +1930,13 @@ async function runUpstreamDraftRejectionManualActionCheck() {
       rejectedStatus: task.status,
       finalStatus: recoveredTask.status,
       targets: task.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        remoteId: target.remoteId,
+        url: target.url,
+        issueCodes: target.issues.map((issue) => issue.code),
+      })),
+      syncedRejectedTargets: syncedRejected.results.map((target) => ({
         platform: target.platform,
         status: target.status,
         remoteId: target.remoteId,
