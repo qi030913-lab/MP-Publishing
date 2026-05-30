@@ -94,7 +94,7 @@ export class PublishService {
   }
 
   private mapRemoteStateToTargetStatus(state: PublishStatus["state"]): PublishTaskTargetRecord["status"] {
-    if (state === "succeeded") {
+    if (state === "succeeded" || state === "draft" || state === "ready" || state === "partially_succeeded") {
       return "succeeded";
     }
 
@@ -174,10 +174,6 @@ export class PublishService {
     mode: PublishTaskMode,
     input: SimulatePublishDto | PublishMockDto | PublishRealDto,
   ): Promise<PublishTaskRecord> {
-    if (mode === "real-publish" && input.platforms.some((platform) => platform !== "wechat")) {
-      throw new BadRequestException("real publish is currently enabled for wechat only");
-    }
-
     const accounts = (await listAccounts()).filter((account) => input.accountIds.includes(account.id));
     const taskCreatedAt = this.createTimestamp();
 
@@ -370,9 +366,13 @@ export class PublishService {
     }
 
     const refreshedTask = await this.refreshTaskAccounts(task);
-    const targets = refreshedTask.targets.filter((target) =>
-      input.platform ? target.platform === input.platform : target.platform === "wechat",
-    );
+    const targets = refreshedTask.targets.filter((target) => {
+      if (input.platform) {
+        return target.platform === input.platform;
+      }
+
+      return refreshedTask.mode === "real-publish" || target.platform === "wechat";
+    });
 
     if (targets.length === 0) {
       throw new BadRequestException("no syncable publish targets found");

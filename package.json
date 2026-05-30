@@ -14,6 +14,7 @@
     "infra:up": "docker compose up -d postgres redis",
     "infra:down": "docker compose down",
     "lint": "turbo run lint",
+    "test:draft-connectors": "node scripts/e2e-draft-connectors.mjs",
     "test:publish-flow": "node scripts/e2e-publish-flow.mjs",
     "typecheck": "turbo run typecheck",
     "format": "turbo run format"

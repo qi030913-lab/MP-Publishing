@@ -100,14 +100,20 @@ export default function PublishPage() {
     }
   }
 
-  async function submitRealWechat() {
+  async function submitRealDraft() {
     if (!draft) {
       return;
     }
 
-    const wechatAccount = selectedAccounts.find((account) => account.platform === "wechat");
-    if (!wechatAccount) {
-      setError("请先选择一个公众号账号。");
+    const realDraftPlatforms = draft.platforms.filter((platform) =>
+      selectedAccounts.some((account) => account.platform === platform),
+    );
+    const realDraftAccountIds = selectedAccounts
+      .filter((account) => realDraftPlatforms.includes(account.platform))
+      .map((account) => account.id);
+
+    if (realDraftPlatforms.length === 0) {
+      setError("请先为目标平台选择可用账号。");
       return;
     }
 
@@ -115,11 +121,11 @@ export default function PublishPage() {
     setIsRealPublishing(true);
 
     try {
-      const task = await runPublishAction("real", { ...draft, platforms: ["wechat"] }, [wechatAccount.id]);
+      const task = await runPublishAction("real", { ...draft, platforms: realDraftPlatforms }, realDraftAccountIds);
       saveActiveTaskId(task.id);
       router.push("/tasks");
     } catch {
-      setError("公众号真实发布任务创建失败，请检查 API 服务和公众号凭证配置。");
+      setError("真实草稿任务创建失败，请检查 API 服务、平台账号和连接器配置。");
     } finally {
       setIsRealPublishing(false);
     }
@@ -130,7 +136,7 @@ export default function PublishPage() {
       <PageHeader
         kicker="Publish"
         title="发布确认"
-        description="发布前确认目标平台、账号健康状态和执行模式。当前真实发布仍是 dry-run/mock 链路。"
+        description="发布前确认目标平台、账号健康状态和执行模式。真实发布默认进入平台草稿或连接器草稿，不会越过平台最终确认。"
         actions={
           <>
             <button className="secondary-button" type="button" onClick={() => submit("simulate")} disabled={isSimulating}>
@@ -141,9 +147,9 @@ export default function PublishPage() {
               {isPublishing ? <LoadingInline label="提交中" /> : <Rocket size={18} />}
               mock 一键发布
             </button>
-            <button className="secondary-button" type="button" onClick={submitRealWechat} disabled={isRealPublishing}>
+            <button className="secondary-button" type="button" onClick={submitRealDraft} disabled={isRealPublishing}>
               {isRealPublishing ? <LoadingInline label="提交中" /> : <Rocket size={18} />}
-              公众号真实草稿
+              创建真实草稿
             </button>
           </>
         }

@@ -15,4 +15,9 @@ export const xiaohongshuAdapter = createAdapter({
   },
   intro: "小红书笔记预览偏体验感和标签氛围。",
   extraHashtags: ["#小红书运营"],
+  realDraft: {
+    envPrefix: "XIAOHONGSHU",
+    remoteIdPrefix: "xiaohongshu-draft",
+    urlScheme: "xiaohongshu",
+  },
 });

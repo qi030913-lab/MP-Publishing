@@ -25,4 +25,9 @@ export const zhihuAdapter = createAdapter({
   intro: "知乎更适合问题拆解与结论先行的内容结构。",
   bulletsStyle: "number",
   extraHashtags: ["#知乎回答"],
+  realDraft: {
+    envPrefix: "ZHIHU",
+    remoteIdPrefix: "zhihu-draft",
+    urlScheme: "zhihu",
+  },
 });

@@ -47,9 +47,11 @@ Verify the local publishing chain after a build:
 
 ```bash
 pnpm test:publish-flow
+pnpm test:draft-connectors
 ```
 
 This starts the built API and worker, creates a simulated publish task through HTTP, waits for BullMQ consumption, and checks that Postgres task state is updated successfully.
+The draft connector test starts a temporary local connector and verifies that Zhihu, Bilibili, and Xiaohongshu can create real-draft task results when their connector endpoints are configured.
 
 Required local services:
 

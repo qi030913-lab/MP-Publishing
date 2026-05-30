@@ -70,6 +70,12 @@ function taskModeLabel(mode: PublishTaskSummary["mode"] | PublishTaskDetail["mod
   return "mock 发布";
 }
 
+function resultLinkLabel(url: string) {
+  if (url.includes("://draft/")) return "打开草稿引用";
+  if (url.startsWith("https://example.com/")) return "打开 mock 链接";
+  return "打开发布结果";
+}
+
 export default function TasksPage() {
   const [tasks, setTasks] = useState<PublishTaskSummary[]>([]);
   const [activeTask, setActiveTask] = useState<PublishTaskDetail | null>(null);
@@ -221,7 +227,7 @@ export default function TasksPage() {
       {tasks.length === 0 ? (
         <EmptyState
           title="暂无任务记录"
-          description="在发布确认页发起模拟发布或 mock 发布后，任务会出现在这里。"
+          description="在发布确认页发起模拟发布、mock 发布或真实草稿后，任务会出现在这里。"
           actionHref="/publish"
           actionLabel="去发布确认"
         />
@@ -335,7 +341,7 @@ export default function TasksPage() {
 
                       {result.url ? (
                         <a className="ghost-button compact" href={result.url} target="_blank" rel="noreferrer">
-                          打开 mock 链接
+                          {resultLinkLabel(result.url)}
                         </a>
                       ) : null}
 
@@ -355,7 +361,7 @@ export default function TasksPage() {
                         </button>
                       ) : null}
 
-                      {activeTask.mode === "real-publish" && result.platform === "wechat" ? (
+                      {activeTask.mode === "real-publish" ? (
                         <button
                           className="secondary-button compact"
                           type="button"

@@ -29,9 +29,11 @@
 - OAuth / Cookie Session / Token 的真实授权、刷新和加密存储
 - 平台真实发布 API、Webhook 回执、状态同步和审计日志
 
-当前大多数 adapter 的 `simulatePublish` 和 `publish` 仍是 mock/demo 行为：模拟发布返回 `simulation://...`，mock 发布返回 `dry-run-*` 和 `https://example.com/...`。
+当前 `simulatePublish` 和 mock 发布仍是 demo 行为：模拟发布返回 `simulation://...`，mock 发布返回 `dry-run-*` 和 `https://example.com/...`。
 
 公众号 adapter 已开始接入真实平台链路：在 `WECHAT_REAL_PUBLISH_ENABLED=true` 且凭证、封面素材配置完整时，可调用微信服务端接口创建真实草稿；在 `WECHAT_SUBMIT_FREEPUBLISH=true` 时才会继续提交发布。任务中心提供手动状态同步入口，公众号发布提交后可通过 `freepublish/get` 查询远程发布状态。由于授权、素材、Webhook 和审核回执仍未完整产品化，当前系统仍应视为真实发布链路联调阶段，不应用作无人值守生产发布。
+
+知乎、B站、小红书 adapter 已接入真实草稿连接器基线：在各自 `*_REAL_PUBLISH_ENABLED=true` 且 `*_DRAFT_ENDPOINT` 配置完整时，worker 会把平台化草稿投递给外部连接器，由连接器对接官方 API、创作者中心自动化或私有联调服务。连接器可选提供 `*_STATUS_ENDPOINT` 做远程状态同步。这三个平台当前还不是内置官方 API 直连实现。
 
 ## 1. 目标
 
@@ -453,8 +455,8 @@ packages/
 
 - `/preview` 仍直接从输入生成 Canonical Document 和平台草稿，不写入内容库
 - `/publish/simulate` 和 `/publish/mock` 会创建 `ContentDocument / ContentVersion / PublishJob / PublishTarget`，然后将可执行 target 投递到 BullMQ
-- `/publish/real` 当前仅允许公众号，默认受环境开关保护；可创建真实公众号草稿，并可选提交发布
-- `/publish/tasks/:taskId/sync` 当前主要用于公众号 `freepublish/get` 手动状态同步
+- `/publish/real` 默认受环境开关保护；公众号走微信服务端草稿 API，知乎 / B站 / 小红书走可配置 draft connector
+- `/publish/tasks/:taskId/sync` 当前支持公众号 `freepublish/get` 和各平台可选 `*_STATUS_ENDPOINT` 手动状态同步
 - `/accounts/*` 操作 Prisma 中的 demo 账号健康状态，不是真实平台授权
 - `/runtime/status` 用于前端任务中心展示 worker 心跳和队列统计
 

@@ -16,4 +16,9 @@ export const bilibiliAdapter = createAdapter({
   titleSuffix: " | B站稿件",
   intro: "B站稿件预览偏口语、强调观点和节奏。",
   extraHashtags: ["#B站创作"],
+  realDraft: {
+    envPrefix: "BILIBILI",
+    remoteIdPrefix: "bilibili-draft",
+    urlScheme: "bilibili",
+  },
 });
