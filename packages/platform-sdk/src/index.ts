@@ -34,10 +34,25 @@ export type PlatformDraft = {
   warnings: ValidationIssue[];
 };
 
+export type PlatformCredential = {
+  accountId: string;
+  platform: PlatformName;
+  credentialRef: string;
+  authMode: "official-api" | "cookie-session" | "hybrid";
+  appId?: string;
+  appSecret?: string;
+  accessToken?: string;
+  refreshToken?: string;
+  cookies?: string;
+  storageStateJson?: string;
+  expiresAt?: string;
+};
+
 export type PublishInput = {
   accountId: string;
   document: CanonicalDocument;
   dryRun?: boolean;
+  credential?: PlatformCredential;
 };
 
 export type SimulationResult = {

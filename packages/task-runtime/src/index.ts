@@ -7,6 +7,7 @@ import { PrismaClient, type Prisma } from "@prisma/client";
 
 import type { CanonicalDocument } from "@mp-publishing/content-model";
 import type {
+  PlatformCredential,
   PlatformName,
   ValidationIssue,
 } from "@mp-publishing/platform-sdk";
@@ -82,6 +83,8 @@ export type PlatformAccountRecord = {
   handle: string;
   authMode: "official-api" | "cookie-session" | "hybrid";
   health: PlatformAccountHealth;
+  credentialRef?: string;
+  credentialStatus: "unbound" | "missing" | "configured";
   lastCheckedAt: string;
 };
 
@@ -160,6 +163,7 @@ export type PublishTargetProcessingContext = {
   platform: PlatformName;
   attemptCount: number;
   account: PlatformAccountRecord | null;
+  credential: PlatformCredential | null;
   document: CanonicalDocument;
 };
 
@@ -178,6 +182,7 @@ const defaultAccounts: PlatformAccountRecord[] = [
     handle: "创作者实验室",
     authMode: "official-api",
     health: "healthy",
+    credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T22:00:00+08:00",
   },
   {
@@ -187,6 +192,7 @@ const defaultAccounts: PlatformAccountRecord[] = [
     handle: "内容系统设计",
     authMode: "official-api",
     health: "healthy",
+    credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T22:05:00+08:00",
   },
   {
@@ -196,6 +202,7 @@ const defaultAccounts: PlatformAccountRecord[] = [
     handle: "效率创作手记",
     authMode: "hybrid",
     health: "expiring",
+    credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T21:55:00+08:00",
   },
   {
@@ -205,6 +212,7 @@ const defaultAccounts: PlatformAccountRecord[] = [
     handle: "创作效率观察",
     authMode: "hybrid",
     health: "healthy",
+    credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T21:50:00+08:00",
   },
 ];
@@ -309,6 +317,7 @@ function mapAccount(account: {
   handle: string;
   authMode: string;
   health: string;
+  credentialRef: string | null;
   lastCheckedAt: Date;
 }): PlatformAccountRecord {
   return {
@@ -318,6 +327,8 @@ function mapAccount(account: {
     handle: account.handle,
     authMode: account.authMode as PlatformAccountRecord["authMode"],
     health: account.health as PlatformAccountHealth,
+    credentialRef: account.credentialRef ?? undefined,
+    credentialStatus: account.credentialRef ? "configured" : "unbound",
     lastCheckedAt: account.lastCheckedAt.toISOString(),
   };
 }
@@ -332,6 +343,7 @@ function mapTarget(target: {
     handle: string;
     authMode: string;
     health: string;
+    credentialRef: string | null;
     lastCheckedAt: Date;
   } | null;
   status: string;
@@ -486,6 +498,7 @@ export async function ensureRuntimeReady() {
         handle: account.handle,
         authMode: account.authMode,
         health: account.health,
+        credentialRef: account.credentialRef,
         lastCheckedAt: new Date(account.lastCheckedAt),
       },
     });
@@ -617,6 +630,7 @@ export async function updateAccount(
       handle: patch.handle,
       authMode: patch.authMode,
       health: patch.health,
+      credentialRef: patch.credentialRef,
       lastCheckedAt: patch.lastCheckedAt ? new Date(patch.lastCheckedAt) : undefined,
     },
   });
@@ -924,6 +938,7 @@ export async function startPublishTarget(targetId: string): Promise<PublishTarge
     platform: target.platform as PlatformName,
     attemptCount: target.attemptCount,
     account: target.account ? mapAccount(target.account) : null,
+    credential: null,
     document: {
       id: target.job.documentId ?? target.job.version.document.id,
       title: target.job.version.document.title,
