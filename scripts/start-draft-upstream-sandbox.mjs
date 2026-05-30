@@ -23,6 +23,16 @@ Options:
   --callback-delay-ms <ms>         Delay callback delivery; defaults to 0.
   --connector-api-key <key>        Bearer token for connector status callbacks; defaults to DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY then DRAFT_CONNECTOR_API_KEY.
   --async-response                 Return publishing without remoteId/url and rely on callback/status sync.
+
+Routes:
+  GET /drafts                      List accepted sandbox drafts.
+  GET /:platform/drafts            List accepted drafts for one platform.
+  GET /:platform/drafts/:remoteId  Read one accepted sandbox draft.
+  GET /work-orders                 List creator-center work-order summaries.
+  GET /:platform/work-orders       List work-order summaries for one platform.
+  GET /:platform/work-orders/:remoteId
+                                   Read the full creator-center fill checklist.
+
   --help`;
 
 function parseArgs(argv) {
@@ -169,8 +179,157 @@ function summarizeCredential(credential) {
   };
 }
 
+function readOptionalString(value) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function readStringArray(value) {
+  return Array.isArray(value)
+    ? value.filter((item) => typeof item === "string" && item.trim().length > 0).map((item) => item.trim())
+    : [];
+}
+
+function readValidationIssues(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((item) => item && typeof item === "object" && typeof item.code === "string" && typeof item.message === "string")
+    .map((item) => ({
+      code: item.code,
+      message: item.message,
+      severity: ["info", "warning", "error"].includes(item.severity) ? item.severity : "warning",
+    }));
+}
+
 function createExternalUrl(platform, remoteId) {
   return `https://sandbox.example.test/${platform}/${remoteId}`;
+}
+
+function createRenderedBody(draft) {
+  const segments = [readOptionalString(draft.summary), readOptionalString(draft.body)].filter(Boolean);
+  const hashtags = readStringArray(draft.hashtags);
+  return [...segments, hashtags.length > 0 ? hashtags.join(" ") : undefined].filter(Boolean).join("\n\n");
+}
+
+function createWorkOrderChecklist(platform, draft) {
+  const checklist = [
+    {
+      id: "open-creator-center",
+      label: `Open the ${platform} creator center with the intended account selected.`,
+      required: true,
+    },
+    {
+      id: "fill-title",
+      label: "Fill the platform draft title.",
+      required: true,
+      sourceField: "draft.title",
+    },
+    {
+      id: "fill-body",
+      label: "Fill the main draft body without clicking final publish.",
+      required: true,
+      sourceField: "draft.body",
+    },
+    {
+      id: "apply-tags",
+      label: "Apply hashtags or topic tags when the platform compose form supports them.",
+      required: false,
+      sourceField: "draft.hashtags",
+    },
+    {
+      id: "save-draft",
+      label: "Save as draft and capture the real platform draft id or URL.",
+      required: true,
+    },
+    {
+      id: "callback-connector",
+      label: "POST the real draft id and URL back to connector.statusCallbackUrl.",
+      required: true,
+      sourceField: "connector.statusCallbackUrl",
+    },
+  ];
+
+  if (readValidationIssues(draft.warnings).length > 0) {
+    checklist.splice(4, 0, {
+      id: "review-validation-warnings",
+      label: "Review platform validation warnings before saving the draft.",
+      required: true,
+      sourceField: "draft.warnings",
+    });
+  }
+
+  return checklist;
+}
+
+function createWorkOrder({ platform, payload, remoteId, url, statusCallbackUrl, connectorDraftId, now }) {
+  const draft = payload.draft ?? {};
+  const warnings = readValidationIssues(draft.warnings);
+  const title = readOptionalString(draft.title);
+  const summary = readOptionalString(draft.summary);
+  const body = readOptionalString(draft.body);
+  const hashtags = readStringArray(draft.hashtags);
+  const credential = summarizeCredential(payload.credential);
+
+  return {
+    version: "draft-upstream-work-order-v1",
+    platform,
+    remoteId,
+    url,
+    accountId: payload.accountId,
+    createdAt: now,
+    connector: {
+      draftId: connectorDraftId,
+      draftUrl: payload.connector?.draftUrl,
+      statusCallbackUrl,
+      callbackAuthEnv: "DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY",
+    },
+    document: {
+      id: payload.document?.id,
+      title: payload.document?.title,
+    },
+    draft: {
+      title,
+      summary,
+      body,
+      hashtags,
+      warnings,
+      renderedBody: createRenderedBody(draft),
+    },
+    credential: {
+      required: Boolean(payload.credential),
+      summary: credential,
+    },
+    automation: {
+      mode: "creator-center-draft-fill",
+      safeMode: true,
+      finalPublishMustRemainManual: true,
+      expectedResult: "A platform draft id or draft URL, not a published public URL.",
+    },
+    callbackPayloadTemplate: {
+      state: "ready",
+      remoteId,
+      url,
+      detail: `${platform} creator-center draft was saved by upstream automation.`,
+    },
+    checklist: createWorkOrderChecklist(platform, draft),
+  };
+}
+
+function summarizeWorkOrder(record) {
+  return {
+    platform: record.platform,
+    remoteId: record.remoteId,
+    url: record.url,
+    accountId: record.accountId,
+    title: record.workOrder?.draft?.title ?? record.title,
+    checklistTotal: record.workOrder?.checklist?.length ?? 0,
+    requiredChecklistTotal: record.workOrder?.checklist?.filter((item) => item.required).length ?? 0,
+    callbackUrl: record.workOrder?.connector?.statusCallbackUrl ?? record.statusCallbackUrl,
+    workOrderUrl: `/${record.platform}/work-orders/${record.remoteId}`,
+    updatedAt: record.updatedAt,
+  };
 }
 
 function draftFilePath(outboxDir, platform, remoteId) {
@@ -300,6 +459,16 @@ async function handleCreateDraft({
   const remoteId = `${platform}-sandbox-${sanitizeSegment(connectorDraftId)}`;
   const now = new Date().toISOString();
   const existing = await readRecord(outboxDir, platform, remoteId);
+  const url = createExternalUrl(platform, remoteId);
+  const workOrder = createWorkOrder({
+    platform,
+    payload,
+    remoteId,
+    url,
+    statusCallbackUrl,
+    connectorDraftId,
+    now: existing?.workOrder?.createdAt ?? now,
+  });
   const record = {
     ...(existing ?? {}),
     version: "draft-upstream-sandbox-v1",
@@ -309,10 +478,11 @@ async function handleCreateDraft({
     connectorDraftUrl: payload.connector?.draftUrl,
     statusCallbackUrl,
     remoteId,
-    url: createExternalUrl(platform, remoteId),
+    url,
     state: existing?.state ?? initialState,
     title,
     summary: payload.draft?.summary,
+    workOrder,
     hasCredential: Boolean(payload.credential),
     credential: summarizeCredential(payload.credential),
     receivedAt: existing?.receivedAt ?? now,
@@ -427,14 +597,48 @@ async function main() {
           return;
         }
 
-        const [platform, operation] = parts;
+        if (request.method === "GET" && url.pathname === "/work-orders") {
+          const records = await listRecords(outboxDir, Array.from(supportedPlatforms));
+          sendJson(response, 200, { ok: true, outboxDir, items: records.map(summarizeWorkOrder) });
+          return;
+        }
+
+        const [platform, operation, remoteId] = parts;
         if (!supportedPlatforms.has(platform)) {
           sendJson(response, 404, { ok: false, message: "Unsupported upstream sandbox platform." });
           return;
         }
 
         if (request.method === "GET" && operation === "drafts") {
+          if (remoteId) {
+            const record = await readRecord(outboxDir, platform, remoteId);
+            if (!record) {
+              sendJson(response, 404, { ok: false, message: `${platform} sandbox draft ${remoteId} was not found.` });
+              return;
+            }
+
+            sendJson(response, 200, { ok: true, outboxDir, item: record });
+            return;
+          }
+
           sendJson(response, 200, { ok: true, outboxDir, items: await listRecords(outboxDir, [platform]) });
+          return;
+        }
+
+        if (request.method === "GET" && operation === "work-orders") {
+          if (remoteId) {
+            const record = await readRecord(outboxDir, platform, remoteId);
+            if (!record?.workOrder) {
+              sendJson(response, 404, { ok: false, message: `${platform} sandbox work order ${remoteId} was not found.` });
+              return;
+            }
+
+            sendJson(response, 200, { ok: true, outboxDir, workOrder: record.workOrder });
+            return;
+          }
+
+          const records = await listRecords(outboxDir, [platform]);
+          sendJson(response, 200, { ok: true, outboxDir, items: records.map(summarizeWorkOrder) });
           return;
         }
 

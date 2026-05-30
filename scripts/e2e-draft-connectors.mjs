@@ -733,15 +733,53 @@ async function runUpstreamSandboxScriptCheck() {
     });
     if (
       sandboxOutbox.items?.length !== platforms.length ||
-      platforms.some((platform) => !sandboxOutbox.items.some((item) => item.platform === platform && item.hasCredential && item.statusHasCredential))
+      platforms.some(
+        (platform) =>
+          !sandboxOutbox.items.some(
+            (item) =>
+              item.platform === platform &&
+              item.hasCredential &&
+              item.statusHasCredential &&
+              item.workOrder?.connector?.callbackAuthEnv === "DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY" &&
+              item.workOrder?.automation?.mode === "creator-center-draft-fill",
+          ),
+      )
     ) {
       throw new Error(`Draft upstream sandbox did not persist every checked platform draft: ${JSON.stringify(sandboxOutbox)}`);
+    }
+
+    const workOrders = await requestAbsoluteJson(`${sandboxBaseUrl}/work-orders`, {
+      headers: { authorization: `Bearer ${sandboxApiKey}` },
+    });
+    if (
+      workOrders.items?.length !== platforms.length ||
+      workOrders.items.some((item) => !item.workOrderUrl || item.requiredChecklistTotal < 4)
+    ) {
+      throw new Error(`Draft upstream sandbox did not expose creator-center work-order summaries: ${JSON.stringify(workOrders)}`);
+    }
+
+    const firstChecked = checkedPlatforms[0];
+    const workOrderDetail = await requestAbsoluteJson(`${sandboxBaseUrl}/${firstChecked.platform}/work-orders/${firstChecked.remoteId}`, {
+      headers: { authorization: `Bearer ${sandboxApiKey}` },
+    });
+    if (
+      workOrderDetail.workOrder?.remoteId !== firstChecked.remoteId ||
+      !workOrderDetail.workOrder?.draft?.renderedBody?.includes("Synthetic draft used") ||
+      !workOrderDetail.workOrder?.checklist?.some((item) => item.id === "callback-connector")
+    ) {
+      throw new Error(`Draft upstream sandbox work-order detail is incomplete: ${JSON.stringify(workOrderDetail)}`);
     }
 
     return {
       healthStatus: health.status,
       platforms: checkedPlatforms,
       outboxTotal: sandboxOutbox.items.length,
+      workOrderTotal: workOrders.items.length,
+      sampleWorkOrder: {
+        platform: workOrderDetail.workOrder.platform,
+        remoteId: workOrderDetail.workOrder.remoteId,
+        checklistTotal: workOrderDetail.workOrder.checklist.length,
+      },
     };
   } finally {
     await stopService(sandbox);
