@@ -39,6 +39,23 @@ export type PublishTaskLog = {
   message: string;
 };
 
+export type PublishTaskEvent = {
+  id: string;
+  timestamp: string;
+  level: "info" | "warning" | "error";
+  stage:
+    | "created"
+    | "queued"
+    | "running"
+    | "needs_retry"
+    | "needs_manual_action"
+    | "retrying"
+    | "succeeded"
+    | "failed";
+  message: string;
+  platform?: PlatformName;
+};
+
 export type PublishTaskTargetRecord = {
   platform: PlatformName;
   account: PlatformAccountRecord | null;
@@ -60,6 +77,7 @@ export type PublishTaskRecord = {
   documentTitle: string;
   createdAt: string;
   updatedAt: string;
+  timeline: PublishTaskEvent[];
   targets: PublishTaskTargetRecord[];
 };
 

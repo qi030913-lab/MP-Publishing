@@ -7,6 +7,7 @@ import {
   listAccounts,
   listTasks,
   type PlatformAccountRecord,
+  type PublishTaskEvent,
   type PublishTaskLog,
   type PublishTaskMode,
   type PublishTaskRecord,
@@ -33,6 +34,22 @@ export class PublishService {
       timestamp: this.createTimestamp(),
       level,
       message,
+    };
+  }
+
+  private createEvent(
+    stage: PublishTaskEvent["stage"],
+    level: PublishTaskEvent["level"],
+    message: string,
+    platform?: PublishTaskEvent["platform"],
+  ): PublishTaskEvent {
+    return {
+      id: `evt_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
+      timestamp: this.createTimestamp(),
+      level,
+      stage,
+      message,
+      platform,
     };
   }
 
@@ -113,6 +130,7 @@ export class PublishService {
       createdAt: task.createdAt,
       updatedAt: task.updatedAt,
       status: task.status,
+      timeline: task.timeline,
       results: task.targets.map((target) => ({
         platform: target.platform,
         account: target.account,
@@ -192,6 +210,23 @@ export class PublishService {
       documentTitle: document.title,
       createdAt: taskCreatedAt,
       updatedAt: this.createTimestamp(),
+      timeline: [
+        this.createEvent(
+          "created",
+          "info",
+          mode === "simulate" ? "已创建模拟发布任务。" : "已创建 mock 一键发布任务。",
+        ),
+        ...targets.map((target) =>
+          this.createEvent(
+            target.status === "needs_manual_action" ? "needs_manual_action" : "queued",
+            target.status === "needs_manual_action" ? "warning" : "info",
+            target.status === "needs_manual_action"
+              ? `${target.platform} 初始化时需要人工处理。`
+              : `${target.platform} 已进入发布队列，等待 worker 执行。`,
+            target.platform,
+          ),
+        ),
+      ],
       targets,
     };
 
@@ -256,10 +291,24 @@ export class PublishService {
       target.startedAt = undefined;
       target.completedAt = undefined;
       target.logs.push(this.createLog("info", `已执行第 ${target.attemptCount} 次重试。`));
+      refreshedTask.timeline.push(
+        this.createEvent("retrying", "info", `${target.platform} 已执行第 ${target.attemptCount} 次重试。`, target.platform),
+      );
       if (!target.account) {
         target.logs.push(this.createLog("warning", `${target.platform} 缺少账号绑定，重试后仍需人工处理。`));
+        refreshedTask.timeline.push(
+          this.createEvent(
+            "needs_manual_action",
+            "warning",
+            `${target.platform} 重试后仍缺少账号绑定。`,
+            target.platform,
+          ),
+        );
       } else {
         target.logs.push(this.createLog("info", `${target.platform} 已重新排入执行队列。`));
+        refreshedTask.timeline.push(
+          this.createEvent("queued", "info", `${target.platform} 已重新排入执行队列。`, target.platform),
+        );
         if (target.account.health === "expiring") {
           const updatedAccount = await updateAccount(target.account.id, {
             health: "healthy",
@@ -269,6 +318,9 @@ export class PublishService {
           if (updatedAccount) {
             target.account = updatedAccount;
             target.logs.push(this.createLog("info", `${target.platform} 凭证刷新成功，状态已恢复健康。`));
+            refreshedTask.timeline.push(
+              this.createEvent("running", "info", `${target.platform} 凭证刷新成功，准备重新执行。`, target.platform),
+            );
           }
         }
       }

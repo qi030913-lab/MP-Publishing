@@ -93,6 +93,22 @@ type PublishTaskDetail = {
   documentTitle: string;
   createdAt: string;
   updatedAt: string;
+  timeline: Array<{
+    id: string;
+    timestamp: string;
+    level: "info" | "warning" | "error";
+    stage:
+      | "created"
+      | "queued"
+      | "running"
+      | "needs_retry"
+      | "needs_manual_action"
+      | "retrying"
+      | "succeeded"
+      | "failed";
+    message: string;
+    platform?: PlatformName;
+  }>;
   results: TaskResult[];
 };
 
@@ -248,6 +264,17 @@ function workerStatusLabel(status: RuntimeStatus["worker"]["status"]) {
   if (status === "working") return "执行中";
   if (status === "idle") return "空闲";
   return "离线";
+}
+
+function eventStageLabel(stage: PublishTaskDetail["timeline"][number]["stage"]) {
+  if (stage === "created") return "创建";
+  if (stage === "queued") return "入队";
+  if (stage === "running") return "执行";
+  if (stage === "needs_retry") return "待重试";
+  if (stage === "needs_manual_action") return "待人工处理";
+  if (stage === "retrying") return "重试";
+  if (stage === "succeeded") return "完成";
+  return "失败";
 }
 
 function createRuntimeFallback(): RuntimeStatus {
@@ -1233,6 +1260,31 @@ export default function HomePage() {
                     );
                   })}
                 </div>
+
+                <div className="timeline-panel">
+                  <div className="list-header">
+                    <div className="list-title">
+                      <ScrollText size={16} />
+                      任务时间线
+                    </div>
+                  </div>
+
+                  <div className="timeline-list">
+                    {activeTask.timeline.map((event) => (
+                      <div key={event.id} className={`timeline-item ${event.level}`}>
+                        <div className="timeline-rail" />
+                        <div className="timeline-content">
+                          <div className="timeline-head">
+                            <strong>{eventStageLabel(event.stage)}</strong>
+                            <span>{new Date(event.timestamp).toLocaleTimeString("zh-CN")}</span>
+                          </div>
+                          <p>{event.message}</p>
+                          {event.platform ? <span className="timeline-platform">{platformMeta[event.platform].label}</span> : null}
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
               </div>
             ) : (
               <EmptyTasks />
@@ -1876,7 +1928,8 @@ export default function HomePage() {
         }
 
         .report-card,
-        .task-list-panel {
+        .task-list-panel,
+        .timeline-panel {
           padding: 18px;
           border-radius: 8px;
           border: 1px solid rgba(148, 163, 184, 0.14);
@@ -1921,6 +1974,65 @@ export default function HomePage() {
           align-items: center;
           gap: 8px;
           color: #cbd5e1;
+        }
+
+        .timeline-list {
+          display: grid;
+          gap: 12px;
+        }
+
+        .timeline-item {
+          display: grid;
+          grid-template-columns: 12px minmax(0, 1fr);
+          gap: 12px;
+        }
+
+        .timeline-rail {
+          width: 12px;
+          border-radius: 999px;
+          background: rgba(37, 99, 235, 0.32);
+        }
+
+        .timeline-item.warning .timeline-rail {
+          background: rgba(217, 119, 6, 0.4);
+        }
+
+        .timeline-item.error .timeline-rail {
+          background: rgba(220, 38, 38, 0.4);
+        }
+
+        .timeline-content {
+          display: grid;
+          gap: 8px;
+          padding: 14px;
+          border-radius: 8px;
+          background: rgba(2, 6, 23, 0.34);
+          border: 1px solid rgba(148, 163, 184, 0.14);
+        }
+
+        .timeline-head {
+          display: flex;
+          justify-content: space-between;
+          gap: 12px;
+          align-items: center;
+        }
+
+        .timeline-head span,
+        .timeline-content p,
+        .timeline-platform {
+          color: #94a3b8;
+          font-size: 13px;
+          margin: 0;
+        }
+
+        .timeline-platform {
+          display: inline-flex;
+          width: fit-content;
+          padding: 6px 10px;
+          border-radius: 999px;
+          background: rgba(37, 99, 235, 0.12);
+          color: #bfdbfe;
+          border: 1px solid rgba(37, 99, 235, 0.24);
         }
 
         .empty-state {
@@ -1971,6 +2083,7 @@ export default function HomePage() {
           .account-line,
           .report-card-head,
           .task-header,
+          .timeline-head,
           .task-summary-head,
           .task-summary-meta,
           .task-meta-row,

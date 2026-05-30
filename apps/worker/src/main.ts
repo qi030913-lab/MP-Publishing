@@ -2,6 +2,7 @@ import {
   getWorkerStatus,
   listAccounts,
   listTasks,
+  type PublishTaskEvent,
   type PublishTaskLog,
   type PublishTaskRecord,
   type PublishTaskTargetRecord,
@@ -22,6 +23,22 @@ function createLog(level: PublishTaskLog["level"], message: string): PublishTask
     timestamp: createTimestamp(),
     level,
     message,
+  };
+}
+
+function createEvent(
+  stage: PublishTaskEvent["stage"],
+  level: PublishTaskEvent["level"],
+  message: string,
+  platform?: PublishTaskEvent["platform"],
+): PublishTaskEvent {
+  return {
+    id: `evt_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
+    timestamp: createTimestamp(),
+    level,
+    stage,
+    message,
+    platform,
   };
 }
 
@@ -67,6 +84,7 @@ async function processTask(task: PublishTaskRecord) {
       target.status = "running";
       target.startedAt = createTimestamp();
       target.logs.push(createLog("info", `${target.platform} 已进入 worker 执行队列。`));
+      task.timeline.push(createEvent("running", "info", `${target.platform} 已进入 worker 执行队列。`, target.platform));
       changed = true;
       return;
     }
@@ -83,6 +101,9 @@ async function processTask(task: PublishTaskRecord) {
     if (!target.account || target.account.health === "needs-login") {
       target.status = "needs_manual_action";
       target.logs.push(createLog("warning", `${target.platform} 需要人工登录后才能继续发布。`));
+      task.timeline.push(
+        createEvent("needs_manual_action", "warning", `${target.platform} 需要人工登录后才能继续发布。`, target.platform),
+      );
       changed = true;
       return;
     }
@@ -90,6 +111,9 @@ async function processTask(task: PublishTaskRecord) {
     if (target.account.health === "expiring" && target.attemptCount === 1) {
       target.status = "needs_retry";
       target.logs.push(createLog("warning", `${target.platform} 账号凭证接近过期，建议执行重试。`));
+      task.timeline.push(
+        createEvent("needs_retry", "warning", `${target.platform} 账号凭证接近过期，建议执行重试。`, target.platform),
+      );
       changed = true;
       return;
     }
@@ -97,6 +121,7 @@ async function processTask(task: PublishTaskRecord) {
     target.status = "succeeded";
     target.completedAt = createTimestamp();
     target.logs.push(createLog("info", `${target.platform} 任务执行完成。`));
+    task.timeline.push(createEvent("succeeded", "info", `${target.platform} 任务执行完成。`, target.platform));
     changed = true;
   });
 
