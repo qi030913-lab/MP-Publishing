@@ -48,6 +48,23 @@ function connectorLabel(status: RuntimeStatus["draftConnector"]["status"]) {
 
 const connectorDraftPlatforms = new Set<PlatformName>(["zhihu", "bilibili", "xiaohongshu"]);
 
+function isConnectorDraftReady(platform: PlatformName, runtime: RuntimeStatus | null) {
+  const platformStatus = runtime?.draftConnector.platforms.find((item) => item.platform === platform);
+  if (!platformStatus?.realPublishEnabled || !platformStatus.draftEndpoint) {
+    return false;
+  }
+
+  if (runtime?.draftConnector.status === "offline" || runtime?.draftConnector.status === "unconfigured") {
+    return false;
+  }
+
+  if (platformStatus.upstreamDraftEndpointConfigured && platformStatus.upstreamDraftStatus === "offline") {
+    return false;
+  }
+
+  return true;
+}
+
 export default function PublishPage() {
   const router = useRouter();
   const [draft, setDraft] = useState<DraftDocument | null>(null);
@@ -75,8 +92,11 @@ export default function PublishPage() {
   );
 
   const readyConnectorDraftPlatforms = useMemo(
-    () => selectedConnectorDraftPlatforms.filter((platform) => accountsByPlatform.has(platform)),
-    [accountsByPlatform, selectedConnectorDraftPlatforms],
+    () =>
+      selectedConnectorDraftPlatforms.filter(
+        (platform) => accountsByPlatform.has(platform) && isConnectorDraftReady(platform, runtime),
+      ),
+    [accountsByPlatform, runtime, selectedConnectorDraftPlatforms],
   );
 
   useEffect(() => {
@@ -134,14 +154,17 @@ export default function PublishPage() {
     }
 
     const realDraftPlatforms = draft.platforms.filter(
-      (platform) => connectorDraftPlatforms.has(platform) && selectedAccounts.some((account) => account.platform === platform),
+      (platform) =>
+        connectorDraftPlatforms.has(platform) &&
+        selectedAccounts.some((account) => account.platform === platform) &&
+        isConnectorDraftReady(platform, runtime),
     );
     const realDraftAccountIds = selectedAccounts
       .filter((account) => realDraftPlatforms.includes(account.platform))
       .map((account) => account.id);
 
     if (realDraftPlatforms.length === 0) {
-      setError("请先选择知乎、B站或小红书平台，并为其选择可用账号。");
+      setError("请先选择已就绪的知乎、B站或小红书连接器草稿平台，并为其选择可用账号。");
       return;
     }
 
@@ -175,7 +198,12 @@ export default function PublishPage() {
               {isPublishing ? <LoadingInline label="提交中" /> : <Rocket size={18} />}
               mock 一键发布
             </button>
-            <button className="secondary-button" type="button" onClick={submitRealDraft} disabled={isRealPublishing}>
+            <button
+              className="secondary-button"
+              type="button"
+              onClick={submitRealDraft}
+              disabled={isRealPublishing || !draft || readyConnectorDraftPlatforms.length === 0}
+            >
               {isRealPublishing ? <LoadingInline label="提交中" /> : <Rocket size={18} />}
               创建连接器草稿
             </button>
@@ -225,26 +253,31 @@ export default function PublishPage() {
                 ) : null}
               </div>
               <div className="issue-list">
-                {runtime?.draftConnector.platforms.map((platformStatus) => (
-                  <div key={platformStatus.platform} className="issue-item info">
-                    <RadioTower size={18} />
-                    <div>
-                      <strong>{platformLabel(platformStatus.platform)}</strong>
-                      <p>
-                        {platformStatus.realPublishEnabled ? "真实草稿已启用" : "真实草稿未启用"} /{" "}
-                        {platformStatus.draftEndpoint ? "draft endpoint 已配置" : "缺少 draft endpoint"}
-                        {platformStatus.statusEndpoint ? " / status endpoint 已配置" : ""}
-                        {platformStatus.upstreamDraftEndpointConfigured !== undefined ? (
-                          <>
-                            {" "}
-                            / upstream {platformStatus.upstreamDraftStatus ?? "unknown"}
-                            {platformStatus.upstreamStatusEndpointConfigured ? " / status sync" : ""}
-                          </>
-                        ) : null}
-                      </p>
+                {runtime?.draftConnector.platforms.map((platformStatus) => {
+                  const connectorReady = isConnectorDraftReady(platformStatus.platform, runtime);
+
+                  return (
+                    <div key={platformStatus.platform} className={connectorReady ? "issue-item info" : "issue-item warning"}>
+                      <RadioTower size={18} />
+                      <div>
+                        <strong>{platformLabel(platformStatus.platform)}</strong>
+                        <p>
+                          {connectorReady ? "可创建连接器草稿" : "暂不可创建连接器草稿"} /{" "}
+                          {platformStatus.realPublishEnabled ? "真实草稿已启用" : "真实草稿未启用"} /{" "}
+                          {platformStatus.draftEndpoint ? "draft endpoint 已配置" : "缺少 draft endpoint"}
+                          {platformStatus.statusEndpoint ? " / status endpoint 已配置" : ""}
+                          {platformStatus.upstreamDraftEndpointConfigured !== undefined ? (
+                            <>
+                              {" "}
+                              / upstream {platformStatus.upstreamDraftStatus ?? "unknown"}
+                              {platformStatus.upstreamStatusEndpointConfigured ? " / status sync" : ""}
+                            </>
+                          ) : null}
+                        </p>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
               {runtime?.draftConnector.outboxUrl ? (
                 <a className="secondary-button compact" href={runtime.draftConnector.outboxUrl} target="_blank" rel="noreferrer">
