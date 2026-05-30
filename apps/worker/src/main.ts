@@ -115,6 +115,10 @@ async function processPublishTarget(job: Job<PublishQueueJobData>) {
             context.targetId,
             `${context.platform} 真实草稿连接器需要人工处理后继续。`,
             result.issues,
+            {
+              remoteId: result.remoteId,
+              url: result.url,
+            },
           );
         } else {
           await markPublishTargetFailed(

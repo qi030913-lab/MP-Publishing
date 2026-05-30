@@ -194,8 +194,11 @@ async function publishDraftThroughConnector(
     });
 
     if (payload.ok === false) {
+      const remoteId = payload.remoteId ?? payload.draftId;
       return {
         ok: false,
+        remoteId,
+        url: payload.url ?? (remoteId ? `${config.urlScheme}://draft/${remoteId}` : undefined),
         issues: [
           ...issues,
           ...(payload.issues ?? []),

@@ -1719,7 +1719,8 @@ async function runUpstreamDraftRejectionManualActionCheck() {
   const upstreamPort = await getFreePort();
   const connectorPort = await getFreePort();
   const apiPort = await getFreePort();
-  const upstream = await startFakeUpstreamDraftService(upstreamPort, "reject-upstream-secret", { rejectDrafts: true });
+  const upstreamOptions = { rejectDrafts: true };
+  const upstream = await startFakeUpstreamDraftService(upstreamPort, "reject-upstream-secret", upstreamOptions);
   const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
   const outboxDir = path.join(runtimeDir, `draft-connector-upstream-reject-e2e-${Date.now()}`);
   const queueName = `mp-publishing-draft-upstream-reject-e2e-${Date.now()}`;
@@ -1823,10 +1824,57 @@ async function runUpstreamDraftRejectionManualActionCheck() {
     }
 
     for (const request of upstream.requests) {
-      const detail = await requestAbsoluteJson(request.connectorDraftUrl);
+      const target = task.results.find((item) => item.platform === request.platform);
+      if (
+        target?.remoteId !== request.connectorDraftId ||
+        target?.url !== request.connectorDraftUrl
+      ) {
+        throw new Error(`Rejected upstream target did not keep local draft URL for ${request.platform}: ${JSON.stringify(target)}`);
+      }
+
+      const detail = await requestAbsoluteJson(target.url);
       if (detail.state !== "needs_manual_action" || detail.payload?.credential) {
         throw new Error(`Rejected upstream outbox detail is incorrect for ${request.platform}: ${JSON.stringify(detail)}`);
       }
+    }
+
+    upstreamOptions.rejectDrafts = false;
+    const retried = await requestJson(`/publish/tasks/${created.id}/retry`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (platforms.some((platform) => retried.results.find((item) => item.platform === platform)?.status !== "queued")) {
+      throw new Error(`Rejected upstream retry should enqueue every platform after upstream recovery: ${JSON.stringify(retried)}`);
+    }
+
+    let recoveredTask = retried;
+    for (let i = 0; i < 50; i += 1) {
+      await delay(600);
+      recoveredTask = await requestJson(`/publish/tasks/${created.id}`);
+      if (!["running", "queued"].includes(recoveredTask.status)) {
+        break;
+      }
+    }
+
+    if (
+      recoveredTask.status !== "succeeded" ||
+      platforms.some((platform) => {
+        const target = recoveredTask.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return (
+          target?.status !== "succeeded" ||
+          !target.remoteId?.startsWith(`${platform}-upstream-${platform}-draft-`) ||
+          !target.url?.startsWith(`https://upstream.example.test/${platform}/`) ||
+          issueCodes.some((code) => code.endsWith("_DRAFT_CONNECTOR_REJECTED") || code.endsWith("_UPSTREAM_DRAFT_REJECTED"))
+        );
+      })
+    ) {
+      throw new Error(`Recovered upstream draft retry did not succeed cleanly: ${JSON.stringify(recoveredTask)}`);
+    }
+
+    if (upstream.requests.length !== platforms.length * 2) {
+      throw new Error(`Recovered upstream did not receive a second draft request for every platform: ${JSON.stringify(upstream.requests)}`);
     }
 
     const runtimeAfterRejection = await requestJson("/runtime/status");
@@ -1841,10 +1889,20 @@ async function runUpstreamDraftRejectionManualActionCheck() {
 
     return {
       taskId: created.id,
-      finalStatus: task.status,
+      rejectedStatus: task.status,
+      finalStatus: recoveredTask.status,
       targets: task.results.map((target) => ({
         platform: target.platform,
         status: target.status,
+        remoteId: target.remoteId,
+        url: target.url,
+        issueCodes: target.issues.map((issue) => issue.code),
+      })),
+      recoveredTargets: recoveredTask.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        remoteId: target.remoteId,
+        url: target.url,
         issueCodes: target.issues.map((issue) => issue.code),
       })),
       upstreamRequests: upstream.requests.map((request) => ({
