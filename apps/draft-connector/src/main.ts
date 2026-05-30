@@ -3,6 +3,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 
 type DraftPayload = {
   platform?: string;
@@ -176,7 +177,21 @@ const outboxDir = process.env.DRAFT_CONNECTOR_OUTBOX_DIR
   ? resolveWorkspacePath(process.env.DRAFT_CONNECTOR_OUTBOX_DIR)
   : path.join(workspaceRoot, ".runtime", "drafts");
 
-function createDraftId(platform: string) {
+function normalizeDraftIdSegment(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+}
+
+function createDraftId(platform: string, execution?: DraftPayload["execution"]) {
+  const normalizedExecution = normalizeExecutionContext(execution);
+  const targetSegment = normalizedExecution ? normalizeDraftIdSegment(normalizedExecution.targetId) : "";
+  if (targetSegment) {
+    return `${platform}-draft-${targetSegment}-attempt-${normalizedExecution!.attemptCount}`;
+  }
+
   return `${platform}-draft-${randomUUID()}`;
 }
 
@@ -603,11 +618,24 @@ async function refreshStoredDraftFromUpstreamStatus(
 
 async function readStoredDraft(platform: string, draftId: string) {
   const filePath = path.join(outboxDir, platform, `${draftId}.json`);
-  if (!existsSync(filePath)) {
-    return null;
+
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      return normalizeStoredDraft(JSON.parse(await readFile(filePath, "utf8")) as StoredDraft);
+    } catch (error) {
+      if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+        return null;
+      }
+
+      if (!(error instanceof SyntaxError) || attempt === 4) {
+        throw error;
+      }
+
+      await delay(10 * (attempt + 1));
+    }
   }
 
-  return normalizeStoredDraft(JSON.parse(await readFile(filePath, "utf8")) as StoredDraft);
+  return null;
 }
 
 async function writeStoredDraft(storedDraft: StoredDraft) {
@@ -616,6 +644,24 @@ async function writeStoredDraft(storedDraft: StoredDraft) {
 
   await mkdir(platformOutboxDir, { recursive: true });
   await writeFile(filePath, `${JSON.stringify(storedDraft, null, 2)}\n`, "utf8");
+}
+
+async function writeStoredDraftIfAbsent(storedDraft: StoredDraft) {
+  const platformOutboxDir = path.join(outboxDir, storedDraft.platform);
+  const filePath = path.join(platformOutboxDir, `${storedDraft.draftId}.json`);
+
+  await mkdir(platformOutboxDir, { recursive: true });
+
+  try {
+    await writeFile(filePath, `${JSON.stringify(storedDraft, null, 2)}\n`, { encoding: "utf8", flag: "wx" });
+    return true;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "EEXIST") {
+      return false;
+    }
+
+    throw error;
+  }
 }
 
 async function findStoredDraftByRemoteId(platform: string, remoteId: string) {
@@ -634,8 +680,11 @@ async function findStoredDraftByRemoteId(platform: string, remoteId: string) {
 
   const fileNames = await readdir(platformOutboxDir);
   for (const fileName of fileNames.filter((name) => name.endsWith(".json"))) {
-    const content = await readFile(path.join(platformOutboxDir, fileName), "utf8");
-    const storedDraft = normalizeStoredDraft(JSON.parse(content) as StoredDraft);
+    const storedDraft = await readStoredDraft(platform, fileName.replace(/\.json$/, ""));
+    if (!storedDraft) {
+      continue;
+    }
+
     if (storedDraft.externalDraftId === remoteId) {
       return storedDraft;
     }
@@ -657,8 +706,11 @@ async function findStoredDraftByExecution(platform: string, execution: DraftPayl
 
   const fileNames = await readdir(platformOutboxDir);
   for (const fileName of fileNames.filter((name) => name.endsWith(".json"))) {
-    const content = await readFile(path.join(platformOutboxDir, fileName), "utf8");
-    const storedDraft = normalizeStoredDraft(JSON.parse(content) as StoredDraft);
+    const storedDraft = await readStoredDraft(platform, fileName.replace(/\.json$/, ""));
+    if (!storedDraft) {
+      continue;
+    }
+
     const storedExecution = normalizeExecutionContext(storedDraft.payload.execution);
     if (
       storedExecution?.targetId === normalizedExecution.targetId &&
@@ -673,7 +725,7 @@ async function findStoredDraftByExecution(platform: string, execution: DraftPayl
 
 function createStoredDraftResponse(storedDraft: StoredDraft, request: IncomingMessage) {
   const draftUrl = createDraftUrl(storedDraft.platform, storedDraft.draftId, request);
-  const reusable = storedDraft.state !== "failed" && storedDraft.state !== "needs_manual_action" && storedDraft.state !== "publishing";
+  const reusable = storedDraft.state !== "failed" && storedDraft.state !== "needs_manual_action";
 
   return {
     ok: reusable,
@@ -773,13 +825,12 @@ async function listStoredDrafts(platforms: string[], request: IncomingMessage) {
       const storedDrafts = await Promise.all(
         fileNames
           .filter((fileName) => fileName.endsWith(".json"))
-          .map(async (fileName) => {
-            const content = await readFile(path.join(platformOutboxDir, fileName), "utf8");
-            return normalizeStoredDraft(JSON.parse(content) as StoredDraft);
-          }),
+          .map((fileName) => readStoredDraft(platform, fileName.replace(/\.json$/, ""))),
       );
 
-      return storedDrafts.map((storedDraft) => createDraftSummary(storedDraft, request));
+      return storedDrafts
+        .filter((storedDraft): storedDraft is StoredDraft => Boolean(storedDraft))
+        .map((storedDraft) => createDraftSummary(storedDraft, request));
     }),
   );
 
@@ -854,7 +905,7 @@ async function handleCreateDraft(platform: string, request: IncomingMessage, res
     return;
   }
 
-  const draftId = createDraftId(platform);
+  const draftId = createDraftId(platform, payload.execution);
   const createdAt = new Date().toISOString();
   const storedDraft: StoredDraft = {
     draftId,
@@ -866,7 +917,16 @@ async function handleCreateDraft(platform: string, request: IncomingMessage, res
     payload: sanitizeDraftPayload(payload),
   };
 
-  await writeStoredDraft(storedDraft);
+  const stored = await writeStoredDraftIfAbsent(storedDraft);
+  if (!stored) {
+    const concurrentDraft = await readStoredDraft(platform, draftId);
+    if (concurrentDraft) {
+      sendJson(response, 200, createStoredDraftResponse(concurrentDraft, request));
+      return;
+    }
+
+    throw new Error(`${platform} draft ${draftId} was reserved concurrently but could not be read.`);
+  }
 
   const draftUrl = createDraftUrl(platform, draftId, request);
   const upstreamConfig = resolveUpstreamDraftConfig(platform);

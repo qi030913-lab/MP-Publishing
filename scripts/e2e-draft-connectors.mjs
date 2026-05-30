@@ -368,6 +368,16 @@ function readDraftOutbox(outboxDir, platforms) {
   });
 }
 
+function expectedExecutionDraftId(platform, execution) {
+  const targetSegment = String(execution.targetId)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+
+  return `${platform}-draft-${targetSegment}-attempt-${execution.attemptCount}`;
+}
+
 function createCleanServiceEnv(extraEnv = {}) {
   const env = { ...process.env };
   const isolatedKeys = new Set([
@@ -2814,6 +2824,11 @@ try {
       throw new Error(`Draft connector detail did not persist publish target execution context for ${platform}: ${JSON.stringify(detail.payload?.execution)}`);
     }
 
+    const expectedDraftId = expectedExecutionDraftId(platform, detail.payload.execution);
+    if (detail.draftId !== expectedDraftId || target.remoteId !== expectedDraftId) {
+      throw new Error(`Draft connector did not use the deterministic execution draft id for ${platform}: ${JSON.stringify({ expectedDraftId, detail, target })}`);
+    }
+
     const countBeforeDuplicate = readDraftOutbox(outboxDir, [platform]).length;
     const duplicate = await requestAbsoluteJson(`${connectorBaseUrl}/${platform}/drafts`, {
       method: "POST",
@@ -2835,10 +2850,57 @@ try {
       );
     }
 
+    const concurrentPayload = {
+      ...detail.payload,
+      execution: {
+        ...detail.payload.execution,
+        targetId: `${detail.payload.execution.targetId}-concurrent-${platform}`,
+        attemptCount: 1,
+      },
+    };
+    const expectedConcurrentDraftId = expectedExecutionDraftId(platform, concurrentPayload.execution);
+    const countBeforeConcurrent = readDraftOutbox(outboxDir, [platform]).length;
+    const [concurrentLeft, concurrentRight] = await Promise.all([
+      requestAbsoluteJson(`${connectorBaseUrl}/${platform}/drafts`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer draft-secret",
+        },
+        body: JSON.stringify(concurrentPayload),
+      }),
+      requestAbsoluteJson(`${connectorBaseUrl}/${platform}/drafts`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: "Bearer draft-secret",
+        },
+        body: JSON.stringify(concurrentPayload),
+      }),
+    ]);
+    const countAfterConcurrent = readDraftOutbox(outboxDir, [platform]).length;
+    if (
+      concurrentLeft.draftId !== expectedConcurrentDraftId ||
+      concurrentRight.draftId !== expectedConcurrentDraftId ||
+      countAfterConcurrent !== countBeforeConcurrent + 1
+    ) {
+      throw new Error(
+        `Draft connector concurrent idempotency did not reserve one deterministic draft for ${platform}: ${JSON.stringify({
+          expectedConcurrentDraftId,
+          concurrentLeft,
+          concurrentRight,
+          countBeforeConcurrent,
+          countAfterConcurrent,
+        })}`,
+      );
+    }
+
     idempotentDrafts.push({
       platform,
       draftId: duplicate.draftId,
       countAfterDuplicate,
+      concurrentDraftId: concurrentLeft.draftId,
+      countAfterConcurrent,
     });
 
     draftDetails.push({
@@ -2966,7 +3028,7 @@ try {
 
   const outboxIndex = await requestAbsoluteJson(`${connectorBaseUrl}/drafts?format=json`);
   const outboxHtml = await requestAbsoluteText(`${connectorBaseUrl}/drafts`);
-  if (outboxIndex.items?.length !== platforms.length) {
+  if (outboxIndex.items?.length !== platforms.length * 2) {
     throw new Error(`Draft connector outbox index did not include every stored draft: ${JSON.stringify(outboxIndex)}`);
   }
 
@@ -2981,11 +3043,17 @@ try {
     }
 
     const platformOutbox = await requestAbsoluteJson(`${connectorBaseUrl}/${platform}/drafts?format=json`);
+    const localDraft = draftDetails.find((item) => item.platform === platform);
+    const concurrentDraft = idempotentDrafts.find((item) => item.platform === platform);
+    const readyDraft = platformOutbox.items?.find((item) => item.draftId === localDraft?.draftId);
+    const freshConcurrentDraft = platformOutbox.items?.find((item) => item.draftId === concurrentDraft?.concurrentDraftId);
     if (
-      platformOutbox.items?.length !== 1 ||
-      platformOutbox.items[0]?.platform !== platform ||
-      platformOutbox.items[0]?.state !== "ready" ||
-      !platformOutbox.items[0]?.externalUrl
+      platformOutbox.items?.length !== 2 ||
+      readyDraft?.platform !== platform ||
+      readyDraft?.state !== "ready" ||
+      !readyDraft.externalUrl ||
+      freshConcurrentDraft?.platform !== platform ||
+      freshConcurrentDraft?.state !== "draft"
     ) {
       throw new Error(`Draft connector platform outbox is incorrect for ${platform}: ${JSON.stringify(platformOutbox)}`);
     }
