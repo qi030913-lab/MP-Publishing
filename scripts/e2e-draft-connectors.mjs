@@ -1012,7 +1012,13 @@ async function runUpstreamProxyEnablementCheck() {
       upstream.requests.length !== platforms.length ||
       upstream.statusRequests.length !== platforms.length ||
       upstream.requests.some((request) => !request.hasCredential) ||
-      upstream.statusRequests.some((request) => !request.hasCredential)
+      upstream.statusRequests.some((request) => !request.hasCredential) ||
+      upstream.requests.some(
+        (request) => request.statusCallbackUrl !== `${connectorBaseUrl}/${request.platform}/drafts/${request.connectorDraftId}/status`,
+      ) ||
+      upstream.statusRequests.some(
+        (request) => request.connectorDraftUrl !== `${connectorBaseUrl}/${request.platform}/drafts/${request.connectorDraftId}`,
+      )
     ) {
       throw new Error(
         `Upstream enablement script did not configure or check every platform: ${JSON.stringify({

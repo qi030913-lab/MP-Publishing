@@ -227,6 +227,8 @@ async function runChecker(options) {
       platform,
       "--draft-endpoint",
       joinUrl(options.proxyBaseUrl, options.draftPathTemplate, platform),
+      "--callback-base-url",
+      options.publicBaseUrl ?? options.connectorBaseUrl,
     ];
 
     if (options.withStatus) {
