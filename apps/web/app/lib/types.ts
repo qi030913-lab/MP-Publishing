@@ -46,6 +46,8 @@ export type PlatformAccount = {
   handle: string;
   authMode: "official-api" | "cookie-session" | "hybrid";
   health: "healthy" | "expiring" | "needs-login";
+  credentialRef?: string;
+  credentialStatus: "unbound" | "missing" | "configured";
   lastCheckedAt: string;
 };
 
@@ -54,6 +56,9 @@ export type AccountSummary = {
   healthy: number;
   expiring: number;
   needsLogin: number;
+  credentialsConfigured: number;
+  credentialsMissing: number;
+  credentialsUnbound: number;
 };
 
 export type TaskTargetStatus =

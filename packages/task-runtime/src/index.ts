@@ -182,6 +182,7 @@ const defaultAccounts: PlatformAccountRecord[] = [
     handle: "创作者实验室",
     authMode: "official-api",
     health: "healthy",
+    credentialRef: process.env.WECHAT_OFFICIAL_ACCOUNT_CREDENTIAL_REF ?? "env:WECHAT_OFFICIAL_ACCOUNT",
     credentialStatus: "unbound",
     lastCheckedAt: "2026-05-29T22:00:00+08:00",
   },
@@ -248,6 +249,85 @@ function readJsonArray<T>(value: Prisma.JsonValue | null | undefined): T[] {
 
 function readJsonObject<T>(value: Prisma.JsonValue | null | undefined): T {
   return value && typeof value === "object" && !Array.isArray(value) ? (value as T) : ({} as T);
+}
+
+function readEnvValue(key: string) {
+  const value = process.env[key]?.trim();
+  return value && value.length > 0 ? value : undefined;
+}
+
+function readCredentialEnvPrefix(credentialRef?: string) {
+  if (!credentialRef?.startsWith("env:")) {
+    return null;
+  }
+
+  const prefix = credentialRef.slice("env:".length).trim();
+  return prefix.length > 0 ? prefix : null;
+}
+
+function hasUsableCredential(credential: PlatformCredential) {
+  if (credential.authMode === "official-api") {
+    return Boolean(credential.accessToken || (credential.appId && credential.appSecret));
+  }
+
+  if (credential.authMode === "cookie-session") {
+    return Boolean(credential.cookies || credential.storageStateJson);
+  }
+
+  return Boolean(
+    credential.accessToken ||
+      (credential.appId && credential.appSecret) ||
+      credential.cookies ||
+      credential.storageStateJson,
+  );
+}
+
+export function resolvePlatformCredential(account: PlatformAccountRecord | null): PlatformCredential | null {
+  const prefix = readCredentialEnvPrefix(account?.credentialRef);
+  if (!account || !account.credentialRef || !prefix) {
+    return null;
+  }
+
+  const credential: PlatformCredential = {
+    accountId: account.id,
+    platform: account.platform,
+    credentialRef: account.credentialRef,
+    authMode: account.authMode,
+    appId: readEnvValue(`${prefix}_APP_ID`),
+    appSecret: readEnvValue(`${prefix}_APP_SECRET`),
+    accessToken: readEnvValue(`${prefix}_ACCESS_TOKEN`),
+    refreshToken: readEnvValue(`${prefix}_REFRESH_TOKEN`),
+    cookies: readEnvValue(`${prefix}_COOKIES`),
+    storageStateJson: readEnvValue(`${prefix}_STORAGE_STATE_JSON`),
+    expiresAt: readEnvValue(`${prefix}_EXPIRES_AT`),
+  };
+
+  return hasUsableCredential(credential) ? credential : null;
+}
+
+function getCredentialStatus(account: {
+  id: string;
+  platform: string;
+  authMode: string;
+  credentialRef?: string | null;
+}): PlatformAccountRecord["credentialStatus"] {
+  if (!account.credentialRef) {
+    return "unbound";
+  }
+
+  return resolvePlatformCredential({
+    id: account.id,
+    platform: account.platform as PlatformName,
+    displayName: "",
+    handle: "",
+    authMode: account.authMode as PlatformAccountRecord["authMode"],
+    health: "healthy",
+    credentialRef: account.credentialRef,
+    credentialStatus: "missing",
+    lastCheckedAt: createTimestamp(),
+  })
+    ? "configured"
+    : "missing";
 }
 
 function createLog(level: PublishTaskLog["level"], message: string): PublishTaskLog {
@@ -328,7 +408,7 @@ function mapAccount(account: {
     authMode: account.authMode as PlatformAccountRecord["authMode"],
     health: account.health as PlatformAccountHealth,
     credentialRef: account.credentialRef ?? undefined,
-    credentialStatus: account.credentialRef ? "configured" : "unbound",
+    credentialStatus: getCredentialStatus(account),
     lastCheckedAt: account.lastCheckedAt.toISOString(),
   };
 }
@@ -489,7 +569,9 @@ export async function ensureRuntimeReady() {
   for (const account of defaultAccounts) {
     await prisma.platformAccount.upsert({
       where: { id: account.id },
-      update: {},
+      update: {
+        credentialRef: account.credentialRef,
+      },
       create: {
         id: account.id,
         workspaceId: defaultWorkspaceId,
@@ -931,14 +1013,16 @@ export async function startPublishTarget(targetId: string): Promise<PublishTarge
     target.job.version.body,
   );
 
+  const account = target.account ? mapAccount(target.account) : null;
+
   return {
     taskId: target.jobId,
     targetId: target.id,
     mode: target.job.mode as PublishTaskMode,
     platform: target.platform as PlatformName,
     attemptCount: target.attemptCount,
-    account: target.account ? mapAccount(target.account) : null,
-    credential: null,
+    account,
+    credential: resolvePlatformCredential(account),
     document: {
       id: target.job.documentId ?? target.job.version.document.id,
       title: target.job.version.document.title,
