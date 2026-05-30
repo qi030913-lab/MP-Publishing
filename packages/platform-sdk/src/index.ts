@@ -79,6 +79,14 @@ export type PublishStatus = {
     | "failed"
     | "needs_manual_action";
   detail?: string;
+  remoteId?: string;
+  url?: string;
+  issues?: ValidationIssue[];
+};
+
+export type PublishStatusInput = {
+  accountId?: string;
+  credential?: PlatformCredential;
 };
 
 export interface PlatformAdapter {
@@ -88,5 +96,5 @@ export interface PlatformAdapter {
   adapt(document: CanonicalDocument, options: AdaptOptions): Promise<PlatformDraft>;
   simulatePublish(input: PublishInput): Promise<SimulationResult>;
   publish(input: PublishInput): Promise<PublishResult>;
-  getPublishStatus?(remoteId: string): Promise<PublishStatus>;
+  getPublishStatus?(remoteId: string, input?: PublishStatusInput): Promise<PublishStatus>;
 }

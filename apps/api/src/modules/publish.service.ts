@@ -1,5 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { createDocumentFromInput } from "@mp-publishing/content-model";
+import { adapterRegistry } from "@mp-publishing/adapter-core";
+import type { PublishStatus } from "@mp-publishing/platform-sdk";
 import {
   createContentSnapshot,
   enqueueTaskTargets,
@@ -7,6 +9,7 @@ import {
   findTaskById,
   listAccounts,
   listTasks,
+  resolvePlatformCredential,
   type PlatformAccountRecord,
   type PublishTaskEvent,
   type PublishTaskLog,
@@ -22,6 +25,7 @@ import type {
   PublishRealDto,
   RetryPublishTaskDto,
   SimulatePublishDto,
+  SyncPublishTaskDto,
 } from "./publish.dto.js";
 
 @Injectable()
@@ -87,6 +91,22 @@ export class PublishService {
     }
 
     return "queued";
+  }
+
+  private mapRemoteStateToTargetStatus(state: PublishStatus["state"]): PublishTaskTargetRecord["status"] {
+    if (state === "succeeded") {
+      return "succeeded";
+    }
+
+    if (state === "failed") {
+      return "failed";
+    }
+
+    if (state === "needs_manual_action") {
+      return "needs_manual_action";
+    }
+
+    return "running";
   }
 
   private createBaseDocument(input: SimulatePublishDto | PublishMockDto | PublishRealDto) {
@@ -339,6 +359,85 @@ export class PublishService {
     refreshedTask.updatedAt = this.createTimestamp();
     const savedTask = await upsertTask(refreshedTask);
     await enqueueTaskTargets(refreshedTask.id, input.platform);
+
+    return this.mapTaskForResponse(savedTask ?? refreshedTask);
+  }
+
+  async syncTask(taskId: string, input: SyncPublishTaskDto) {
+    const task = await findTaskById(taskId);
+    if (!task) {
+      throw new NotFoundException("publish task not found");
+    }
+
+    const refreshedTask = await this.refreshTaskAccounts(task);
+    const targets = refreshedTask.targets.filter((target) =>
+      input.platform ? target.platform === input.platform : target.platform === "wechat",
+    );
+
+    if (targets.length === 0) {
+      throw new BadRequestException("no syncable publish targets found");
+    }
+
+    for (const target of targets) {
+      if (!target.id) {
+        continue;
+      }
+
+      if (!target.remoteId || target.url?.startsWith("wechat://draft/")) {
+        const message = `${target.platform} 当前只有草稿或本地结果，暂无远程发布状态可同步。`;
+        target.logs.push(this.createLog("info", message));
+        refreshedTask.timeline.push(this.createEvent("running", "info", message, target.platform));
+        continue;
+      }
+
+      if (!target.account) {
+        const message = `${target.platform} 缺少账号绑定，无法查询远程发布状态。`;
+        target.status = "needs_manual_action";
+        target.logs.push(this.createLog("warning", message));
+        refreshedTask.timeline.push(this.createEvent("needs_manual_action", "warning", message, target.platform));
+        continue;
+      }
+
+      const adapter = adapterRegistry.get(target.platform);
+      if (!adapter.getPublishStatus) {
+        const message = `${target.platform} 暂未实现远程状态查询。`;
+        target.logs.push(this.createLog("warning", message));
+        refreshedTask.timeline.push(this.createEvent("needs_manual_action", "warning", message, target.platform));
+        continue;
+      }
+
+      const status = await adapter.getPublishStatus(target.remoteId, {
+        accountId: target.account.id,
+        credential: resolvePlatformCredential(target.account) ?? undefined,
+      });
+      const nextTargetStatus = this.mapRemoteStateToTargetStatus(status.state);
+      const message = `${target.platform} 远程状态同步完成：${status.detail ?? status.state}`;
+
+      target.status = nextTargetStatus;
+      target.remoteId = status.remoteId ?? target.remoteId;
+      target.url = status.url ?? target.url;
+      target.issues = [...target.issues, ...(status.issues ?? [])];
+      target.logs.push(this.createLog(nextTargetStatus === "failed" ? "error" : "info", message));
+      target.completedAt = nextTargetStatus === "running" ? undefined : this.createTimestamp();
+      refreshedTask.timeline.push(
+        this.createEvent(
+          nextTargetStatus === "failed"
+            ? "failed"
+            : nextTargetStatus === "needs_manual_action"
+              ? "needs_manual_action"
+              : nextTargetStatus === "succeeded"
+                ? "succeeded"
+                : "running",
+          nextTargetStatus === "failed" ? "error" : nextTargetStatus === "needs_manual_action" ? "warning" : "info",
+          message,
+          target.platform,
+        ),
+      );
+    }
+
+    refreshedTask.status = this.summarizeTaskStatus(refreshedTask.targets);
+    refreshedTask.updatedAt = this.createTimestamp();
+    const savedTask = await upsertTask(refreshedTask);
 
     return this.mapTaskForResponse(savedTask ?? refreshedTask);
   }

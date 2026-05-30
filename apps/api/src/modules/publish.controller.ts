@@ -5,6 +5,7 @@ import type {
   PublishRealDto,
   RetryPublishTaskDto,
   SimulatePublishDto,
+  SyncPublishTaskDto,
 } from "./publish.dto.js";
 import { PublishService } from "./publish.service.js";
 
@@ -40,5 +41,10 @@ export class PublishController {
   @Post("tasks/:taskId/retry")
   retryTask(@Param("taskId") taskId: string, @Body() body: RetryPublishTaskDto) {
     return this.publishService.retryTask(taskId, body);
+  }
+
+  @Post("tasks/:taskId/sync")
+  syncTask(@Param("taskId") taskId: string, @Body() body: SyncPublishTaskDto) {
+    return this.publishService.syncTask(taskId, body);
   }
 }

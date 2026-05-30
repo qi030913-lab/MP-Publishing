@@ -3,7 +3,7 @@
 import { RefreshCcw, RotateCcw } from "lucide-react";
 import { useEffect, useMemo, useState } from "react";
 
-import { getRuntimeStatus, getTask, listTasks, retryTask } from "../lib/api";
+import { getRuntimeStatus, getTask, listTasks, retryTask, syncTask } from "../lib/api";
 import { loadActiveTaskId, saveActiveTaskId } from "../lib/draft-store";
 import { platformLabel } from "../lib/platforms";
 import type { PlatformName, PublishTaskDetail, PublishTaskSummary, RuntimeStatus, TaskStatus } from "../lib/types";
@@ -78,6 +78,7 @@ export default function TasksPage() {
   const [query, setQuery] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [retryingKey, setRetryingKey] = useState<string | null>(null);
+  const [syncingKey, setSyncingKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const filteredTasks = useMemo(() => {
@@ -140,6 +141,22 @@ export default function TasksPage() {
       setError("重试任务失败。");
     } finally {
       setRetryingKey(null);
+    }
+  }
+
+  async function handleSync(taskId: string, platform?: PlatformName) {
+    const syncKey = `${taskId}-${platform ?? "all"}`;
+    setSyncingKey(syncKey);
+    setError(null);
+
+    try {
+      const detail = await syncTask(taskId, platform);
+      setActiveTask(detail);
+      await refresh(detail.id);
+    } catch {
+      setError("同步平台状态失败。");
+    } finally {
+      setSyncingKey(null);
     }
   }
 
@@ -291,6 +308,15 @@ export default function TasksPage() {
                     {retryingKey === `${activeTask.id}-all` ? <LoadingInline label="重试中" /> : <RotateCcw size={16} />}
                     重试未完成
                   </button>
+                  <button
+                    className="secondary-button compact"
+                    type="button"
+                    onClick={() => handleSync(activeTask.id)}
+                    disabled={syncingKey === `${activeTask.id}-all`}
+                  >
+                    {syncingKey === `${activeTask.id}-all` ? <LoadingInline label="同步中" /> : <RefreshCcw size={16} />}
+                    同步平台状态
+                  </button>
                 </div>
 
                 <div className="result-list" style={{ marginTop: 16 }}>
@@ -326,6 +352,22 @@ export default function TasksPage() {
                             <RotateCcw size={16} />
                           )}
                           重试 {platformLabel(result.platform)}
+                        </button>
+                      ) : null}
+
+                      {activeTask.mode === "real-publish" && result.platform === "wechat" ? (
+                        <button
+                          className="secondary-button compact"
+                          type="button"
+                          onClick={() => handleSync(activeTask.id, result.platform)}
+                          disabled={syncingKey === `${activeTask.id}-${result.platform}`}
+                        >
+                          {syncingKey === `${activeTask.id}-${result.platform}` ? (
+                            <LoadingInline label="同步中" />
+                          ) : (
+                            <RefreshCcw size={16} />
+                          )}
+                          同步 {platformLabel(result.platform)}
                         </button>
                       ) : null}
 

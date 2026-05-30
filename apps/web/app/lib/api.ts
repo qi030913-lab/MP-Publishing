@@ -86,6 +86,13 @@ export function retryTask(taskId: string, platform?: PlatformName) {
   });
 }
 
+export function syncTask(taskId: string, platform?: PlatformName) {
+  return request<PublishTaskDetail>(`/publish/tasks/${taskId}/sync`, {
+    method: "POST",
+    body: JSON.stringify({ platform }),
+  });
+}
+
 export function accountAction(accountId: string, action: "check" | "refresh" | "mark-needs-login") {
   return request<PlatformAccount>(`/accounts/${accountId}/${action}`, {
     method: "POST",

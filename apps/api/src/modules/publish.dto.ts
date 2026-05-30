@@ -22,3 +22,7 @@ export type PublishRealDto = SimulatePublishDto;
 export type RetryPublishTaskDto = {
   platform?: PlatformName;
 };
+
+export type SyncPublishTaskDto = {
+  platform?: PlatformName;
+};

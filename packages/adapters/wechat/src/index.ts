@@ -3,8 +3,11 @@ import type {
   PlatformAdapter,
   PlatformCapabilities,
   PlatformDraft,
+  PlatformCredential,
   PublishInput,
   PublishResult,
+  PublishStatus,
+  PublishStatusInput,
   SimulationResult,
   ValidationIssue,
 } from "@mp-publishing/platform-sdk";
@@ -52,6 +55,20 @@ type WechatDraftResponse = WechatApiError & {
 
 type WechatFreePublishResponse = WechatApiError & {
   publish_id?: string;
+};
+
+type WechatFreePublishStatusResponse = WechatApiError & {
+  publish_id?: string;
+  publish_status?: number;
+  article_id?: string;
+  article_detail?: {
+    count?: number;
+    item?: Array<{
+      idx?: number;
+      article_url?: string;
+    }>;
+  };
+  fail_idx?: number[];
 };
 
 function createIssue(code: string, message: string, severity: ValidationIssue["severity"] = "error"): ValidationIssue {
@@ -151,8 +168,7 @@ async function requestWechatJson<T extends WechatApiError>(url: string, init?: R
   return payload;
 }
 
-async function resolveAccessToken(input: PublishInput) {
-  const credential = input.credential;
+async function resolveAccessToken(credential?: PlatformCredential) {
   if (!credential) {
     throw new Error("missing WeChat credential");
   }
@@ -198,7 +214,7 @@ function buildWechatArticle(input: PublishInput) {
 }
 
 async function createWechatDraft(input: PublishInput) {
-  const accessToken = await resolveAccessToken(input);
+  const accessToken = await resolveAccessToken(input.credential);
   const url = new URL("https://api.weixin.qq.com/cgi-bin/draft/add");
   url.searchParams.set("access_token", accessToken);
 
@@ -217,7 +233,7 @@ async function createWechatDraft(input: PublishInput) {
 }
 
 async function submitWechatPublish(input: PublishInput, mediaId: string) {
-  const accessToken = await resolveAccessToken(input);
+  const accessToken = await resolveAccessToken(input.credential);
   const url = new URL("https://api.weixin.qq.com/cgi-bin/freepublish/submit");
   url.searchParams.set("access_token", accessToken);
 
@@ -233,6 +249,74 @@ async function submitWechatPublish(input: PublishInput, mediaId: string) {
   }
 
   return payload.publish_id;
+}
+
+async function queryWechatPublishStatus(publishId: string, input?: PublishStatusInput): Promise<WechatFreePublishStatusResponse> {
+  const accessToken = await resolveAccessToken(input?.credential);
+  const url = new URL("https://api.weixin.qq.com/cgi-bin/freepublish/get");
+  url.searchParams.set("access_token", accessToken);
+
+  return requestWechatJson<WechatFreePublishStatusResponse>(url.toString(), {
+    method: "POST",
+    body: JSON.stringify({
+      publish_id: publishId,
+    }),
+  });
+}
+
+function mapWechatPublishStatus(payload: WechatFreePublishStatusResponse): PublishStatus {
+  const firstArticle = payload.article_detail?.item?.find((item) => item.article_url);
+
+  if (payload.publish_status === 0) {
+    return {
+      state: "succeeded",
+      detail: "WeChat reports the publish job succeeded.",
+      remoteId: payload.article_id ?? payload.publish_id,
+      url: firstArticle?.article_url,
+    };
+  }
+
+  if (payload.publish_status === 1) {
+    return {
+      state: "publishing",
+      detail: "WeChat reports the publish job is still running.",
+      remoteId: payload.publish_id,
+    };
+  }
+
+  if (payload.publish_status === 2) {
+    return {
+      state: "needs_manual_action",
+      detail: "WeChat original-content review failed.",
+      remoteId: payload.publish_id,
+      issues: [createIssue("WECHAT_ORIGINAL_REVIEW_FAILED", `Original review failed for article indexes: ${payload.fail_idx?.join(", ") || "unknown"}.`, "warning")],
+    };
+  }
+
+  if (payload.publish_status === 4) {
+    return {
+      state: "needs_manual_action",
+      detail: "WeChat platform review did not pass.",
+      remoteId: payload.publish_id,
+      issues: [createIssue("WECHAT_PLATFORM_REVIEW_FAILED", `Platform review failed for article indexes: ${payload.fail_idx?.join(", ") || "unknown"}.`, "warning")],
+    };
+  }
+
+  if (payload.publish_status === 5 || payload.publish_status === 6) {
+    return {
+      state: "needs_manual_action",
+      detail: "WeChat reports articles were removed or banned after publishing.",
+      remoteId: payload.publish_id,
+      issues: [createIssue("WECHAT_POST_PUBLISH_UNAVAILABLE", "Published WeChat articles are no longer available.", "warning")],
+    };
+  }
+
+  return {
+    state: "failed",
+    detail: `WeChat reports publish failure status ${payload.publish_status ?? "unknown"}.`,
+    remoteId: payload.publish_id,
+    issues: [createIssue("WECHAT_PUBLISH_FAILED", `WeChat publish_status=${payload.publish_status ?? "unknown"}.`)],
+  };
 }
 
 export const wechatAdapter: PlatformAdapter = {
@@ -350,10 +434,17 @@ export const wechatAdapter: PlatformAdapter = {
       };
     }
   },
-  async getPublishStatus() {
-    return {
-      state: "needs_manual_action",
-      detail: "WeChat status sync is not wired yet; use freepublish status query or webhook in the next milestone.",
-    };
+  async getPublishStatus(remoteId: string, input?: PublishStatusInput) {
+    try {
+      const payload = await queryWechatPublishStatus(remoteId, input);
+      return mapWechatPublishStatus(payload);
+    } catch (error) {
+      return {
+        state: "needs_manual_action",
+        detail: error instanceof Error ? error.message : "Unknown WeChat status query error.",
+        remoteId,
+        issues: [createIssue("WECHAT_STATUS_QUERY_FAILED", error instanceof Error ? error.message : "Unknown WeChat status query error.", "warning")],
+      };
+    }
   },
 };
