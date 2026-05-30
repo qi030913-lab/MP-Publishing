@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 
@@ -25,6 +25,15 @@ type StoredDraft = {
   accountId?: string;
   createdAt: string;
   payload: DraftPayload;
+};
+
+type DraftSummary = {
+  draftId: string;
+  platform: string;
+  accountId?: string;
+  title: string;
+  createdAt: string;
+  url: string;
 };
 
 const supportedPlatforms = new Set(["zhihu", "bilibili", "xiaohongshu"]);
@@ -209,6 +218,90 @@ function renderDraftHtml(storedDraft: StoredDraft, url: string) {
 </html>`;
 }
 
+function createDraftSummary(storedDraft: StoredDraft, request: IncomingMessage): DraftSummary {
+  return {
+    draftId: storedDraft.draftId,
+    platform: storedDraft.platform,
+    accountId: storedDraft.accountId,
+    title: storedDraft.payload.draft?.title ?? storedDraft.payload.document?.title ?? storedDraft.draftId,
+    createdAt: storedDraft.createdAt,
+    url: createDraftUrl(storedDraft.platform, storedDraft.draftId, request),
+  };
+}
+
+async function listStoredDrafts(platforms: string[], request: IncomingMessage) {
+  const drafts = await Promise.all(
+    platforms.map(async (platform) => {
+      const platformOutboxDir = path.join(outboxDir, platform);
+      if (!existsSync(platformOutboxDir)) {
+        return [];
+      }
+
+      const fileNames = await readdir(platformOutboxDir);
+      const storedDrafts = await Promise.all(
+        fileNames
+          .filter((fileName) => fileName.endsWith(".json"))
+          .map(async (fileName) => {
+            const content = await readFile(path.join(platformOutboxDir, fileName), "utf8");
+            return JSON.parse(content) as StoredDraft;
+          }),
+      );
+
+      return storedDrafts.map((storedDraft) => createDraftSummary(storedDraft, request));
+    }),
+  );
+
+  return drafts
+    .flat()
+    .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
+}
+
+function renderDraftListHtml(items: DraftSummary[], title: string) {
+  const content =
+    items.length > 0
+      ? `<div class="list">${items
+          .map(
+            (item) => `<a class="draft-row" href="${escapeHtml(item.url)}">
+          <strong>${escapeHtml(item.title)}</strong>
+          <span>${escapeHtml(item.platform)} · ${escapeHtml(item.accountId ?? "unknown")} · ${escapeHtml(item.createdAt)}</span>
+        </a>`,
+          )
+          .join("")}</div>`
+      : `<p class="empty">No drafts have been stored yet.</p>`;
+
+  return `<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(title)}</title>
+    <style>
+      body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f7f7f4; }
+      main { width: min(960px, calc(100vw - 32px)); margin: 32px auto; }
+      .toolbar { display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0 20px; }
+      .toolbar a, .draft-row { background: #fff; border: 1px solid #d7d7cf; border-radius: 8px; color: inherit; text-decoration: none; }
+      .toolbar a { padding: 8px 12px; }
+      .list { display: grid; gap: 10px; }
+      .draft-row { display: grid; gap: 6px; padding: 16px; }
+      .draft-row span, .empty { color: #626a73; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>${escapeHtml(title)}</h1>
+      <div class="toolbar">
+        <a href="/drafts">All</a>
+        ${Array.from(supportedPlatforms)
+          .map((platform) => `<a href="/${escapeHtml(platform)}/drafts">${escapeHtml(platform)}</a>`)
+          .join("")}
+        <a href="/drafts?format=json">JSON</a>
+      </div>
+      ${content}
+    </main>
+  </body>
+</html>`;
+}
+
 async function handleCreateDraft(platform: string, request: IncomingMessage, response: ServerResponse) {
   if (!requireAuthorized(request)) {
     sendJson(response, 401, { ok: false, message: "Draft connector API key is invalid." });
@@ -271,6 +364,19 @@ async function handleGetDraft(platform: string, draftId: string | undefined, req
   sendHtml(response, 200, renderDraftHtml(storedDraft, url));
 }
 
+async function handleListDrafts(platform: string | undefined, request: IncomingMessage, response: ServerResponse) {
+  const platforms = platform ? [platform] : Array.from(supportedPlatforms);
+  const items = await listStoredDrafts(platforms, request);
+  const title = platform ? `${platform} drafts` : "Draft connector outbox";
+
+  if (shouldReturnJson(request)) {
+    sendJson(response, 200, { ok: true, outboxDir, items });
+    return;
+  }
+
+  sendHtml(response, 200, renderDraftListHtml(items, title));
+}
+
 async function handleDraftStatus(platform: string, request: IncomingMessage, response: ServerResponse) {
   if (!requireAuthorized(request)) {
     sendJson(response, 401, { state: "needs_manual_action", detail: "Draft connector API key is invalid." });
@@ -322,6 +428,11 @@ const server = createServer((request, response) => {
         return;
       }
 
+      if (request.method === "GET" && routePlatform === "drafts") {
+        await handleListDrafts(undefined, request, response);
+        return;
+      }
+
       if (!platform) {
         sendJson(response, 404, { ok: false, message: "Unsupported draft connector platform." });
         return;
@@ -333,7 +444,12 @@ const server = createServer((request, response) => {
       }
 
       if (request.method === "GET" && operation === "drafts") {
-        await handleGetDraft(platform, draftId, request, response);
+        if (draftId) {
+          await handleGetDraft(platform, draftId, request, response);
+          return;
+        }
+
+        await handleListDrafts(platform, request, response);
         return;
       }
 

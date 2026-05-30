@@ -75,6 +75,16 @@ async function requestAbsoluteJson(url) {
   return response.json();
 }
 
+async function requestAbsoluteText(url) {
+  const response = await fetch(url);
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`GET ${url} failed: ${response.status} ${body}`);
+  }
+
+  return response.text();
+}
+
 async function waitForApi(api) {
   for (let i = 0; i < 40; i += 1) {
     if (api.child.exitCode !== null) {
@@ -287,6 +297,28 @@ try {
 
   task = syncedTask;
 
+  const outboxIndex = await requestAbsoluteJson(`${connectorBaseUrl}/drafts?format=json`);
+  const outboxHtml = await requestAbsoluteText(`${connectorBaseUrl}/drafts`);
+  if (outboxIndex.items?.length !== platforms.length) {
+    throw new Error(`Draft connector outbox index did not include every stored draft: ${JSON.stringify(outboxIndex)}`);
+  }
+
+  if (!outboxHtml.includes("Draft connector outbox") || !outboxHtml.includes("/zhihu/drafts/")) {
+    throw new Error(`Draft connector outbox HTML did not render expected draft links: ${outboxHtml.slice(0, 500)}`);
+  }
+
+  const outboxPlatforms = new Set(outboxIndex.items.map((item) => item.platform));
+  for (const platform of platforms) {
+    if (!outboxPlatforms.has(platform)) {
+      throw new Error(`Draft connector outbox index is missing ${platform}: ${JSON.stringify(outboxIndex)}`);
+    }
+
+    const platformOutbox = await requestAbsoluteJson(`${connectorBaseUrl}/${platform}/drafts?format=json`);
+    if (platformOutbox.items?.length !== 1 || platformOutbox.items[0]?.platform !== platform) {
+      throw new Error(`Draft connector platform outbox is incorrect for ${platform}: ${JSON.stringify(platformOutbox)}`);
+    }
+  }
+
   const result = {
     taskId: created.id,
     finalStatus: task.status,
@@ -305,6 +337,12 @@ try {
     })),
     draftDetails,
     syncedTargets,
+    outboxIndex: outboxIndex.items.map((item) => ({
+      platform: item.platform,
+      draftId: item.draftId,
+      title: item.title,
+      url: item.url,
+    })),
     queue: runtime.queue,
   };
 
