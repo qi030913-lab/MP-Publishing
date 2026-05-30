@@ -911,6 +911,121 @@ async function runOfflineDraftConnectorPreflightCheck() {
   }
 }
 
+async function runExplicitLocalDraftEndpointPreflightCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const apiPort = await getFreePort();
+  const offlineConnectorPort = await getFreePort();
+  const queueName = `mp-publishing-draft-explicit-local-e2e-${Date.now()}`;
+  const connectorBaseUrl = `http://127.0.0.1:${offlineConnectorPort}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+
+  const api = startService("api-draft-explicit-local", ["apps/api/dist/main.js"], {
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: "",
+    DRAFT_CONNECTOR_HEALTH_URL: "",
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    ZHIHU_DRAFT_ENDPOINT: `${connectorBaseUrl}/zhihu/drafts`,
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_DRAFT_ENDPOINT: `${connectorBaseUrl}/bilibili/drafts`,
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_DRAFT_ENDPOINT: `${connectorBaseUrl}/xiaohongshu/drafts`,
+  });
+
+  try {
+    await waitForApi(api);
+    const initialRuntime = await requestJson("/runtime/status");
+    if (
+      initialRuntime.draftConnector?.status !== "offline" ||
+      initialRuntime.draftConnector?.healthUrl !== `${connectorBaseUrl}/health`
+    ) {
+      throw new Error(`Explicit local draft endpoints did not infer connector health: ${JSON.stringify(initialRuntime.draftConnector)}`);
+    }
+
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for explicit local endpoint preflight verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "三平台显式本地 endpoint 离线预检验证",
+          summary: "验证显式配置本地 connector endpoint 时仍会探测 /health。",
+          body: "这条内容用于确认未设置 DRAFT_CONNECTOR_BASE_URL 但使用本地 /:platform/drafts endpoint 时，API 仍会在入队前发现连接器离线。",
+          tags: ["draft", "explicit-endpoint", "offline", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+
+    if (
+      created.status !== "needs_manual_action" ||
+      platforms.some((platform) => {
+        const target = created.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return target?.status !== "needs_manual_action" || !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_CONNECTOR_OFFLINE`);
+      })
+    ) {
+      throw new Error(`Explicit local endpoint preflight did not hold offline connector targets: ${JSON.stringify(created)}`);
+    }
+
+    const retried = await requestJson(`/publish/tasks/${created.id}/retry`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const runtimeAfterRetry = await requestJson("/runtime/status");
+
+    if (
+      retried.status !== "needs_manual_action" ||
+      platforms.some((platform) => {
+        const target = retried.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return target?.status !== "needs_manual_action" || !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_CONNECTOR_OFFLINE`);
+      })
+    ) {
+      throw new Error(`Explicit local endpoint retry did not keep targets on manual action: ${JSON.stringify(retried)}`);
+    }
+
+    if (
+      runtimeAfterRetry.queue.waiting > 0 ||
+      runtimeAfterRetry.queue.active > 0 ||
+      runtimeAfterRetry.queue.delayed > 0 ||
+      runtimeAfterRetry.queue.failed > 0
+    ) {
+      throw new Error(`Explicit local endpoint retry should not enqueue work: ${JSON.stringify(runtimeAfterRetry.queue)}`);
+    }
+
+    return {
+      taskId: created.id,
+      status: retried.status,
+      healthUrl: initialRuntime.draftConnector.healthUrl,
+      targets: retried.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        attemptCount: target.attemptCount,
+        issueCodes: target.issues.map((issue) => issue.code),
+      })),
+      queue: runtimeAfterRetry.queue,
+    };
+  } finally {
+    await stopService(api);
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runCredentialForwardingMismatchPreflightCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -1783,6 +1898,7 @@ const disabledPreflight = await runDisabledDraftPreflightCheck();
 const credentialPreflight = await runCredentialPreflightCheck();
 const credentialMismatchPreflight = await runCredentialForwardingMismatchPreflightCheck();
 const offlinePreflight = await runOfflineDraftConnectorPreflightCheck();
+const explicitLocalEndpointPreflight = await runExplicitLocalDraftEndpointPreflightCheck();
 const offlineUpstreamPreflight = await runOfflineUpstreamDraftPreflightCheck();
 const offlineUpstreamRecovery = await runOfflineUpstreamDraftRecoveryCheck();
 const upstreamForwarding = await runUpstreamDraftForwardingCheck();
@@ -2051,6 +2167,7 @@ try {
     credentialPreflight,
     credentialMismatchPreflight,
     offlinePreflight,
+    explicitLocalEndpointPreflight,
     offlineUpstreamPreflight,
     offlineUpstreamRecovery,
     upstreamForwarding,

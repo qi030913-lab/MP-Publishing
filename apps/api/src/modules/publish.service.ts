@@ -59,6 +59,29 @@ function trimTrailingSlash(value: string) {
   return value.replace(/\/+$/, "");
 }
 
+function isLocalConnectorHost(hostname: string) {
+  const normalized = hostname.toLowerCase();
+  return normalized === "localhost" || normalized === "127.0.0.1" || normalized === "::1";
+}
+
+function inferLocalDraftConnectorHealthUrl(platform: PlatformName, draftEndpoint: string | undefined) {
+  if (!draftEndpoint) {
+    return undefined;
+  }
+
+  try {
+    const url = new URL(draftEndpoint);
+    const pathname = url.pathname.replace(/\/+$/, "");
+    if (!isLocalConnectorHost(url.hostname) || pathname !== `/${platform}/drafts`) {
+      return undefined;
+    }
+
+    return `${url.origin}/health`;
+  } catch {
+    return undefined;
+  }
+}
+
 function resolveDraftEndpoint(platform: PlatformName, envPrefix: string) {
   const explicitEndpoint = readEnvValue(`${envPrefix}_DRAFT_ENDPOINT`);
   if (explicitEndpoint) {
@@ -69,8 +92,18 @@ function resolveDraftEndpoint(platform: PlatformName, envPrefix: string) {
   return baseUrl ? `${trimTrailingSlash(baseUrl)}/${platform}/drafts` : undefined;
 }
 
-function usesInferredDraftConnectorEndpoint(envPrefix: string) {
-  return !readEnvValue(`${envPrefix}_DRAFT_ENDPOINT`) && Boolean(readEnvValue("DRAFT_CONNECTOR_BASE_URL"));
+function resolveDraftConnectorHealthUrl(platform: PlatformName, envPrefix: string) {
+  const explicitHealthUrl = readEnvValue("DRAFT_CONNECTOR_HEALTH_URL");
+  if (explicitHealthUrl) {
+    return explicitHealthUrl;
+  }
+
+  const baseUrl = readEnvValue("DRAFT_CONNECTOR_BASE_URL");
+  if (baseUrl) {
+    return `${trimTrailingSlash(baseUrl)}/health`;
+  }
+
+  return inferLocalDraftConnectorHealthUrl(platform, readEnvValue(`${envPrefix}_DRAFT_ENDPOINT`));
 }
 
 @Injectable()
@@ -143,12 +176,8 @@ export class PublishService {
   }
 
   private async probeDraftConnectorHealth(platform: PlatformName, envPrefix: string) {
-    if (!usesInferredDraftConnectorEndpoint(envPrefix)) {
-      return [];
-    }
-
-    const baseUrl = readEnvValue("DRAFT_CONNECTOR_BASE_URL");
-    if (!baseUrl) {
+    const healthUrl = resolveDraftConnectorHealthUrl(platform, envPrefix);
+    if (!healthUrl) {
       return [];
     }
 
@@ -156,7 +185,7 @@ export class PublishService {
     const timeout = setTimeout(() => controller.abort(), 1500);
 
     try {
-      const response = await fetch(`${trimTrailingSlash(baseUrl)}/health`, { signal: controller.signal });
+      const response = await fetch(healthUrl, { signal: controller.signal });
       if (!response.ok) {
         return [
           this.createIssue(

@@ -168,6 +168,7 @@ export type RuntimeStatus = {
     status: "online" | "offline" | "configured" | "unconfigured";
     baseUrl?: string;
     outboxUrl?: string;
+    healthUrl?: string;
     outboxDir?: string;
     detail: string;
     platforms: Array<{
