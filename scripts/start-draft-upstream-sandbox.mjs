@@ -32,6 +32,8 @@ Routes:
   GET /:platform/work-orders       List work-order summaries for one platform.
   GET /:platform/work-orders/:remoteId
                                    Read the full creator-center fill checklist.
+  POST /:platform/work-orders/:remoteId/complete
+                                   Mark a filled creator-center draft complete and callback the connector.
 
   --help`;
 
@@ -121,6 +123,19 @@ function normalizeState(value) {
   }
 
   throw new Error("--initial-state must be one of draft, publishing, ready, succeeded, failed, needs_manual_action.");
+}
+
+function normalizeOptionalState(value) {
+  if (value === undefined || value === null || value === "") {
+    return undefined;
+  }
+
+  const state = String(value).trim();
+  if (["draft", "publishing", "ready", "succeeded", "failed", "needs_manual_action"].includes(state)) {
+    return state;
+  }
+
+  return undefined;
 }
 
 function resolveWorkspacePath(value) {
@@ -277,6 +292,8 @@ function createWorkOrder({ platform, payload, remoteId, url, statusCallbackUrl, 
     platform,
     remoteId,
     url,
+    externalDraftId: remoteId,
+    externalUrl: url,
     accountId: payload.accountId,
     createdAt: now,
     connector: {
@@ -309,8 +326,8 @@ function createWorkOrder({ platform, payload, remoteId, url, statusCallbackUrl, 
     },
     callbackPayloadTemplate: {
       state: "ready",
-      remoteId,
-      url,
+      remoteId: "<real-platform-draft-id>",
+      url: "<real-platform-draft-url>",
       detail: `${platform} creator-center draft was saved by upstream automation.`,
     },
     checklist: createWorkOrderChecklist(platform, draft),
@@ -324,6 +341,9 @@ function summarizeWorkOrder(record) {
     url: record.url,
     accountId: record.accountId,
     title: record.workOrder?.draft?.title ?? record.title,
+    completed: Boolean(record.completion),
+    externalDraftId: record.externalDraftId,
+    externalUrl: record.externalUrl,
     checklistTotal: record.workOrder?.checklist?.length ?? 0,
     requiredChecklistTotal: record.workOrder?.checklist?.filter((item) => item.required).length ?? 0,
     callbackUrl: record.workOrder?.connector?.statusCallbackUrl ?? record.statusCallbackUrl,
@@ -352,6 +372,16 @@ async function readRecord(outboxDir, platform, remoteId) {
 
     throw error;
   }
+}
+
+async function findRecordByRemoteId(outboxDir, platform, remoteId) {
+  const directRecord = await readRecord(outboxDir, platform, remoteId);
+  if (directRecord) {
+    return directRecord;
+  }
+
+  const records = await listRecords(outboxDir, [platform]);
+  return records.find((record) => record.externalDraftId === remoteId || record.completion?.externalDraftId === remoteId) ?? null;
 }
 
 async function listRecords(outboxDir, platforms) {
@@ -388,6 +418,13 @@ async function summarizeOutbox(outboxDir) {
 }
 
 async function postStatusCallback(record, connectorApiKey) {
+  const callbackRemoteId = record.externalDraftId ?? record.completion?.externalDraftId ?? record.remoteId;
+  const callbackUrl = record.externalUrl ?? record.completion?.externalUrl ?? record.url;
+  const callbackDetail =
+    record.completion?.detail ??
+    (record.completion
+      ? `${record.platform} creator-center draft was completed through upstream work order.`
+      : `${record.platform} sandbox upstream draft callback accepted.`);
   const response = await fetch(record.statusCallbackUrl, {
     method: "POST",
     headers: {
@@ -396,9 +433,10 @@ async function postStatusCallback(record, connectorApiKey) {
     },
     body: JSON.stringify({
       state: record.state,
-      remoteId: record.remoteId,
-      url: record.url,
-      detail: `${record.platform} sandbox upstream draft callback accepted.`,
+      remoteId: callbackRemoteId,
+      url: callbackUrl,
+      detail: callbackDetail,
+      ...(record.completion?.issues ? { issues: record.completion.issues } : {}),
     }),
   });
   const body = await response.text();
@@ -434,6 +472,78 @@ function scheduleStatusCallback(outboxDir, record, connectorApiKey, callbackDela
       });
     });
   }, callbackDelayMs);
+}
+
+async function handleCompleteWorkOrder({ request, response, platform, remoteId, outboxDir, connectorApiKey }) {
+  const record = await readRecord(outboxDir, platform, remoteId);
+  if (!record?.workOrder) {
+    sendJson(response, 404, { ok: false, message: `${platform} sandbox work order ${remoteId} was not found.` });
+    return;
+  }
+
+  const payload = await readRequestJson(request);
+  const externalDraftId = readOptionalString(payload.externalDraftId) ?? readOptionalString(payload.remoteId);
+  const externalUrl = readOptionalString(payload.externalUrl) ?? readOptionalString(payload.url);
+  const state = normalizeOptionalState(payload.state) ?? "ready";
+  const detail =
+    readOptionalString(payload.detail) ?? `${platform} creator-center draft was completed through upstream work order.`;
+  const issues = readValidationIssues(payload.issues);
+  if (!externalDraftId || !externalUrl) {
+    sendJson(response, 422, {
+      ok: false,
+      message: "Work-order completion must include remoteId/externalDraftId and url/externalUrl.",
+    });
+    return;
+  }
+
+  const completedAt = new Date().toISOString();
+  const completedRecord = {
+    ...record,
+    state,
+    externalDraftId,
+    externalUrl,
+    completion: {
+      completedAt,
+      completedBy: readOptionalString(payload.completedBy) ?? "upstream-work-order",
+      externalDraftId,
+      externalUrl,
+      state,
+      detail,
+      ...(issues.length > 0 ? { issues } : {}),
+    },
+    workOrder: {
+      ...record.workOrder,
+      externalDraftId,
+      externalUrl,
+      completedAt,
+      callbackPayloadTemplate: {
+        state,
+        remoteId: externalDraftId,
+        url: externalUrl,
+        detail,
+      },
+    },
+    updatedAt: completedAt,
+  };
+
+  const callback = await postStatusCallback(completedRecord, connectorApiKey);
+  const storedRecord = {
+    ...completedRecord,
+    callback,
+    callbackAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  await writeRecord(outboxDir, storedRecord);
+
+  sendJson(response, callback.ok ? 200 : 502, {
+    ok: callback.ok,
+    state: storedRecord.state,
+    remoteId: storedRecord.externalDraftId,
+    url: storedRecord.externalUrl,
+    detail,
+    callback,
+    workOrder: summarizeWorkOrder(storedRecord),
+  });
 }
 
 async function handleCreateDraft({
@@ -521,7 +631,7 @@ async function handleStatus({ request, response, platform, outboxDir }) {
     return;
   }
 
-  const record = await readRecord(outboxDir, platform, remoteId);
+  const record = await findRecordByRemoteId(outboxDir, platform, remoteId);
   if (!record) {
     sendJson(response, 404, {
       ok: false,
@@ -544,8 +654,8 @@ async function handleStatus({ request, response, platform, outboxDir }) {
   sendJson(response, 200, {
     ok: true,
     state: updatedRecord.state,
-    remoteId: updatedRecord.remoteId,
-    url: updatedRecord.url,
+    remoteId: updatedRecord.externalDraftId ?? updatedRecord.remoteId,
+    url: updatedRecord.externalUrl ?? updatedRecord.url,
     detail: `${platform} sandbox upstream draft status returned.`,
   });
 }
@@ -603,7 +713,7 @@ async function main() {
           return;
         }
 
-        const [platform, operation, remoteId] = parts;
+        const [platform, operation, remoteId, action] = parts;
         if (!supportedPlatforms.has(platform)) {
           sendJson(response, 404, { ok: false, message: "Unsupported upstream sandbox platform." });
           return;
@@ -639,6 +749,18 @@ async function main() {
 
           const records = await listRecords(outboxDir, [platform]);
           sendJson(response, 200, { ok: true, outboxDir, items: records.map(summarizeWorkOrder) });
+          return;
+        }
+
+        if (request.method === "POST" && operation === "work-orders" && remoteId && action === "complete") {
+          await handleCompleteWorkOrder({
+            request,
+            response,
+            platform,
+            remoteId,
+            outboxDir,
+            connectorApiKey,
+          });
           return;
         }
 

@@ -993,12 +993,85 @@ async function runUpstreamSandboxCallbackCheck() {
       throw new Error(`Async sandbox upstream did not persist successful connector callbacks: ${JSON.stringify(sandboxOutbox)}`);
     }
 
+    const workOrderCompletions = [];
+    for (const item of sandboxOutbox.items) {
+      const externalDraftId = `${item.platform}-creator-draft-${created.id}`;
+      const externalUrl = `https://creator.example.test/${item.platform}/drafts/${externalDraftId}`;
+      const completion = await requestAbsoluteJson(`${sandboxBaseUrl}/${item.platform}/work-orders/${item.remoteId}/complete`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${sandboxApiKey}`,
+        },
+        body: JSON.stringify({
+          remoteId: externalDraftId,
+          url: externalUrl,
+          state: "ready",
+          completedBy: "e2e-work-order-completion",
+          detail: `${item.platform} creator-center draft completed through work-order e2e.`,
+        }),
+      });
+      if (!completion.ok || completion.remoteId !== externalDraftId || completion.url !== externalUrl || completion.callback?.status !== 200) {
+        throw new Error(`Sandbox work-order completion did not callback connector: ${JSON.stringify(completion)}`);
+      }
+
+      workOrderCompletions.push({
+        platform: item.platform,
+        workOrderId: item.remoteId,
+        externalDraftId,
+        externalUrl,
+      });
+    }
+
+    const completedCallbackDrafts = [];
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      completedCallbackDrafts.length = 0;
+      for (const completion of workOrderCompletions) {
+        const target = task.results.find((item) => item.platform === completion.platform);
+        if (!target) {
+          continue;
+        }
+        const detail = await requestAbsoluteJson(target.url);
+        if (detail.externalDraftId === completion.externalDraftId && detail.externalUrl === completion.externalUrl) {
+          completedCallbackDrafts.push(completion);
+        }
+      }
+
+      if (completedCallbackDrafts.length === platforms.length) {
+        break;
+      }
+
+      await delay(200);
+    }
+
+    if (completedCallbackDrafts.length !== platforms.length) {
+      throw new Error(`Work-order completions did not update every connector draft: ${JSON.stringify(completedCallbackDrafts)}`);
+    }
+
+    const completedTask = await requestJson(`/publish/tasks/${created.id}/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    if (
+      completedTask.status !== "succeeded" ||
+      platforms.some((platform) => {
+        const target = completedTask.results.find((item) => item.platform === platform);
+        const completion = workOrderCompletions.find((item) => item.platform === platform);
+        return !target || !completion || target.remoteId !== completion.externalDraftId || target.url !== completion.externalUrl;
+      })
+    ) {
+      throw new Error(`Work-order completion sync did not expose creator-center draft links: ${JSON.stringify(completedTask)}`);
+    }
+
     return {
       taskId: created.id,
       initialStatus: task.status,
-      finalStatus: syncedTask.status,
+      finalStatus: completedTask.status,
       callbackKeyDraftCreateRejected,
       callbackDrafts,
+      workOrderCompletions,
       sandboxCallbacks: sandboxOutbox.items.map((item) => ({
         platform: item.platform,
         remoteId: item.remoteId,

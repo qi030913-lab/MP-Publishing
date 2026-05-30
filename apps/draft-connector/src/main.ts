@@ -53,6 +53,7 @@ type StoredDraft = {
   updatedAt: string;
   state: DraftState;
   externalDraftId?: string;
+  externalDraftIdAliases?: string[];
   externalUrl?: string;
   statusDetail?: string;
   statusIssues?: ValidationIssue[];
@@ -68,6 +69,7 @@ type DraftSummary = {
   updatedAt: string;
   state: DraftState;
   externalDraftId?: string;
+  externalDraftIdAliases?: string[];
   externalUrl?: string;
   statusDetail?: string;
   url: string;
@@ -475,11 +477,31 @@ function normalizeIssues(value: unknown) {
   return Array.isArray(value) ? value.filter(isValidationIssue) : undefined;
 }
 
+function normalizeStringList(value: unknown) {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string" && item.trim().length > 0).map((item) => item.trim())
+    : undefined;
+}
+
+function createExternalDraftIdAliases(storedDraft: StoredDraft, nextExternalDraftId: string | undefined) {
+  const aliases = new Set(normalizeStringList(storedDraft.externalDraftIdAliases) ?? []);
+  if (storedDraft.externalDraftId && nextExternalDraftId && storedDraft.externalDraftId !== nextExternalDraftId) {
+    aliases.add(storedDraft.externalDraftId);
+  }
+
+  if (nextExternalDraftId) {
+    aliases.delete(nextExternalDraftId);
+  }
+
+  return aliases.size > 0 ? Array.from(aliases) : undefined;
+}
+
 function normalizeStoredDraft(raw: StoredDraft): StoredDraft {
   return {
     ...raw,
     state: normalizeDraftState(raw.state) ?? "draft",
     updatedAt: raw.updatedAt ?? raw.createdAt,
+    externalDraftIdAliases: normalizeStringList(raw.externalDraftIdAliases),
     statusIssues: normalizeIssues(raw.statusIssues),
   };
 }
@@ -705,11 +727,13 @@ function applyUpstreamDraftResponse(storedDraft: StoredDraft, payload: UpstreamD
   const nextState = normalizeDraftState(payload.state) ?? (externalDraftId || externalUrl ? "ready" : storedDraft.state);
   const statusDetail = readOptionalString(payload.detail) ?? readOptionalString(payload.message) ?? storedDraft.statusDetail;
   const statusIssues = normalizeIssues(payload.issues);
+  const nextExternalDraftId = externalDraftId ?? storedDraft.externalDraftId;
 
   return {
     ...storedDraft,
     state: nextState,
-    externalDraftId: externalDraftId ?? storedDraft.externalDraftId,
+    externalDraftId: nextExternalDraftId,
+    externalDraftIdAliases: createExternalDraftIdAliases(storedDraft, nextExternalDraftId),
     externalUrl: externalUrl ?? storedDraft.externalUrl,
     statusDetail,
     statusIssues: statusIssues ?? storedDraft.statusIssues,
@@ -948,7 +972,7 @@ async function findStoredDraftByRemoteId(platform: string, remoteId: string) {
       continue;
     }
 
-    if (storedDraft.externalDraftId === remoteId) {
+    if (storedDraft.externalDraftId === remoteId || storedDraft.externalDraftIdAliases?.includes(remoteId)) {
       return storedDraft;
     }
   }
@@ -1129,6 +1153,7 @@ function createDraftSummary(storedDraft: StoredDraft, request: IncomingMessage):
     updatedAt: storedDraft.updatedAt,
     state: storedDraft.state,
     externalDraftId: storedDraft.externalDraftId,
+    externalDraftIdAliases: storedDraft.externalDraftIdAliases,
     externalUrl: storedDraft.externalUrl,
     statusDetail: storedDraft.statusDetail,
     url: createDraftUrl(storedDraft.platform, storedDraft.draftId, request),
@@ -1309,10 +1334,12 @@ async function handleUpdateDraftStatus(platform: string, draftId: string | undef
   const externalUrl = readOptionalString(payload.externalUrl) ?? readOptionalString(payload.url);
   const statusDetail = readOptionalString(payload.detail);
   const statusIssues = Array.isArray(payload.issues) ? payload.issues.filter(isValidationIssue) : undefined;
+  const nextExternalDraftId = externalDraftId ?? storedDraft.externalDraftId;
   const updatedDraft: StoredDraft = {
     ...storedDraft,
     state,
-    externalDraftId: externalDraftId ?? storedDraft.externalDraftId,
+    externalDraftId: nextExternalDraftId,
+    externalDraftIdAliases: createExternalDraftIdAliases(storedDraft, nextExternalDraftId),
     externalUrl: externalUrl ?? storedDraft.externalUrl,
     statusDetail: statusDetail ?? storedDraft.statusDetail,
     statusIssues: statusIssues ?? storedDraft.statusIssues,
