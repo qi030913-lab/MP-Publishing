@@ -375,6 +375,7 @@ async function runDisabledDraftPreflightCheck() {
   const previousApiBaseUrl = apiBaseUrl;
   const preflightApiPort = await getFreePort();
   const preflightQueueName = `mp-publishing-draft-preflight-e2e-${Date.now()}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
   apiBaseUrl = `http://127.0.0.1:${preflightApiPort}`;
   const api = startService("api-draft-preflight", ["apps/api/dist/main.js"], {
     PORT: String(preflightApiPort),
@@ -382,14 +383,18 @@ async function runDisabledDraftPreflightCheck() {
     DRAFT_CONNECTOR_BASE_URL: "",
     ZHIHU_REAL_PUBLISH_ENABLED: "false",
     ZHIHU_DRAFT_ENDPOINT: "",
+    BILIBILI_REAL_PUBLISH_ENABLED: "false",
+    BILIBILI_DRAFT_ENDPOINT: "",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "false",
+    XIAOHONGSHU_DRAFT_ENDPOINT: "",
   });
 
   try {
     await waitForApi(api);
     const accountsResponse = await requestJson("/accounts");
-    const zhihuAccount = accountsResponse.items.find((account) => account.platform === "zhihu");
-    if (!zhihuAccount) {
-      throw new Error(`Missing zhihu account for preflight verification: ${JSON.stringify(accountsResponse.items)}`);
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for disabled preflight verification: ${JSON.stringify(accountsResponse.items)}`);
     }
 
     const created = await requestJson("/publish/real", {
@@ -399,23 +404,26 @@ async function runDisabledDraftPreflightCheck() {
         document: {
           title: "非公众号平台真实草稿预检验证",
           summary: "验证未启用连接器时不会把真实草稿任务排入 worker。",
-          body: "这条内容用于确认 API 会在创建真实草稿任务时做连接器预检。",
+          body: "这条内容用于确认 API 会在创建三平台真实草稿任务时做连接器预检。",
           tags: ["draft", "preflight", "e2e"],
         },
-        platforms: ["zhihu"],
-        accountIds: [zhihuAccount.id],
+        platforms,
+        accountIds: accounts.map((account) => account.id),
         toneMode: "keep",
         preserveOriginal: true,
       }),
     });
-    const target = created.results.find((item) => item.platform === "zhihu");
-    const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
-
     if (
       created.status !== "needs_manual_action" ||
-      target?.status !== "needs_manual_action" ||
-      !issueCodes.includes("ZHIHU_REAL_PUBLISH_DISABLED") ||
-      !issueCodes.includes("ZHIHU_DRAFT_ENDPOINT_MISSING")
+      platforms.some((platform) => {
+        const target = created.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return (
+          target?.status !== "needs_manual_action" ||
+          !issueCodes.includes(`${platform.toUpperCase()}_REAL_PUBLISH_DISABLED`) ||
+          !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_ENDPOINT_MISSING`)
+        );
+      })
     ) {
       throw new Error(`Draft preflight did not mark disabled connector target correctly: ${JSON.stringify(created)}`);
     }
@@ -423,17 +431,21 @@ async function runDisabledDraftPreflightCheck() {
     const retried = await requestJson(`/publish/tasks/${created.id}/retry`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ platform: "zhihu" }),
+      body: JSON.stringify({}),
     });
-    const retryTarget = retried.results.find((item) => item.platform === "zhihu");
-    const retryIssueCodes = retryTarget?.issues?.map((issue) => issue.code) ?? [];
     const runtimeAfterRetry = await requestJson("/runtime/status");
 
     if (
       retried.status !== "needs_manual_action" ||
-      retryTarget?.status !== "needs_manual_action" ||
-      !retryIssueCodes.includes("ZHIHU_REAL_PUBLISH_DISABLED") ||
-      !retryIssueCodes.includes("ZHIHU_DRAFT_ENDPOINT_MISSING")
+      platforms.some((platform) => {
+        const target = retried.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return (
+          target?.status !== "needs_manual_action" ||
+          !issueCodes.includes(`${platform.toUpperCase()}_REAL_PUBLISH_DISABLED`) ||
+          !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_ENDPOINT_MISSING`)
+        );
+      })
     ) {
       throw new Error(`Draft preflight retry did not keep disabled connector target on manual action: ${JSON.stringify(retried)}`);
     }
@@ -450,9 +462,12 @@ async function runDisabledDraftPreflightCheck() {
     return {
       taskId: created.id,
       status: retried.status,
-      targetStatus: retryTarget.status,
-      attemptCount: retryTarget.attemptCount,
-      issueCodes: retryIssueCodes,
+      targets: retried.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        attemptCount: target.attemptCount,
+        issueCodes: target.issues.map((issue) => issue.code),
+      })),
       queue: runtimeAfterRetry.queue,
     };
   } finally {
@@ -470,6 +485,7 @@ async function runOfflineDraftConnectorPreflightCheck() {
   const preflightApiPort = await getFreePort();
   const offlineConnectorPort = await getFreePort();
   const preflightQueueName = `mp-publishing-draft-offline-e2e-${Date.now()}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
   apiBaseUrl = `http://127.0.0.1:${preflightApiPort}`;
   const api = startService("api-draft-offline", ["apps/api/dist/main.js"], {
     PORT: String(preflightApiPort),
@@ -477,14 +493,18 @@ async function runOfflineDraftConnectorPreflightCheck() {
     DRAFT_CONNECTOR_BASE_URL: `http://127.0.0.1:${offlineConnectorPort}`,
     ZHIHU_REAL_PUBLISH_ENABLED: "true",
     ZHIHU_DRAFT_ENDPOINT: "",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_DRAFT_ENDPOINT: "",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_DRAFT_ENDPOINT: "",
   });
 
   try {
     await waitForApi(api);
     const accountsResponse = await requestJson("/accounts");
-    const zhihuAccount = accountsResponse.items.find((account) => account.platform === "zhihu");
-    if (!zhihuAccount) {
-      throw new Error(`Missing zhihu account for offline connector preflight verification: ${JSON.stringify(accountsResponse.items)}`);
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for offline connector preflight verification: ${JSON.stringify(accountsResponse.items)}`);
     }
 
     const created = await requestJson("/publish/real", {
@@ -494,22 +514,23 @@ async function runOfflineDraftConnectorPreflightCheck() {
         document: {
           title: "非公众号平台真实草稿离线连接器预检验证",
           summary: "验证本地连接器离线时不会把真实草稿任务排入 worker。",
-          body: "这条内容用于确认 API 会在创建真实草稿任务时探测本地 draft connector health。",
+          body: "这条内容用于确认 API 会在创建三平台真实草稿任务时探测本地 draft connector health。",
           tags: ["draft", "offline", "e2e"],
         },
-        platforms: ["zhihu"],
-        accountIds: [zhihuAccount.id],
+        platforms,
+        accountIds: accounts.map((account) => account.id),
         toneMode: "keep",
         preserveOriginal: true,
       }),
     });
-    const target = created.results.find((item) => item.platform === "zhihu");
-    const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
 
     if (
       created.status !== "needs_manual_action" ||
-      target?.status !== "needs_manual_action" ||
-      !issueCodes.includes("ZHIHU_DRAFT_CONNECTOR_OFFLINE")
+      platforms.some((platform) => {
+        const target = created.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return target?.status !== "needs_manual_action" || !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_CONNECTOR_OFFLINE`);
+      })
     ) {
       throw new Error(`Draft preflight did not hold an offline connector target correctly: ${JSON.stringify(created)}`);
     }
@@ -517,16 +538,17 @@ async function runOfflineDraftConnectorPreflightCheck() {
     const retried = await requestJson(`/publish/tasks/${created.id}/retry`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ platform: "zhihu" }),
+      body: JSON.stringify({}),
     });
-    const retryTarget = retried.results.find((item) => item.platform === "zhihu");
-    const retryIssueCodes = retryTarget?.issues?.map((issue) => issue.code) ?? [];
     const runtimeAfterRetry = await requestJson("/runtime/status");
 
     if (
       retried.status !== "needs_manual_action" ||
-      retryTarget?.status !== "needs_manual_action" ||
-      !retryIssueCodes.includes("ZHIHU_DRAFT_CONNECTOR_OFFLINE")
+      platforms.some((platform) => {
+        const target = retried.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return target?.status !== "needs_manual_action" || !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_CONNECTOR_OFFLINE`);
+      })
     ) {
       throw new Error(`Draft preflight retry did not keep offline connector target on manual action: ${JSON.stringify(retried)}`);
     }
@@ -543,9 +565,12 @@ async function runOfflineDraftConnectorPreflightCheck() {
     return {
       taskId: created.id,
       status: retried.status,
-      targetStatus: retryTarget.status,
-      attemptCount: retryTarget.attemptCount,
-      issueCodes: retryIssueCodes,
+      targets: retried.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        attemptCount: target.attemptCount,
+        issueCodes: target.issues.map((issue) => issue.code),
+      })),
       queue: runtimeAfterRetry.queue,
     };
   } finally {
