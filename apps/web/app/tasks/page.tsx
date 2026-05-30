@@ -287,6 +287,14 @@ export default function TasksPage() {
               </a>
             </div>
           ) : null}
+          {runtime.draftConnector.contractUrl ? (
+            <div className="capability-item">
+              <span>Contract</span>
+              <a className="secondary-button compact" href={runtime.draftConnector.contractUrl} target="_blank" rel="noreferrer">
+                查看上游契约
+              </a>
+            </div>
+          ) : null}
         </div>
         {runtime.draftConnector.platforms.length > 0 ? (
           <div className="runtime-grid" style={{ marginTop: 12 }}>

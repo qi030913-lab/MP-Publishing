@@ -35,6 +35,8 @@ type DraftOutboxPlatformSummary = {
 type DraftConnectorHealthPayload = {
   status?: string;
   outboxDir?: string;
+  contractVersion?: string;
+  contractUrl?: string;
   outbox?: {
     total?: number;
     platforms?: DraftOutboxPlatformSummary[];
@@ -308,6 +310,7 @@ export class RuntimeService {
         status,
         publicBaseUrl,
         outboxUrl: publicBaseUrl ? `${publicBaseUrl}/drafts` : undefined,
+        contractUrl: publicBaseUrl ? `${publicBaseUrl}/contract` : undefined,
         detail: hasConnectorConfig
           ? "Draft endpoints are configured directly; set DRAFT_CONNECTOR_HEALTH_URL or DRAFT_CONNECTOR_BASE_URL to enable health checks."
           : "Set DRAFT_CONNECTOR_BASE_URL to enable local draft connector health checks.",
@@ -320,6 +323,7 @@ export class RuntimeService {
         status: DraftConnectorStatus;
         publicBaseUrl?: string;
         outboxUrl?: string;
+        contractUrl?: string;
         detail: string;
         platforms: DraftConnectorPlatformStatus[];
       };
@@ -361,6 +365,8 @@ export class RuntimeService {
         baseUrl: normalizedBaseUrl,
         publicBaseUrl: normalizedPublicBaseUrl,
         outboxUrl: normalizedPublicBaseUrl ? `${normalizedPublicBaseUrl}/drafts` : undefined,
+        contractUrl: normalizedPublicBaseUrl ? `${normalizedPublicBaseUrl}/contract` : payload.contractUrl,
+        contractVersion: payload.contractVersion,
         healthUrl,
         detail: response.ok
           ? `Draft connector is ${payload.status ?? "reachable"}.`
@@ -375,6 +381,7 @@ export class RuntimeService {
         baseUrl: normalizedBaseUrl,
         publicBaseUrl: normalizedPublicBaseUrl,
         outboxUrl: normalizedPublicBaseUrl ? `${normalizedPublicBaseUrl}/drafts` : undefined,
+        contractUrl: normalizedPublicBaseUrl ? `${normalizedPublicBaseUrl}/contract` : undefined,
         healthUrl,
         detail: error instanceof Error ? error.message : "Draft connector health check failed.",
         platforms: platforms.map((platformStatus) => ({

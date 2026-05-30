@@ -169,6 +169,8 @@ export type RuntimeStatus = {
     baseUrl?: string;
     publicBaseUrl?: string;
     outboxUrl?: string;
+    contractUrl?: string;
+    contractVersion?: string;
     healthUrl?: string;
     outboxDir?: string;
     outbox?: {

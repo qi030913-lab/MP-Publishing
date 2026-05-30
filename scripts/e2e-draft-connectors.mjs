@@ -534,12 +534,17 @@ async function runDraftConnectorPublicBaseRuntimeCheck() {
     await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector public base");
     await waitForApi(api);
     const runtime = await requestJson("/runtime/status");
+    const contract = await requestAbsoluteJson(`${connectorBaseUrl}/contract`);
 
     if (
       runtime.draftConnector?.status !== "online" ||
       runtime.draftConnector?.baseUrl !== connectorBaseUrl ||
       runtime.draftConnector?.publicBaseUrl !== publicBaseUrl ||
       runtime.draftConnector?.outboxUrl !== `${publicBaseUrl}/drafts` ||
+      runtime.draftConnector?.contractUrl !== `${publicBaseUrl}/contract` ||
+      contract.version !== "draft-connector-upstream-v1" ||
+      contract.connector?.contractUrl !== `${publicBaseUrl}/contract` ||
+      platforms.some((platform) => !contract.supportedPlatforms?.includes(platform)) ||
       platforms.some((platform) => {
         const platformStatus = runtime.draftConnector?.platforms?.find((item) => item.platform === platform);
         return (
@@ -556,6 +561,8 @@ async function runDraftConnectorPublicBaseRuntimeCheck() {
       baseUrl: runtime.draftConnector.baseUrl,
       publicBaseUrl: runtime.draftConnector.publicBaseUrl,
       outboxUrl: runtime.draftConnector.outboxUrl,
+      contractUrl: runtime.draftConnector.contractUrl,
+      contractVersion: contract.version,
       platformOutboxUrls: runtime.draftConnector.platforms.map((platformStatus) => ({
         platform: platformStatus.platform,
         outboxUrl: platformStatus.outboxUrl,
@@ -3106,6 +3113,7 @@ try {
   if (
     initialRuntime.draftConnector?.status !== "online" ||
     initialRuntime.draftConnector?.outboxUrl !== `${connectorBaseUrl}/drafts` ||
+    initialRuntime.draftConnector?.contractUrl !== `${connectorBaseUrl}/contract` ||
     initialRuntime.draftConnector?.outbox?.total !== 0 ||
     platforms.some(
       (platform) =>
@@ -3114,6 +3122,18 @@ try {
     )
   ) {
     throw new Error(`API runtime did not report the draft connector as online: ${JSON.stringify(initialRuntime.draftConnector)}`);
+  }
+
+  const connectorContract = await requestAbsoluteJson(initialRuntime.draftConnector.contractUrl);
+  if (
+    connectorContract.version !== "draft-connector-upstream-v1" ||
+    connectorContract.connector?.outboxUrl !== `${connectorBaseUrl}/drafts` ||
+    platforms.some((platform) => !connectorContract.supportedPlatforms?.includes(platform)) ||
+    !connectorContract.upstream?.draftEndpoint ||
+    !connectorContract.upstream?.statusEndpoint ||
+    !connectorContract.upstream?.statusCallback
+  ) {
+    throw new Error(`Draft connector upstream contract is incomplete: ${JSON.stringify(connectorContract)}`);
   }
 
   await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
@@ -3480,6 +3500,8 @@ try {
     draftConnector: {
       status: initialRuntime.draftConnector.status,
       outboxUrl: initialRuntime.draftConnector.outboxUrl,
+      contractUrl: initialRuntime.draftConnector.contractUrl,
+      contractVersion: connectorContract.version,
       outbox: finalRuntime.draftConnector.outbox,
     },
     workspaceEnvCheck,

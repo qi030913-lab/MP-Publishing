@@ -280,6 +280,128 @@ function createStatusCallbackUrl(platform: string, draftId: string, request: Inc
   return `${createDraftUrl(platform, draftId, request)}/status`;
 }
 
+function createUpstreamContract(request: IncomingMessage) {
+  const baseUrl = resolvePublicBaseUrl(request);
+  const platforms = Array.from(supportedPlatforms);
+  const draftStates = Array.from(supportedDraftStates);
+
+  return {
+    ok: true,
+    version: "draft-connector-upstream-v1",
+    generatedAt: new Date().toISOString(),
+    connector: {
+      healthUrl: `${baseUrl}/health`,
+      contractUrl: `${baseUrl}/contract`,
+      outboxUrl: `${baseUrl}/drafts`,
+      routes: {
+        createLocalDraft: "POST /:platform/drafts",
+        queryLocalDraftStatus: "POST /:platform/status",
+        updateLocalDraftStatus: "POST /:platform/drafts/:draftId/status",
+        listLocalDrafts: "GET /drafts?format=json or GET /:platform/drafts?format=json",
+      },
+    },
+    supportedPlatforms: platforms,
+    draftStates,
+    upstream: {
+      draftEndpoint: {
+        configuredBy:
+          "DRAFT_CONNECTOR_<PLATFORM>_UPSTREAM_DRAFT_ENDPOINT, with optional DRAFT_CONNECTOR_<PLATFORM>_UPSTREAM_DRAFT_API_KEY",
+        method: "POST",
+        auth: "Authorization: Bearer <api key>, when an upstream API key is configured",
+        request: {
+          platform: "zhihu | bilibili | xiaohongshu",
+          accountId: "Runtime account id selected for this target",
+          document: "Canonical document snapshot used to build the platform draft",
+          draft: {
+            platform: "Target platform",
+            title: "Platform-specific draft title",
+            summary: "Optional platform-specific summary",
+            body: "Platform-specific draft body",
+            hashtags: ["Optional platform tags"],
+            warnings: "Adapter validation warnings",
+          },
+          execution: {
+            taskId: "Publish task id",
+            targetId: "Publish target id",
+            attemptCount: "Worker attempt number",
+          },
+          credential:
+            "Optional credential object. Present only when both adapter and connector credential-forwarding flags are enabled.",
+          requestedAt: "ISO timestamp",
+          connector: {
+            draftId: "Deterministic local connector draft id",
+            draftUrl: `${baseUrl}/:platform/drafts/:draftId`,
+            statusCallbackUrl: `${baseUrl}/:platform/drafts/:draftId/status`,
+          },
+        },
+        response: {
+          ok: "false marks the connector draft as needs_manual_action; omitted or true accepts the draft",
+          remoteId: "Real platform draft id, or equivalent upstream draft id",
+          externalDraftId: "Alias for remoteId",
+          url: "Real platform draft URL",
+          externalUrl: "Alias for url",
+          state: draftStates,
+          detail: "Human-readable status detail",
+          message: "Alias for detail",
+          issues: "Optional ValidationIssue[] with code, message, severity",
+        },
+      },
+      statusEndpoint: {
+        configuredBy:
+          "DRAFT_CONNECTOR_<PLATFORM>_UPSTREAM_STATUS_ENDPOINT or DRAFT_CONNECTOR_UPSTREAM_STATUS_ENDPOINT",
+        method: "POST",
+        auth: "Authorization: Bearer <api key>, when an upstream status API key is configured",
+        request: {
+          platform: "zhihu | bilibili | xiaohongshu",
+          accountId: "Runtime account id when available",
+          remoteId: "External draft id when linked, otherwise the connector draft id",
+          credential:
+            "Optional credential object. Present only when both adapter and connector status credential-forwarding flags are enabled.",
+          requestedAt: "ISO timestamp",
+          connector: {
+            draftId: "Local connector draft id",
+            draftUrl: `${baseUrl}/:platform/drafts/:draftId`,
+            statusCallbackUrl: `${baseUrl}/:platform/drafts/:draftId/status`,
+          },
+        },
+        response: {
+          ok: "false keeps or moves the local draft to needs_manual_action",
+          remoteId: "Real platform draft id",
+          externalDraftId: "Alias for remoteId",
+          url: "Real platform draft URL",
+          externalUrl: "Alias for url",
+          state: draftStates,
+          detail: "Human-readable status detail",
+          message: "Alias for detail",
+          issues: "Optional ValidationIssue[] with code, message, severity",
+        },
+      },
+      statusCallback: {
+        endpoint: `${baseUrl}/:platform/drafts/:draftId/status`,
+        method: "POST",
+        purpose:
+          "External upstream workers can call this route after async creator-center automation creates or updates the real platform draft.",
+        request: {
+          state: draftStates,
+          remoteId: "Real platform draft id",
+          externalDraftId: "Alias for remoteId",
+          url: "Real platform draft URL",
+          externalUrl: "Alias for url",
+          detail: "Human-readable status detail",
+          issues: "Optional ValidationIssue[] with code, message, severity",
+        },
+      },
+    },
+    credentialForwarding: {
+      draft:
+        "Enable both <PLATFORM>_DRAFT_INCLUDE_CREDENTIAL=true and DRAFT_CONNECTOR_<PLATFORM>_UPSTREAM_INCLUDE_CREDENTIAL=true.",
+      status:
+        "Enable both <PLATFORM>_STATUS_INCLUDE_CREDENTIAL=true and DRAFT_CONNECTOR_<PLATFORM>_UPSTREAM_STATUS_INCLUDE_CREDENTIAL=true.",
+      persistence: "Credentials are forwarded for the request only and are not stored in the local outbox.",
+    },
+  };
+}
+
 function requireAuthorized(request: IncomingMessage) {
   const apiKey = process.env.DRAFT_CONNECTOR_API_KEY?.trim();
   if (!apiKey) {
@@ -1058,6 +1180,7 @@ function renderDraftListHtml(items: DraftSummary[], title: string) {
           .map((platform) => `<a href="/${escapeHtml(platform)}/drafts">${escapeHtml(platform)}</a>`)
           .join("")}
         <a href="/drafts?format=json">JSON</a>
+        <a href="/contract">Upstream contract</a>
       </div>
       ${content}
     </main>
@@ -1274,13 +1397,21 @@ const server = createServer((request, response) => {
 
       if (request.method === "GET" && request.url === "/health") {
         const platforms = Array.from(supportedPlatforms);
+        const baseUrl = resolvePublicBaseUrl(request);
         sendJson(response, 200, {
           status: "ok",
           outboxDir,
           platforms,
+          contractVersion: "draft-connector-upstream-v1",
+          contractUrl: `${baseUrl}/contract`,
           outbox: await summarizeOutbox(platforms),
           upstreamDrafts: await listUpstreamDraftStatuses(),
         });
+        return;
+      }
+
+      if (request.method === "GET" && routePlatform === "contract") {
+        sendJson(response, 200, createUpstreamContract(request));
         return;
       }
 

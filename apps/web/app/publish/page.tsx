@@ -353,6 +353,11 @@ export default function PublishPage() {
                   打开草稿收件箱
                 </a>
               ) : null}
+              {runtime?.draftConnector.contractUrl ? (
+                <a className="secondary-button compact" href={runtime.draftConnector.contractUrl} target="_blank" rel="noreferrer">
+                  查看上游契约
+                </a>
+              ) : null}
             </div>
 
             <div className="subsection" style={{ marginTop: 18 }}>
