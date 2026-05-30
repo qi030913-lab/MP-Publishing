@@ -911,6 +911,163 @@ async function runOfflineDraftConnectorPreflightCheck() {
   }
 }
 
+async function runCredentialForwardingMismatchPreflightCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const apiPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const upstreamPort = await getFreePort();
+  const upstream = await startFakeUpstreamDraftService(upstreamPort, "upstream-secret");
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const outboxDir = path.join(runtimeDir, `draft-connector-credential-mismatch-e2e-${Date.now()}`);
+  const queueName = `mp-publishing-draft-credential-mismatch-e2e-${Date.now()}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+
+  const api = startService("api-draft-credential-mismatch", ["apps/api/dist/main.js"], {
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+    ZHIHU_DRAFT_INCLUDE_CREDENTIAL: "",
+    BILIBILI_DRAFT_INCLUDE_CREDENTIAL: "",
+    XIAOHONGSHU_DRAFT_INCLUDE_CREDENTIAL: "",
+  });
+  const draftConnector = startService("draft-connector-credential-mismatch", ["apps/draft-connector/dist/main.js"], {
+    PORT: String(connectorPort),
+    DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_UPSTREAM_API_KEY: "upstream-secret",
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/zhihu/drafts`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_INCLUDE_CREDENTIAL: "true",
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/bilibili/drafts`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_INCLUDE_CREDENTIAL: "true",
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/xiaohongshu/drafts`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_INCLUDE_CREDENTIAL: "true",
+  });
+
+  try {
+    const connectorHealth = await waitForHealth(
+      draftConnector,
+      `${connectorBaseUrl}/health`,
+      "Draft connector credential forwarding mismatch",
+    );
+    if (
+      platforms.some(
+        (platform) =>
+          !connectorHealth.upstreamDrafts?.some(
+            (item) =>
+              item.platform === platform &&
+              item.draftEndpointConfigured &&
+              item.credentialForwardingEnabled &&
+              item.status === "online",
+          ),
+      )
+    ) {
+      throw new Error(`Draft connector health did not expose upstream credential requirements: ${JSON.stringify(connectorHealth)}`);
+    }
+
+    await waitForApi(api);
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for credential mismatch preflight verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "三平台凭证转发配置不一致预检验证",
+          summary: "验证 connector 上游要求凭证但 adapter 未开启凭证转发时不会入队。",
+          body: "这条内容用于确认两级凭证转发开关必须一致，否则官方 API 代理会收到无凭证请求。",
+          tags: ["draft", "credential", "mismatch", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+
+    if (
+      created.status !== "needs_manual_action" ||
+      platforms.some((platform) => {
+        const target = created.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return (
+          target?.status !== "needs_manual_action" ||
+          !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_CREDENTIAL_FORWARDING_DISABLED`)
+        );
+      })
+    ) {
+      throw new Error(`Credential mismatch preflight did not hold targets correctly: ${JSON.stringify(created)}`);
+    }
+
+    const retried = await requestJson(`/publish/tasks/${created.id}/retry`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    const runtimeAfterRetry = await requestJson("/runtime/status");
+
+    if (
+      retried.status !== "needs_manual_action" ||
+      platforms.some((platform) => {
+        const target = retried.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return (
+          target?.status !== "needs_manual_action" ||
+          !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_CREDENTIAL_FORWARDING_DISABLED`)
+        );
+      })
+    ) {
+      throw new Error(`Credential mismatch preflight retry did not keep targets on manual action: ${JSON.stringify(retried)}`);
+    }
+
+    if (
+      runtimeAfterRetry.queue.waiting > 0 ||
+      runtimeAfterRetry.queue.active > 0 ||
+      runtimeAfterRetry.queue.delayed > 0 ||
+      runtimeAfterRetry.queue.failed > 0 ||
+      upstream.requests.length > 0
+    ) {
+      throw new Error(
+        `Credential mismatch preflight should not enqueue work or call upstream: ${JSON.stringify({
+          queue: runtimeAfterRetry.queue,
+          upstreamRequests: upstream.requests,
+        })}`,
+      );
+    }
+
+    return {
+      taskId: created.id,
+      status: retried.status,
+      targets: retried.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        attemptCount: target.attemptCount,
+        issueCodes: target.issues.map((issue) => issue.code),
+      })),
+      queue: runtimeAfterRetry.queue,
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(draftConnector)]);
+    await upstream.close();
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runOfflineUpstreamDraftPreflightCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -1624,6 +1781,7 @@ const workspaceEnvCheck = await runDraftConnectorWorkspaceEnvCheck();
 const localEnablement = await runLocalDraftEnablementCheck();
 const disabledPreflight = await runDisabledDraftPreflightCheck();
 const credentialPreflight = await runCredentialPreflightCheck();
+const credentialMismatchPreflight = await runCredentialForwardingMismatchPreflightCheck();
 const offlinePreflight = await runOfflineDraftConnectorPreflightCheck();
 const offlineUpstreamPreflight = await runOfflineUpstreamDraftPreflightCheck();
 const offlineUpstreamRecovery = await runOfflineUpstreamDraftRecoveryCheck();
@@ -1891,6 +2049,7 @@ try {
     localEnablement,
     disabledPreflight,
     credentialPreflight,
+    credentialMismatchPreflight,
     offlinePreflight,
     offlineUpstreamPreflight,
     offlineUpstreamRecovery,

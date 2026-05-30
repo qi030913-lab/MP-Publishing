@@ -11,6 +11,8 @@ type DraftConnectorPlatformStatus = {
   statusEndpoint?: string;
   upstreamDraftEndpointConfigured?: boolean;
   upstreamStatusEndpointConfigured?: boolean;
+  upstreamCredentialForwardingEnabled?: boolean;
+  upstreamStatusCredentialForwardingEnabled?: boolean;
   upstreamDraftStatus?: "unconfigured" | "configured" | "online" | "offline";
   upstreamDraftDetail?: string;
   upstreamDraftHealthEndpoint?: string;
@@ -23,6 +25,8 @@ type DraftConnectorHealthPayload = {
     platform?: PlatformName;
     draftEndpointConfigured?: boolean;
     statusEndpointConfigured?: boolean;
+    credentialForwardingEnabled?: boolean;
+    statusCredentialForwardingEnabled?: boolean;
     healthEndpoint?: string;
     status?: "unconfigured" | "configured" | "online" | "offline";
     detail?: string;
@@ -101,6 +105,8 @@ export class RuntimeService {
           ...platformStatus,
           upstreamDraftEndpointConfigured: upstreamStatus?.draftEndpointConfigured,
           upstreamStatusEndpointConfigured: upstreamStatus?.statusEndpointConfigured,
+          upstreamCredentialForwardingEnabled: upstreamStatus?.credentialForwardingEnabled,
+          upstreamStatusCredentialForwardingEnabled: upstreamStatus?.statusCredentialForwardingEnabled,
           upstreamDraftStatus: upstreamStatus?.status,
           upstreamDraftDetail: upstreamStatus?.detail,
           upstreamDraftHealthEndpoint: upstreamStatus?.healthEndpoint,

@@ -177,6 +177,8 @@ export type RuntimeStatus = {
       statusEndpoint?: string;
       upstreamDraftEndpointConfigured?: boolean;
       upstreamStatusEndpointConfigured?: boolean;
+      upstreamCredentialForwardingEnabled?: boolean;
+      upstreamStatusCredentialForwardingEnabled?: boolean;
       upstreamDraftStatus?: "unconfigured" | "configured" | "online" | "offline";
       upstreamDraftDetail?: string;
       upstreamDraftHealthEndpoint?: string;

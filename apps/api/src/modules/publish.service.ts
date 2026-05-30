@@ -39,6 +39,8 @@ type DraftConnectorHealthPayload = {
     platform?: PlatformName;
     draftEndpointConfigured?: boolean;
     statusEndpointConfigured?: boolean;
+    credentialForwardingEnabled?: boolean;
+    statusCredentialForwardingEnabled?: boolean;
     status?: "unconfigured" | "configured" | "online" | "offline";
     detail?: string;
   }>;
@@ -172,6 +174,15 @@ export class PublishService {
             `${platform.toUpperCase()}_UPSTREAM_DRAFT_CONNECTOR_OFFLINE`,
             upstreamStatus.detail ??
               `${platform} upstream draft connector health check failed before creating a real draft.`,
+          ),
+        ];
+      }
+
+      if (upstreamStatus?.draftEndpointConfigured && upstreamStatus.credentialForwardingEnabled && !isEnabled(`${envPrefix}_DRAFT_INCLUDE_CREDENTIAL`)) {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_DRAFT_CREDENTIAL_FORWARDING_DISABLED`,
+            `Enable ${envPrefix}_DRAFT_INCLUDE_CREDENTIAL=true because the local draft connector is configured to forward credentials to the ${platform} upstream draft service.`,
           ),
         ];
       }

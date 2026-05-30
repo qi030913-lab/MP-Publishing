@@ -81,6 +81,8 @@ type UpstreamDraftStatus = {
   platform: string;
   draftEndpointConfigured: boolean;
   statusEndpointConfigured: boolean;
+  credentialForwardingEnabled: boolean;
+  statusCredentialForwardingEnabled: boolean;
   healthEndpoint?: string;
   status: "unconfigured" | "configured" | "online" | "offline";
   detail?: string;
@@ -360,6 +362,8 @@ async function probeUpstreamDraftStatus(platform: string): Promise<UpstreamDraft
       platform,
       draftEndpointConfigured: false,
       statusEndpointConfigured: false,
+      credentialForwardingEnabled: false,
+      statusCredentialForwardingEnabled: false,
       status: "unconfigured",
     };
   }
@@ -369,6 +373,8 @@ async function probeUpstreamDraftStatus(platform: string): Promise<UpstreamDraft
       platform,
       draftEndpointConfigured: true,
       statusEndpointConfigured: Boolean(config.statusEndpoint),
+      credentialForwardingEnabled: config.includeCredential,
+      statusCredentialForwardingEnabled: config.statusIncludeCredential,
       status: "configured",
       detail: "Upstream draft endpoint is configured; no health endpoint is configured.",
     };
@@ -387,6 +393,8 @@ async function probeUpstreamDraftStatus(platform: string): Promise<UpstreamDraft
       platform,
       draftEndpointConfigured: true,
       statusEndpointConfigured: Boolean(config.statusEndpoint),
+      credentialForwardingEnabled: config.includeCredential,
+      statusCredentialForwardingEnabled: config.statusIncludeCredential,
       healthEndpoint: config.healthEndpoint,
       status: response.ok ? "online" : "offline",
       detail: response.ok
@@ -398,6 +406,8 @@ async function probeUpstreamDraftStatus(platform: string): Promise<UpstreamDraft
       platform,
       draftEndpointConfigured: true,
       statusEndpointConfigured: Boolean(config.statusEndpoint),
+      credentialForwardingEnabled: config.includeCredential,
+      statusCredentialForwardingEnabled: config.statusIncludeCredential,
       healthEndpoint: config.healthEndpoint,
       status: "offline",
       detail: error instanceof Error ? error.message : "Upstream draft health check failed.",
