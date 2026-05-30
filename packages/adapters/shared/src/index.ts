@@ -174,6 +174,7 @@ function createConnectorDraftPayload(input: PublishInput, draft: PlatformDraft, 
     accountId: input.accountId,
     document: input.document,
     draft,
+    execution: input.execution,
     credential: includeCredential ? input.credential : undefined,
     requestedAt: new Date().toISOString(),
   };

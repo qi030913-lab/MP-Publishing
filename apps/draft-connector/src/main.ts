@@ -7,6 +7,11 @@ import path from "node:path";
 type DraftPayload = {
   platform?: string;
   accountId?: string;
+  execution?: {
+    taskId?: string;
+    targetId?: string;
+    attemptCount?: number;
+  };
   document?: {
     id?: string;
     title?: string;
@@ -305,6 +310,17 @@ function normalizeStoredDraft(raw: StoredDraft): StoredDraft {
     updatedAt: raw.updatedAt ?? raw.createdAt,
     statusIssues: normalizeIssues(raw.statusIssues),
   };
+}
+
+function normalizeExecutionContext(execution: DraftPayload["execution"]) {
+  const taskId = readOptionalString(execution?.taskId);
+  const targetId = readOptionalString(execution?.targetId);
+  const attemptCount =
+    typeof execution?.attemptCount === "number" && Number.isFinite(execution.attemptCount)
+      ? execution.attemptCount
+      : undefined;
+
+  return targetId && attemptCount ? { taskId, targetId, attemptCount } : null;
 }
 
 function validateDraftPayload(platform: string, payload: DraftPayload) {
@@ -628,6 +644,51 @@ async function findStoredDraftByRemoteId(platform: string, remoteId: string) {
   return null;
 }
 
+async function findStoredDraftByExecution(platform: string, execution: DraftPayload["execution"]) {
+  const normalizedExecution = normalizeExecutionContext(execution);
+  if (!normalizedExecution) {
+    return null;
+  }
+
+  const platformOutboxDir = path.join(outboxDir, platform);
+  if (!existsSync(platformOutboxDir)) {
+    return null;
+  }
+
+  const fileNames = await readdir(platformOutboxDir);
+  for (const fileName of fileNames.filter((name) => name.endsWith(".json"))) {
+    const content = await readFile(path.join(platformOutboxDir, fileName), "utf8");
+    const storedDraft = normalizeStoredDraft(JSON.parse(content) as StoredDraft);
+    const storedExecution = normalizeExecutionContext(storedDraft.payload.execution);
+    if (
+      storedExecution?.targetId === normalizedExecution.targetId &&
+      storedExecution.attemptCount === normalizedExecution.attemptCount
+    ) {
+      return storedDraft;
+    }
+  }
+
+  return null;
+}
+
+function createStoredDraftResponse(storedDraft: StoredDraft, request: IncomingMessage) {
+  const draftUrl = createDraftUrl(storedDraft.platform, storedDraft.draftId, request);
+  const reusable = storedDraft.state !== "failed" && storedDraft.state !== "needs_manual_action" && storedDraft.state !== "publishing";
+
+  return {
+    ok: reusable,
+    draftId: storedDraft.draftId,
+    remoteId: storedDraft.externalDraftId ?? storedDraft.draftId,
+    url: storedDraft.externalUrl ?? draftUrl,
+    message:
+      storedDraft.statusDetail ??
+      (reusable
+        ? `${storedDraft.platform} draft already exists for this publish target.`
+        : `${storedDraft.platform} draft requires manual action before it can be reused.`),
+    issues: storedDraft.statusIssues,
+  };
+}
+
 function shouldReturnJson(request: IncomingMessage) {
   const parsed = new URL(request.url ?? "/", "http://localhost");
   const accept = firstHeaderValue(request.headers.accept) ?? "";
@@ -784,6 +845,12 @@ async function handleCreateDraft(platform: string, request: IncomingMessage, res
   const validationError = validateDraftPayload(platform, payload);
   if (validationError) {
     sendJson(response, 422, { ok: false, message: validationError });
+    return;
+  }
+
+  const existingDraft = await findStoredDraftByExecution(platform, payload.execution);
+  if (existingDraft) {
+    sendJson(response, 200, createStoredDraftResponse(existingDraft, request));
     return;
   }
 

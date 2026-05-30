@@ -2793,6 +2793,7 @@ try {
   }
 
   const draftDetails = [];
+  const idempotentDrafts = [];
   for (const platform of platforms) {
     const target = task.results.find((item) => item.platform === platform);
     const expectedUrlPrefix = `${connectorBaseUrl}/${platform}/drafts/`;
@@ -2804,6 +2805,41 @@ try {
     if (detail.draftId !== target.remoteId || detail.platform !== platform || detail.url !== target.url) {
       throw new Error(`Draft connector detail URL returned an unexpected payload for ${platform}: ${JSON.stringify(detail)}`);
     }
+
+    if (
+      detail.payload?.execution?.taskId !== created.id ||
+      !detail.payload.execution.targetId ||
+      detail.payload.execution.attemptCount !== target.attemptCount
+    ) {
+      throw new Error(`Draft connector detail did not persist publish target execution context for ${platform}: ${JSON.stringify(detail.payload?.execution)}`);
+    }
+
+    const countBeforeDuplicate = readDraftOutbox(outboxDir, [platform]).length;
+    const duplicate = await requestAbsoluteJson(`${connectorBaseUrl}/${platform}/drafts`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        authorization: "Bearer draft-secret",
+      },
+      body: JSON.stringify(detail.payload),
+    });
+    const countAfterDuplicate = readDraftOutbox(outboxDir, [platform]).length;
+    if (duplicate.draftId !== target.remoteId || duplicate.url !== target.url || countAfterDuplicate !== countBeforeDuplicate) {
+      throw new Error(
+        `Draft connector idempotency did not reuse the existing draft for ${platform}: ${JSON.stringify({
+          duplicate,
+          countBeforeDuplicate,
+          countAfterDuplicate,
+          target,
+        })}`,
+      );
+    }
+
+    idempotentDrafts.push({
+      platform,
+      draftId: duplicate.draftId,
+      countAfterDuplicate,
+    });
 
     draftDetails.push({
       platform: detail.platform,
@@ -2972,6 +3008,7 @@ try {
       accountId: draft.accountId,
     })),
     draftDetails,
+    idempotentDrafts,
     syncedTargets,
     externalizedTargets,
     outboxIndex: outboxIndex.items.map((item) => ({

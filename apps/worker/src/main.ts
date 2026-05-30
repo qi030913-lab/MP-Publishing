@@ -107,6 +107,11 @@ async function processPublishTarget(job: Job<PublishQueueJobData>) {
         document: context.document,
         dryRun: context.mode !== "real-publish",
         credential: context.credential ?? undefined,
+        execution: {
+          taskId: context.taskId,
+          targetId: context.targetId,
+          attemptCount: context.attemptCount,
+        },
       });
 
       if (!result.ok) {
