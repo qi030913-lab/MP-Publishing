@@ -50,6 +50,8 @@
 
 补充：Playwright capture、check、automation service 和 smoke 脚本现在会默认加载工作区 `.env`，因此 session capture 写入的 storage-state 路径和 selector capture 写入的 selector 路径会被后续命令自动接上；如需使用隔离配置，可设置 `DRAFT_AUTOMATION_ENV_FILE`。`pnpm drafts:smoke-playwright -- --platform <platform> --headed` 会直接构造安全的 `draft-upstream-work-order-v1` 工单调用内置 handler，默认只点击配置的 save-draft selector，不触碰最终发布按钮，用来在真实知乎 / B站 / 小红书页面上验证“填充并保存草稿”。
 
+补充：`pnpm drafts:enable-playwright-automation -- --api-key <key>` 会把应用侧真实草稿链路一键接到本地 Playwright automation service：它开启知乎 / B站 / 小红书真实草稿目标、保留本地 draft connector 作为 outbox/回写层、把 `DRAFT_CONNECTOR_<PLATFORM>_UPSTREAM_DRAFT_ENDPOINT` 指向 `http://localhost:3030/<platform>/drafts`，并配置 `DRAFT_AUTOMATION_SERVICE_HANDLER_MODULE=scripts/handlers/playwright-draft-handler.mjs` 和平台级 `REQUIRE_SESSION=true`。当前 e2e 已覆盖该脚本写出的 connector/service/upstream/session-required 配置，避免真实联调时手工漏填。
+
 ## 1. 目标
 
 面向公众号、知乎、B站、小红书等内容平台，提供一个统一的创作与发布工具，解决以下问题：

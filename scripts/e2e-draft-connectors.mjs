@@ -2449,6 +2449,92 @@ async function runUpstreamProxyEnablementCheck() {
   }
 }
 
+async function runPlaywrightAutomationEnablementCheck() {
+  const workspaceDir = path.join(runtimeDir, `draft-playwright-automation-enable-e2e-${Date.now()}`);
+  const envPath = path.join(workspaceDir, ".env");
+  const automationBaseUrl = "http://127.0.0.1:3030";
+  const connectorBaseUrl = "http://127.0.0.1:3010";
+  const outboxDir = "playwright-outbox";
+  const selectedPlatforms = ["zhihu", "bilibili", "xiaohongshu"];
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.mkdirSync(workspaceDir, { recursive: true });
+
+  try {
+    const command = await runNodeCommand("enable playwright draft automation", [
+      path.join(root, "scripts/enable-playwright-draft-automation.mjs"),
+      "--target-env-file",
+      envPath,
+      "--automation-base-url",
+      automationBaseUrl,
+      "--connector-base-url",
+      connectorBaseUrl,
+      "--outbox-dir",
+      outboxDir,
+      "--api-key",
+      "automation-secret",
+      "--include-credential",
+      "--headed",
+    ]);
+
+    const env = parseEnvFile(envPath);
+    const enabledPlatforms = [];
+    for (const platform of selectedPlatforms) {
+      const envPrefix = platform.toUpperCase();
+      const upstreamPrefix = `DRAFT_CONNECTOR_${envPrefix}_UPSTREAM`;
+      const expectedDraftEndpoint = `${automationBaseUrl}/${platform}/drafts`;
+      if (
+        env.get(`${envPrefix}_REAL_PUBLISH_ENABLED`) !== "true" ||
+        env.get(`${envPrefix}_DRAFT_INCLUDE_CREDENTIAL`) !== "true" ||
+        env.get(`${envPrefix}_STATUS_INCLUDE_CREDENTIAL`) !== "false" ||
+        env.get(`${upstreamPrefix}_DRAFT_ENDPOINT`) !== expectedDraftEndpoint ||
+        env.get(`${upstreamPrefix}_DRAFT_API_KEY`) !== "automation-secret" ||
+        env.get(`${upstreamPrefix}_HEALTH_ENDPOINT`) !== `${automationBaseUrl}/health` ||
+        env.get(`${upstreamPrefix}_STATUS_ENDPOINT`) !== "" ||
+        env.get(`${upstreamPrefix}_INCLUDE_CREDENTIAL`) !== "true" ||
+        env.get(`${upstreamPrefix}_STATUS_INCLUDE_CREDENTIAL`) !== "false" ||
+        env.get(`DRAFT_AUTOMATION_${envPrefix}_REQUIRE_SESSION`) !== "true"
+      ) {
+        throw new Error(`Playwright automation enablement wrote unexpected ${platform} config: ${JSON.stringify(Object.fromEntries(env))}`);
+      }
+
+      enabledPlatforms.push({
+        platform,
+        draftEndpoint: expectedDraftEndpoint,
+        requireSession: env.get(`DRAFT_AUTOMATION_${envPrefix}_REQUIRE_SESSION`) === "true",
+      });
+    }
+
+    if (
+      env.get("DRAFT_CONNECTOR_BASE_URL") !== connectorBaseUrl ||
+      env.get("DRAFT_CONNECTOR_OUTBOX_DIR") !== outboxDir ||
+      env.get("DRAFT_AUTOMATION_SERVICE_PORT") !== "3030" ||
+      env.get("DRAFT_AUTOMATION_SERVICE_API_KEY") !== "automation-secret" ||
+      env.get("DRAFT_AUTOMATION_SERVICE_HANDLER_MODULE") !== "scripts/handlers/playwright-draft-handler.mjs" ||
+      env.get("DRAFT_AUTOMATION_REQUIRE_SESSION") !== "true" ||
+      env.get("DRAFT_AUTOMATION_PLAYWRIGHT_HEADLESS") !== "false" ||
+      !command.stdout.includes("pnpm drafts:automation-service") ||
+      command.stdout.includes("automation-secret")
+    ) {
+      throw new Error(
+        `Playwright automation enablement did not configure the connector/service handoff safely: ${JSON.stringify({
+          env: Object.fromEntries(env),
+          stdout: command.stdout,
+        })}`,
+      );
+    }
+
+    return {
+      platforms: enabledPlatforms,
+      connectorBaseUrl: env.get("DRAFT_CONNECTOR_BASE_URL"),
+      automationPort: env.get("DRAFT_AUTOMATION_SERVICE_PORT"),
+      credentialForwarding: selectedPlatforms.filter((platform) => env.get(`DRAFT_CONNECTOR_${platform.toUpperCase()}_UPSTREAM_INCLUDE_CREDENTIAL`) === "true"),
+    };
+  } finally {
+    fs.rmSync(workspaceDir, { recursive: true, force: true });
+  }
+}
+
 async function runLocalDraftEnablementCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -4964,6 +5050,7 @@ const draftPlaywrightHandlerCheck = await runDraftPlaywrightHandlerCheck();
 const draftPlaywrightSmokeCheck = await runDraftPlaywrightSmokeCheck();
 const upstreamSandboxCallback = await runUpstreamSandboxCallbackCheck();
 const upstreamProxyEnablement = await runUpstreamProxyEnablementCheck();
+const playwrightAutomationEnablement = await runPlaywrightAutomationEnablementCheck();
 const localEnablement = await runLocalDraftEnablementCheck();
 const disabledPreflight = await runDisabledDraftPreflightCheck();
 const workerConfigManualAction = await runWorkerDraftConfigManualActionCheck();
@@ -5403,6 +5490,7 @@ try {
     draftPlaywrightSmokeCheck,
     upstreamSandboxCallback,
     upstreamProxyEnablement,
+    playwrightAutomationEnablement,
     localEnablement,
     disabledPreflight,
     workerConfigManualAction,
