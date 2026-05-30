@@ -66,6 +66,32 @@ function isConnectorDraftReady(platform: PlatformName, runtime: RuntimeStatus | 
   return platformStatus?.draftReady === true && !getCredentialReadinessIssue(platformStatus, account);
 }
 
+function formatOutboxSummary(summary: DraftConnectorPlatformRuntime["outbox"]) {
+  if (!summary) {
+    return null;
+  }
+
+  const byState = summary.byState ?? {};
+  const parts = [`${summary.total ?? 0} 个草稿`];
+  if (byState.publishing) {
+    parts.push(`${byState.publishing} 发布中`);
+  }
+  if (byState.ready) {
+    parts.push(`${byState.ready} 已就绪`);
+  }
+  if (byState.needs_manual_action) {
+    parts.push(`${byState.needs_manual_action} 待处理`);
+  }
+  if (summary.externalizedCount) {
+    parts.push(`${summary.externalizedCount} 外部草稿`);
+  }
+  if (summary.stalePublishingCount) {
+    parts.push(`${summary.stalePublishingCount} 可恢复`);
+  }
+
+  return parts.join(" / ");
+}
+
 export default function PublishPage() {
   const router = useRouter();
   const [draft, setDraft] = useState<DraftDocument | null>(null);
@@ -263,6 +289,7 @@ export default function PublishPage() {
                     ...(credentialReadinessIssue ? [credentialReadinessIssue] : []),
                   ];
                   const connectorReady = isConnectorDraftReady(platformStatus.platform, runtime, account);
+                  const outboxSummary = formatOutboxSummary(platformStatus.outbox);
 
                   return (
                     <div key={platformStatus.platform} className={connectorReady ? "issue-item info" : "issue-item warning"}>
@@ -283,6 +310,7 @@ export default function PublishPage() {
                             </>
                           ) : null}
                         </p>
+                        {outboxSummary ? <p className="page-description">收件箱: {outboxSummary}</p> : null}
                         {!connectorReady && readinessMessages.length > 0 ? (
                           <p className="page-description">
                             Action: {readinessMessages.join(" ")}

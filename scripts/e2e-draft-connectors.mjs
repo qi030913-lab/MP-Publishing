@@ -2829,6 +2829,7 @@ const queueName = `mp-publishing-draft-e2e-${Date.now()}`;
 const apiPort = process.env.E2E_API_BASE_URL ? undefined : await getFreePort();
 apiBaseUrl = apiBaseUrl || `http://127.0.0.1:${apiPort}`;
 const outboxDir = path.join(runtimeDir, `draft-connector-e2e-${Date.now()}`);
+const platforms = ["zhihu", "bilibili", "xiaohongshu"];
 fs.rmSync(outboxDir, { recursive: true, force: true });
 const connectorEnv = {
   ...(apiPort ? { PORT: String(apiPort) } : {}),
@@ -2866,17 +2867,27 @@ const worker = startService("worker", ["apps/worker/dist/main.js"], connectorEnv
 const draftConnector = startService("draft-connector", ["apps/draft-connector/dist/main.js"], draftConnectorEnv);
 
 try {
-  await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector");
+  const initialHealth = await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector");
+  if (
+    initialHealth.outbox?.total !== 0 ||
+    platforms.some((platform) => initialHealth.outbox?.platforms?.find((item) => item.platform === platform)?.total !== 0)
+  ) {
+    throw new Error(`Draft connector health should expose an empty outbox summary before publishing: ${JSON.stringify(initialHealth.outbox)}`);
+  }
+
   await waitForApi(api);
   const initialRuntime = await requestJson("/runtime/status");
-  if (initialRuntime.draftConnector?.status !== "online" || initialRuntime.draftConnector?.outboxUrl !== `${connectorBaseUrl}/drafts`) {
+  if (
+    initialRuntime.draftConnector?.status !== "online" ||
+    initialRuntime.draftConnector?.outboxUrl !== `${connectorBaseUrl}/drafts` ||
+    initialRuntime.draftConnector?.outbox?.total !== 0
+  ) {
     throw new Error(`API runtime did not report the draft connector as online: ${JSON.stringify(initialRuntime.draftConnector)}`);
   }
 
   await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
 
   const accountsResponse = await requestJson("/accounts");
-  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
   const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
 
   if (accounts.length !== platforms.length) {
@@ -2922,6 +2933,16 @@ try {
   const storedDrafts = readDraftOutbox(outboxDir, platforms);
   if (task.status !== "succeeded") {
     throw new Error(`Draft connector task did not succeed: ${task.status}`);
+  }
+
+  if (
+    runtime.draftConnector?.outbox?.total !== platforms.length ||
+    platforms.some((platform) => {
+      const summary = runtime.draftConnector?.platforms?.find((item) => item.platform === platform)?.outbox;
+      return summary?.total !== 1 || summary?.byState?.draft !== 1;
+    })
+  ) {
+    throw new Error(`API runtime did not expose draft outbox summaries after publishing: ${JSON.stringify(runtime.draftConnector)}`);
   }
 
   const draftDetails = [];
@@ -3150,8 +3171,24 @@ try {
 
   const outboxIndex = await requestAbsoluteJson(`${connectorBaseUrl}/drafts?format=json`);
   const outboxHtml = await requestAbsoluteText(`${connectorBaseUrl}/drafts`);
+  const finalRuntime = await requestJson("/runtime/status");
   if (outboxIndex.items?.length !== platforms.length * 2) {
     throw new Error(`Draft connector outbox index did not include every stored draft: ${JSON.stringify(outboxIndex)}`);
+  }
+
+  if (
+    finalRuntime.draftConnector?.outbox?.total !== platforms.length * 2 ||
+    platforms.some((platform) => {
+      const summary = finalRuntime.draftConnector?.platforms?.find((item) => item.platform === platform)?.outbox;
+      return (
+        summary?.total !== 2 ||
+        summary?.byState?.ready !== 1 ||
+        summary?.byState?.draft !== 1 ||
+        summary?.externalizedCount !== 1
+      );
+    })
+  ) {
+    throw new Error(`API runtime did not expose final draft outbox summaries: ${JSON.stringify(finalRuntime.draftConnector)}`);
   }
 
   if (!outboxHtml.includes("Draft connector outbox") || !outboxHtml.includes("/zhihu/drafts/")) {
@@ -3212,6 +3249,7 @@ try {
     draftConnector: {
       status: initialRuntime.draftConnector.status,
       outboxUrl: initialRuntime.draftConnector.outboxUrl,
+      outbox: finalRuntime.draftConnector.outbox,
     },
     workspaceEnvCheck,
     localEnablement,

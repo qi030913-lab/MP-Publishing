@@ -73,6 +73,15 @@ type DraftSummary = {
   url: string;
 };
 
+type DraftOutboxPlatformSummary = {
+  platform: string;
+  total: number;
+  externalizedCount: number;
+  stalePublishingCount: number;
+  latestUpdatedAt?: string;
+  byState: Record<DraftState, number>;
+};
+
 type UpstreamDraftConfig = {
   endpoint: string;
   statusEndpoint?: string;
@@ -852,6 +861,65 @@ function createStoredDraftResponse(storedDraft: StoredDraft, request: IncomingMe
   };
 }
 
+function createEmptyDraftStateCounts(): Record<DraftState, number> {
+  return Array.from(supportedDraftStates).reduce(
+    (counts, state) => ({
+      ...counts,
+      [state]: 0,
+    }),
+    {} as Record<DraftState, number>,
+  );
+}
+
+async function summarizePlatformOutbox(platform: string): Promise<DraftOutboxPlatformSummary> {
+  const summary: DraftOutboxPlatformSummary = {
+    platform,
+    total: 0,
+    externalizedCount: 0,
+    stalePublishingCount: 0,
+    byState: createEmptyDraftStateCounts(),
+  };
+  const platformOutboxDir = path.join(outboxDir, platform);
+  if (!existsSync(platformOutboxDir)) {
+    return summary;
+  }
+
+  const fileNames = await readdir(platformOutboxDir);
+  for (const fileName of fileNames.filter((name) => name.endsWith(".json"))) {
+    const storedDraft = await readStoredDraft(platform, fileName.replace(/\.json$/, ""));
+    if (!storedDraft) {
+      continue;
+    }
+
+    summary.total += 1;
+    summary.byState[storedDraft.state] += 1;
+    if (hasExternalDraft(storedDraft)) {
+      summary.externalizedCount += 1;
+    }
+
+    if (storedDraft.state === "publishing" && isStalePublishingDraft(storedDraft)) {
+      summary.stalePublishingCount += 1;
+    }
+
+    if (
+      !summary.latestUpdatedAt ||
+      new Date(storedDraft.updatedAt).getTime() > new Date(summary.latestUpdatedAt).getTime()
+    ) {
+      summary.latestUpdatedAt = storedDraft.updatedAt;
+    }
+  }
+
+  return summary;
+}
+
+async function summarizeOutbox(platforms: string[]) {
+  const summaries = await Promise.all(platforms.map((platform) => summarizePlatformOutbox(platform)));
+  return {
+    total: summaries.reduce((total, summary) => total + summary.total, 0),
+    platforms: summaries,
+  };
+}
+
 function shouldReturnJson(request: IncomingMessage) {
   const parsed = new URL(request.url ?? "/", "http://localhost");
   const accept = firstHeaderValue(request.headers.accept) ?? "";
@@ -1205,10 +1273,12 @@ const server = createServer((request, response) => {
       const platform = validatePlatform(routePlatform);
 
       if (request.method === "GET" && request.url === "/health") {
+        const platforms = Array.from(supportedPlatforms);
         sendJson(response, 200, {
           status: "ok",
           outboxDir,
-          platforms: Array.from(supportedPlatforms),
+          platforms,
+          outbox: await summarizeOutbox(platforms),
           upstreamDrafts: await listUpstreamDraftStatuses(),
         });
         return;

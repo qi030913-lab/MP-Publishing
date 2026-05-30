@@ -19,11 +19,25 @@ type DraftConnectorPlatformStatus = {
   upstreamDraftStatus?: "unconfigured" | "configured" | "online" | "offline";
   upstreamDraftDetail?: string;
   upstreamDraftHealthEndpoint?: string;
+  outbox?: DraftOutboxPlatformSummary;
+};
+
+type DraftOutboxPlatformSummary = {
+  platform?: PlatformName;
+  total?: number;
+  externalizedCount?: number;
+  stalePublishingCount?: number;
+  latestUpdatedAt?: string;
+  byState?: Partial<Record<string, number>>;
 };
 
 type DraftConnectorHealthPayload = {
   status?: string;
   outboxDir?: string;
+  outbox?: {
+    total?: number;
+    platforms?: DraftOutboxPlatformSummary[];
+  };
   upstreamDrafts?: Array<{
     platform?: PlatformName;
     draftEndpointConfigured?: boolean;
@@ -294,6 +308,7 @@ export class RuntimeService {
         return {
           ...platformStatus,
           ...resolveDraftReadiness(platformStatus, status, resolveEnvPrefix(platformStatus.platform), upstreamStatus),
+          outbox: payload.outbox?.platforms?.find((item) => item.platform === platformStatus.platform),
           upstreamDraftEndpointConfigured: upstreamStatus?.draftEndpointConfigured,
           upstreamStatusEndpointConfigured: upstreamStatus?.statusEndpointConfigured,
           upstreamCredentialForwardingEnabled: upstreamStatus?.credentialForwardingEnabled,
@@ -313,6 +328,7 @@ export class RuntimeService {
           ? `Draft connector is ${payload.status ?? "reachable"}.`
           : `Draft connector health check returned HTTP ${response.status}.`,
         outboxDir: payload.outboxDir,
+        outbox: payload.outbox,
         platforms: platformsWithUpstream,
       };
     } catch (error) {

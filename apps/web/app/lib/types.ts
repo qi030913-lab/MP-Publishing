@@ -170,6 +170,17 @@ export type RuntimeStatus = {
     outboxUrl?: string;
     healthUrl?: string;
     outboxDir?: string;
+    outbox?: {
+      total?: number;
+      platforms?: Array<{
+        platform?: PlatformName;
+        total?: number;
+        externalizedCount?: number;
+        stalePublishingCount?: number;
+        latestUpdatedAt?: string;
+        byState?: Partial<Record<string, number>>;
+      }>;
+    };
     detail: string;
     platforms: Array<{
       platform: PlatformName;
@@ -190,6 +201,14 @@ export type RuntimeStatus = {
       upstreamDraftStatus?: "unconfigured" | "configured" | "online" | "offline";
       upstreamDraftDetail?: string;
       upstreamDraftHealthEndpoint?: string;
+      outbox?: {
+        platform?: PlatformName;
+        total?: number;
+        externalizedCount?: number;
+        stalePublishingCount?: number;
+        latestUpdatedAt?: string;
+        byState?: Partial<Record<string, number>>;
+      };
     }>;
   };
 };
