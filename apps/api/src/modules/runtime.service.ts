@@ -17,7 +17,7 @@ type DraftConnectorPlatformStatus = {
   upstreamStatusEndpointConfigured?: boolean;
   upstreamCredentialForwardingEnabled?: boolean;
   upstreamStatusCredentialForwardingEnabled?: boolean;
-  upstreamDraftStatus?: "unconfigured" | "configured" | "online" | "offline";
+  upstreamDraftStatus?: "unconfigured" | "configured" | "online" | "offline" | "needs_action";
   upstreamDraftDetail?: string;
   upstreamDraftHealthEndpoint?: string;
   outbox?: DraftOutboxPlatformSummary;
@@ -48,7 +48,7 @@ type DraftConnectorHealthPayload = {
     credentialForwardingEnabled?: boolean;
     statusCredentialForwardingEnabled?: boolean;
     healthEndpoint?: string;
-    status?: "unconfigured" | "configured" | "online" | "offline";
+    status?: "unconfigured" | "configured" | "online" | "offline" | "needs_action";
     detail?: string;
   }>;
 };
@@ -264,6 +264,16 @@ function resolveDraftReadiness(
         `${platformStatus.platform.toUpperCase()}_UPSTREAM_DRAFT_CONNECTOR_OFFLINE`,
         upstreamStatus.detail ??
           `${platformStatus.platform} upstream draft connector health check failed before creating a real draft.`,
+      ),
+    );
+  }
+
+  if (upstreamStatus?.draftEndpointConfigured && upstreamStatus.status === "needs_action") {
+    issues.push(
+      createReadinessIssue(
+        `${platformStatus.platform.toUpperCase()}_UPSTREAM_DRAFT_CONNECTOR_NOT_READY`,
+        upstreamStatus.detail ??
+          `${platformStatus.platform} upstream draft connector is reachable but not ready before creating a real draft.`,
       ),
     );
   }

@@ -101,8 +101,16 @@ type UpstreamDraftStatus = {
   credentialForwardingEnabled: boolean;
   statusCredentialForwardingEnabled: boolean;
   healthEndpoint?: string;
-  status: "unconfigured" | "configured" | "online" | "offline";
+  status: "unconfigured" | "configured" | "online" | "offline" | "needs_action";
   detail?: string;
+};
+
+type UpstreamHealthPayload = {
+  ok?: boolean;
+  status?: string;
+  message?: string;
+  detail?: string;
+  missingRequiredSessions?: string[];
 };
 
 type UpstreamDraftResponse = {
@@ -565,6 +573,58 @@ function resolveUpstreamDraftConfig(platform: string): UpstreamDraftConfig | nul
   };
 }
 
+function isReadyHealthStatus(status: string | undefined) {
+  if (!status) {
+    return true;
+  }
+
+  return ["ok", "online", "ready", "healthy"].includes(status.toLowerCase());
+}
+
+function summarizeUpstreamHealthPayload(payload: UpstreamHealthPayload | undefined, platform: string) {
+  if (!payload) {
+    return {
+      status: "online" as const,
+      detail: "Upstream draft health check returned HTTP 200.",
+    };
+  }
+
+  const healthStatus = typeof payload.status === "string" ? payload.status : undefined;
+  const missingRequiredSessions = Array.isArray(payload.missingRequiredSessions)
+    ? payload.missingRequiredSessions.filter((item): item is string => typeof item === "string" && item.trim().length > 0)
+    : [];
+
+  if (payload.ok === false) {
+    return {
+      status: "needs_action" as const,
+      detail: payload.detail ?? payload.message ?? "Upstream draft health check reported ok=false.",
+    };
+  }
+
+  if (healthStatus?.toLowerCase() === "needs_session") {
+    const missingDetail =
+      missingRequiredSessions.length > 0
+        ? ` Missing required sessions: ${missingRequiredSessions.join(", ")}.`
+        : "";
+    return {
+      status: missingRequiredSessions.length === 0 || missingRequiredSessions.includes(platform) ? "needs_action" as const : "online" as const,
+      detail: `Upstream draft health check reported status "${healthStatus}".${missingDetail}`,
+    };
+  }
+
+  if (!isReadyHealthStatus(healthStatus)) {
+    return {
+      status: "needs_action" as const,
+      detail: payload.detail ?? payload.message ?? `Upstream draft health check reported status "${healthStatus}".`,
+    };
+  }
+
+  return {
+    status: "online" as const,
+    detail: `Upstream draft health check reported status "${healthStatus ?? "ok"}".`,
+  };
+}
+
 async function probeUpstreamDraftStatus(platform: string): Promise<UpstreamDraftStatus> {
   const config = resolveUpstreamDraftConfig(platform);
   if (!config) {
@@ -598,6 +658,10 @@ async function probeUpstreamDraftStatus(platform: string): Promise<UpstreamDraft
       headers: config.apiKey ? { authorization: `Bearer ${config.apiKey}` } : undefined,
       signal: controller.signal,
     });
+    const payload = response.ok
+      ? ((await response.json().catch(() => undefined)) as UpstreamHealthPayload | undefined)
+      : undefined;
+    const healthSummary = response.ok ? summarizeUpstreamHealthPayload(payload, platform) : undefined;
 
     return {
       platform,
@@ -606,10 +670,8 @@ async function probeUpstreamDraftStatus(platform: string): Promise<UpstreamDraft
       credentialForwardingEnabled: config.includeCredential,
       statusCredentialForwardingEnabled: config.statusIncludeCredential,
       healthEndpoint: config.healthEndpoint,
-      status: response.ok ? "online" : "offline",
-      detail: response.ok
-        ? `Upstream draft health check returned HTTP ${response.status}.`
-        : `Upstream draft health check failed with HTTP ${response.status}.`,
+      status: response.ok ? healthSummary!.status : "offline",
+      detail: response.ok ? healthSummary!.detail : `Upstream draft health check failed with HTTP ${response.status}.`,
     };
   } catch (error) {
     return {

@@ -41,7 +41,7 @@ type DraftConnectorHealthPayload = {
     statusEndpointConfigured?: boolean;
     credentialForwardingEnabled?: boolean;
     statusCredentialForwardingEnabled?: boolean;
-    status?: "unconfigured" | "configured" | "online" | "offline";
+    status?: "unconfigured" | "configured" | "online" | "offline" | "needs_action";
     detail?: string;
   }>;
 };
@@ -224,6 +224,16 @@ export class PublishService {
         ];
       }
 
+      if (upstreamStatus?.draftEndpointConfigured && upstreamStatus.status === "needs_action") {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_UPSTREAM_DRAFT_CONNECTOR_NOT_READY`,
+            upstreamStatus.detail ??
+              `${platform} upstream draft connector is reachable but not ready before creating a real draft.`,
+          ),
+        ];
+      }
+
       if (upstreamStatus?.draftEndpointConfigured && upstreamStatus.credentialForwardingEnabled && !isEnabled(`${envPrefix}_DRAFT_INCLUDE_CREDENTIAL`)) {
         return [
           this.createIssue(
@@ -318,6 +328,16 @@ export class PublishService {
             `${platform.toUpperCase()}_UPSTREAM_STATUS_CONNECTOR_OFFLINE`,
             upstreamStatus.detail ??
               `${platform} upstream status connector health check failed before syncing draft status.`,
+          ),
+        ];
+      }
+
+      if (upstreamStatus?.statusEndpointConfigured && upstreamStatus.status === "needs_action") {
+        return [
+          this.createIssue(
+            `${platform.toUpperCase()}_UPSTREAM_STATUS_CONNECTOR_NOT_READY`,
+            upstreamStatus.detail ??
+              `${platform} upstream status connector is reachable but not ready before syncing draft status.`,
           ),
         ];
       }

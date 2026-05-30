@@ -470,7 +470,7 @@ function createCleanServiceEnv(extraEnv = {}) {
   ]);
 
   for (const key of Object.keys(env)) {
-    if (isolatedKeys.has(key) || key.startsWith("DRAFT_CONNECTOR_")) {
+    if (isolatedKeys.has(key) || key.startsWith("DRAFT_CONNECTOR_") || key.startsWith("DRAFT_AUTOMATION_")) {
       delete env[key];
     }
   }
@@ -3983,6 +3983,197 @@ async function runOfflineUpstreamDraftPreflightCheck() {
   }
 }
 
+async function runUpstreamNeedsSessionPreflightCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const apiPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const automationPort = await getFreePort();
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const automationBaseUrl = `http://127.0.0.1:${automationPort}`;
+  const outboxDir = path.join(runtimeDir, `draft-connector-upstream-session-e2e-${Date.now()}`);
+  const automationOutboxDir = path.join(runtimeDir, `draft-automation-session-e2e-${Date.now()}`);
+  const emptyAutomationEnvPath = path.join(runtimeDir, `draft-automation-empty-env-e2e-${Date.now()}.env`);
+  const queueName = `mp-publishing-draft-upstream-session-e2e-${Date.now()}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+  fs.rmSync(automationOutboxDir, { recursive: true, force: true });
+  fs.writeFileSync(emptyAutomationEnvPath, "", "utf8");
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+
+  const upstreamEnv = Object.fromEntries(
+    platforms.flatMap((platform) => {
+      const prefix = `DRAFT_CONNECTOR_${platform.toUpperCase()}_UPSTREAM`;
+      return [
+        [`${prefix}_DRAFT_ENDPOINT`, `${automationBaseUrl}/${platform}/drafts`],
+        [`${prefix}_DRAFT_API_KEY`, "automation-secret"],
+        [`${prefix}_HEALTH_ENDPOINT`, `${automationBaseUrl}/health`],
+      ];
+    }),
+  );
+  const apiEnv = createCleanServiceEnv({
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+  });
+  const draftConnectorEnv = createCleanServiceEnv({
+    PORT: String(connectorPort),
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
+    ...upstreamEnv,
+  });
+  const automationEnv = createCleanServiceEnv({
+    DRAFT_AUTOMATION_ENV_FILE: emptyAutomationEnvPath,
+    DRAFT_AUTOMATION_SERVICE_PORT: String(automationPort),
+    DRAFT_AUTOMATION_SERVICE_API_KEY: "automation-secret",
+    DRAFT_AUTOMATION_SERVICE_OUTBOX_DIR: automationOutboxDir,
+    DRAFT_AUTOMATION_REQUIRE_SESSION: "true",
+  });
+
+  const automation = startServiceWithEnv(
+    "draft-automation-needs-session",
+    ["scripts/start-draft-automation-service.mjs"],
+    root,
+    automationEnv,
+  );
+  const draftConnector = startServiceWithEnv(
+    "draft-connector-upstream-needs-session",
+    ["apps/draft-connector/dist/main.js"],
+    root,
+    draftConnectorEnv,
+  );
+  const api = startServiceWithEnv("api-draft-upstream-needs-session", ["apps/api/dist/main.js"], root, apiEnv);
+
+  try {
+    const automationHealth = await waitForAuthorizedHealth(
+      automation,
+      `${automationBaseUrl}/health`,
+      "Draft automation service missing session",
+      "automation-secret",
+    );
+    const connectorHealth = await waitForHealth(
+      draftConnector,
+      `${connectorBaseUrl}/health`,
+      "Draft connector upstream missing session",
+    );
+
+    if (
+      automationHealth.status !== "needs_session" ||
+      platforms.some((platform) => !automationHealth.missingRequiredSessions?.includes(platform))
+    ) {
+      throw new Error(`Automation health should expose missing required sessions: ${JSON.stringify(automationHealth)}`);
+    }
+
+    if (
+      platforms.some(
+        (platform) =>
+          !connectorHealth.upstreamDrafts?.some(
+            (item) =>
+              item.platform === platform &&
+              item.draftEndpointConfigured &&
+              item.status === "needs_action" &&
+              String(item.detail ?? "").includes("needs_session"),
+          ),
+      )
+    ) {
+      throw new Error(`Draft connector health did not expose upstream needs-session status: ${JSON.stringify(connectorHealth)}`);
+    }
+
+    await waitForApi(api);
+    const runtimeBeforePublish = await requestJson("/runtime/status");
+    if (
+      platforms.some((platform) => {
+        const platformStatus = runtimeBeforePublish.draftConnector?.platforms?.find((item) => item.platform === platform);
+        const issueCodes = platformStatus?.draftReadinessIssues?.map((issue) => issue.code) ?? [];
+        return (
+          platformStatus?.draftReady !== false ||
+          platformStatus?.upstreamDraftStatus !== "needs_action" ||
+          !issueCodes.includes(`${platform.toUpperCase()}_UPSTREAM_DRAFT_CONNECTOR_NOT_READY`)
+        );
+      })
+    ) {
+      throw new Error(`Runtime status should hold draft readiness while automation sessions are missing: ${JSON.stringify(runtimeBeforePublish.draftConnector)}`);
+    }
+
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for upstream missing-session preflight verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "Playwright automation session preflight e2e",
+          summary: "Verify real draft tasks stay out of the queue when upstream automation requires missing sessions.",
+          body: "This content confirms API preflight can see automation-service needs_session health through the draft connector.",
+          tags: ["draft", "automation", "session", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+    const runtimeAfterPublish = await requestJson("/runtime/status");
+
+    if (
+      created.status !== "needs_manual_action" ||
+      platforms.some((platform) => {
+        const target = created.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return (
+          target?.status !== "needs_manual_action" ||
+          !issueCodes.includes(`${platform.toUpperCase()}_UPSTREAM_DRAFT_CONNECTOR_NOT_READY`)
+        );
+      })
+    ) {
+      throw new Error(`Draft preflight did not hold upstream missing-session targets correctly: ${JSON.stringify(created)}`);
+    }
+
+    if (
+      runtimeAfterPublish.queue.waiting > 0 ||
+      runtimeAfterPublish.queue.active > 0 ||
+      runtimeAfterPublish.queue.delayed > 0 ||
+      runtimeAfterPublish.queue.failed > 0
+    ) {
+      throw new Error(`Missing-session upstream preflight should not enqueue work: ${JSON.stringify(runtimeAfterPublish.queue)}`);
+    }
+
+    return {
+      taskId: created.id,
+      status: created.status,
+      automationStatus: automationHealth.status,
+      missingRequiredSessions: automationHealth.missingRequiredSessions,
+      upstreamStatuses: connectorHealth.upstreamDrafts
+        ?.filter((item) => platforms.includes(item.platform))
+        .map((item) => ({ platform: item.platform, status: item.status })),
+      targets: created.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        issueCodes: target.issues.map((issue) => issue.code),
+      })),
+      queue: runtimeAfterPublish.queue,
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(draftConnector), stopService(automation)]);
+    fs.rmSync(outboxDir, { recursive: true, force: true });
+    fs.rmSync(automationOutboxDir, { recursive: true, force: true });
+    fs.rmSync(emptyAutomationEnvPath, { force: true });
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runOfflineUpstreamDraftRecoveryCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -5262,6 +5453,7 @@ const offlinePreflight = await runOfflineDraftConnectorPreflightCheck();
 const explicitLocalEndpointPreflight = await runExplicitLocalDraftEndpointPreflightCheck();
 const explicitLocalEndpointStatusSync = await runExplicitLocalDraftEndpointStatusSyncCheck();
 const offlineUpstreamPreflight = await runOfflineUpstreamDraftPreflightCheck();
+const upstreamNeedsSessionPreflight = await runUpstreamNeedsSessionPreflightCheck();
 const offlineUpstreamRecovery = await runOfflineUpstreamDraftRecoveryCheck();
 const upstreamForwarding = await runUpstreamDraftForwardingCheck();
 const upstreamRejectionManualAction = await runUpstreamDraftRejectionManualActionCheck();
@@ -5703,6 +5895,7 @@ try {
     explicitLocalEndpointPreflight,
     explicitLocalEndpointStatusSync,
     offlineUpstreamPreflight,
+    upstreamNeedsSessionPreflight,
     offlineUpstreamRecovery,
     upstreamForwarding,
     upstreamRejectionManualAction,
