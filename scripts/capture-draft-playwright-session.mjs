@@ -4,8 +4,10 @@ import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadWorkspaceEnv } from "./lib/workspace-env.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+loadWorkspaceEnv({ root });
 const supportedPlatforms = new Set(["zhihu", "bilibili", "xiaohongshu"]);
 
 const usageText = `Usage:

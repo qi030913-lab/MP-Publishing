@@ -18,6 +18,7 @@
     "drafts:capture-playwright-session": "node scripts/capture-draft-playwright-session.mjs",
     "drafts:capture-playwright-selectors": "node scripts/capture-draft-playwright-selectors.mjs",
     "drafts:check-playwright": "node scripts/check-draft-playwright-setup.mjs",
+    "drafts:smoke-playwright": "node scripts/smoke-draft-playwright.mjs",
     "drafts:run-work-orders": "node scripts/run-draft-work-order-runner.mjs",
     "drafts:check-upstream": "node scripts/check-draft-upstream-contract.mjs",
     "infra:up": "docker compose up -d postgres redis",

@@ -48,6 +48,8 @@
 
 补充：`pnpm drafts:capture-playwright-selectors -- --platform <platform> --url <creator-draft-url> --fields title,body,saveDraft --save-env` 已补上真实页面 selector 采集步骤：脚本复用上一步的 session 打开创作者草稿页，在页面内注入点击捕获层，让操作者依次点选标题、正文、保存草稿等元素，生成可直接给 `playwright-draft-handler` 使用的扁平 JSON selector 文件，并把 `DRAFT_AUTOMATION_<PLATFORM>_PLAYWRIGHT_SELECTORS_PATH` 写入 `.env`。当前 e2e 已覆盖 selector 文件格式、`.env` 指针更新、可跳过可选字段和敏感 cookie 不落入 `.env`。
 
+补充：Playwright capture、check、automation service 和 smoke 脚本现在会默认加载工作区 `.env`，因此 session capture 写入的 storage-state 路径和 selector capture 写入的 selector 路径会被后续命令自动接上；如需使用隔离配置，可设置 `DRAFT_AUTOMATION_ENV_FILE`。`pnpm drafts:smoke-playwright -- --platform <platform> --headed` 会直接构造安全的 `draft-upstream-work-order-v1` 工单调用内置 handler，默认只点击配置的 save-draft selector，不触碰最终发布按钮，用来在真实知乎 / B站 / 小红书页面上验证“填充并保存草稿”。
+
 ## 1. 目标
 
 面向公众号、知乎、B站、小红书等内容平台，提供一个统一的创作与发布工具，解决以下问题：

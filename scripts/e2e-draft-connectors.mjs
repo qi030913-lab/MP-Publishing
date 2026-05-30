@@ -1821,6 +1821,206 @@ export const chromium = {
   }
 }
 
+async function runDraftPlaywrightSmokeCheck() {
+  const smokeDir = path.join(runtimeDir, `draft-playwright-smoke-e2e-${Date.now()}`);
+  const fakePlaywrightPath = path.join(smokeDir, "fake-playwright.mjs");
+  const operationLogPath = path.join(smokeDir, "operations.json");
+  const selectorsPath = path.join(smokeDir, "zhihu-selectors.json");
+  const envPath = path.join(smokeDir, ".env");
+  fs.rmSync(smokeDir, { recursive: true, force: true });
+  fs.mkdirSync(smokeDir, { recursive: true });
+  fs.writeFileSync(
+    selectorsPath,
+    JSON.stringify(
+      {
+        title: "#title",
+        summary: "#summary",
+        body: "#body",
+        tags: "#tags",
+        saveDraft: "#save-draft",
+        savedIndicator: "#saved",
+        resultUrl: "#draft-link",
+        resultUrlAttribute: "href",
+        remoteIdRegex: "drafts/([^/?#]+)",
+      },
+      null,
+      2,
+    ),
+    "utf8",
+  );
+  fs.writeFileSync(
+    fakePlaywrightPath,
+    `
+import fs from "node:fs";
+
+const logPath = process.env.FAKE_PLAYWRIGHT_LOG_PATH;
+const operations = [];
+let currentUrl = "";
+
+function log(entry) {
+  operations.push(entry);
+  fs.writeFileSync(logPath, JSON.stringify(operations, null, 2), "utf8");
+}
+
+function locator(selector) {
+  return {
+    async fill(value) {
+      log({ action: "fill", selector, value });
+    },
+    async click(options) {
+      log({ action: "click", selector, timeout: options?.timeout });
+      currentUrl = "https://creator.zhihu.example.test/drafts/real-zhihu-smoke-888";
+    },
+    async waitFor(options) {
+      log({ action: "waitFor", selector, timeout: options?.timeout });
+    },
+    async getAttribute(attribute) {
+      log({ action: "getAttribute", selector, attribute });
+      return currentUrl;
+    },
+  };
+}
+
+export const chromium = {
+  async launch(options) {
+    log({ action: "launch", headless: options?.headless, channel: options?.channel });
+    return {
+      async newContext(options) {
+        log({ action: "newContext", hasStorageState: Boolean(options?.storageState) });
+        return {
+          async addCookies(cookies) {
+            log({ action: "addCookies", names: cookies.map((cookie) => cookie.name) });
+          },
+          async newPage() {
+            log({ action: "newPage" });
+            return {
+              setDefaultTimeout(timeout) {
+                log({ action: "setDefaultTimeout", timeout });
+              },
+              async goto(url, options) {
+                currentUrl = url;
+                log({ action: "goto", url, waitUntil: options?.waitUntil, timeout: options?.timeout });
+              },
+              locator,
+              async waitForURL(pattern, options) {
+                log({ action: "waitForURL", pattern, timeout: options?.timeout });
+              },
+              url() {
+                return currentUrl;
+              },
+            };
+          },
+        };
+      },
+      async close() {
+        log({ action: "close" });
+      },
+    };
+  },
+};
+`.trim(),
+    "utf8",
+  );
+  fs.writeFileSync(
+    envPath,
+    [
+      `DRAFT_AUTOMATION_PLAYWRIGHT_MODULE="${pathToFileURL(fakePlaywrightPath).href}"`,
+      `DRAFT_AUTOMATION_PLAYWRIGHT_TIMEOUT_MS="6789"`,
+      `DRAFT_AUTOMATION_PLAYWRIGHT_HEADLESS="true"`,
+      `DRAFT_AUTOMATION_PLAYWRIGHT_BROWSER_CHANNEL="chrome"`,
+      `DRAFT_AUTOMATION_ZHIHU_REQUIRE_SESSION="true"`,
+      `DRAFT_AUTOMATION_ZHIHU_COOKIES="SESSION=zhihu-smoke-secret"`,
+      `DRAFT_AUTOMATION_ZHIHU_STORAGE_STATE_JSON="{\\"cookies\\":[],\\"origins\\":[]}"`,
+      `DRAFT_AUTOMATION_ZHIHU_CREATOR_DRAFT_URL="https://creator.zhihu.example.test/drafts/new"`,
+      `DRAFT_AUTOMATION_ZHIHU_CREATOR_BASE_URL="https://creator.zhihu.example.test"`,
+      `DRAFT_AUTOMATION_ZHIHU_PLAYWRIGHT_SELECTORS_PATH="${selectorsPath.replaceAll("\\", "\\\\")}"`,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+
+  try {
+    const command = await runNodeCommand(
+      "draft playwright smoke",
+      [
+        path.join(root, "scripts/smoke-draft-playwright.mjs"),
+        "--platform",
+        "zhihu",
+        "--title",
+        "Playwright smoke check",
+        "--summary",
+        "Smoke summary.",
+        "--body",
+        "Smoke body.",
+        "--tags",
+        "smoke,draft",
+        "--remote-id-prefix",
+        "direct-smoke",
+      ],
+      {
+        DRAFT_AUTOMATION_ENV_FILE: envPath,
+        DRAFT_AUTOMATION_PLAYWRIGHT_MODULE: undefined,
+        DRAFT_AUTOMATION_PLAYWRIGHT_TIMEOUT_MS: undefined,
+        DRAFT_AUTOMATION_PLAYWRIGHT_HEADLESS: undefined,
+        DRAFT_AUTOMATION_PLAYWRIGHT_BROWSER_CHANNEL: undefined,
+        DRAFT_AUTOMATION_ZHIHU_REQUIRE_SESSION: undefined,
+        DRAFT_AUTOMATION_ZHIHU_COOKIES: undefined,
+        DRAFT_AUTOMATION_ZHIHU_STORAGE_STATE_JSON: undefined,
+        DRAFT_AUTOMATION_ZHIHU_STORAGE_STATE_PATH: undefined,
+        DRAFT_AUTOMATION_ZHIHU_CREATOR_DRAFT_URL: undefined,
+        DRAFT_AUTOMATION_ZHIHU_CREATOR_BASE_URL: undefined,
+        DRAFT_AUTOMATION_ZHIHU_PLAYWRIGHT_SELECTORS_JSON: undefined,
+        DRAFT_AUTOMATION_ZHIHU_PLAYWRIGHT_SELECTORS_PATH: undefined,
+        DRAFT_AUTOMATION_ZHIHU_PLAYWRIGHT_CLICK_SAVE: undefined,
+        FAKE_PLAYWRIGHT_LOG_PATH: operationLogPath,
+      },
+    );
+    const result = JSON.parse(command.stdout);
+    const operations = JSON.parse(fs.readFileSync(operationLogPath, "utf8"));
+    const fillBySelector = new Map(operations.filter((item) => item.action === "fill").map((item) => [item.selector, item.value]));
+    const smokeResult = result.results?.[0];
+
+    if (
+      result.ok !== true ||
+      smokeResult?.platform !== "zhihu" ||
+      smokeResult.remoteId !== "real-zhihu-smoke-888" ||
+      smokeResult.url !== "https://creator.zhihu.example.test/drafts/real-zhihu-smoke-888" ||
+      smokeResult.session?.ready !== true ||
+      smokeResult.session?.hasCookies !== true ||
+      smokeResult.session?.hasStorageStateJson !== true ||
+      JSON.stringify(result).includes("zhihu-smoke-secret") ||
+      !smokeResult.workOrder?.checklist?.some((item) => item.id === "save-draft" && item.required) ||
+      fillBySelector.get("#title") !== "Playwright smoke check" ||
+      fillBySelector.get("#summary") !== "Smoke summary." ||
+      !String(fillBySelector.get("#body")).includes("Smoke body.") ||
+      !String(fillBySelector.get("#body")).includes("#smoke #draft") ||
+      fillBySelector.get("#tags") !== "smoke draft" ||
+      !operations.some((item) => item.action === "launch" && item.headless === true && item.channel === "chrome") ||
+      !operations.some((item) => item.action === "newContext" && item.hasStorageState === true) ||
+      !operations.some((item) => item.action === "addCookies" && item.names.includes("SESSION")) ||
+      !operations.some((item) => item.action === "click" && item.selector === "#save-draft") ||
+      !operations.some((item) => item.action === "setDefaultTimeout" && item.timeout === 6789)
+    ) {
+      throw new Error(
+        `Draft Playwright smoke command did not load .env and create the expected draft: ${JSON.stringify({
+          result,
+          operations,
+        })}`,
+      );
+    }
+
+    return {
+      platform: smokeResult.platform,
+      remoteId: smokeResult.remoteId,
+      url: smokeResult.url,
+      loadedSessionFromEnv: smokeResult.session.ready,
+      clickedSaveDraft: operations.some((item) => item.action === "click" && item.selector === "#save-draft"),
+    };
+  } finally {
+    fs.rmSync(smokeDir, { recursive: true, force: true });
+  }
+}
+
 async function runUpstreamSandboxCallbackCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -4761,6 +4961,7 @@ const draftPlaywrightSessionCaptureCheck = await runDraftPlaywrightSessionCaptur
 const draftPlaywrightSelectorCaptureCheck = await runDraftPlaywrightSelectorCaptureCheck();
 const draftPlaywrightSetupCheck = await runDraftPlaywrightSetupCheckScriptCheck();
 const draftPlaywrightHandlerCheck = await runDraftPlaywrightHandlerCheck();
+const draftPlaywrightSmokeCheck = await runDraftPlaywrightSmokeCheck();
 const upstreamSandboxCallback = await runUpstreamSandboxCallbackCheck();
 const upstreamProxyEnablement = await runUpstreamProxyEnablementCheck();
 const localEnablement = await runLocalDraftEnablementCheck();
@@ -5199,6 +5400,7 @@ try {
     draftPlaywrightSelectorCaptureCheck,
     draftPlaywrightSetupCheck,
     draftPlaywrightHandlerCheck,
+    draftPlaywrightSmokeCheck,
     upstreamSandboxCallback,
     upstreamProxyEnablement,
     localEnablement,

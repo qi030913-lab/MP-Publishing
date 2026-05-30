@@ -3,8 +3,10 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { checkDraftSetup } from "./handlers/playwright-draft-handler.mjs";
+import { loadWorkspaceEnv } from "./lib/workspace-env.mjs";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+loadWorkspaceEnv({ root });
 const supportedPlatforms = new Set(["zhihu", "bilibili", "xiaohongshu"]);
 
 const usageText = `Usage:
