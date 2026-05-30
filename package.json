@@ -11,6 +11,7 @@
     "db:generate": "pnpm --filter @mp-publishing/task-runtime db:generate",
     "db:push": "pnpm --filter @mp-publishing/task-runtime db:push",
     "dev": "turbo run dev --parallel",
+    "drafts:enable-local": "node scripts/enable-local-draft-connectors.mjs",
     "infra:up": "docker compose up -d postgres redis",
     "infra:down": "docker compose down",
     "lint": "turbo run lint",
