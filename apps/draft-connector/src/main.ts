@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -27,6 +28,7 @@ type StoredDraft = {
 };
 
 const supportedPlatforms = new Set(["zhihu", "bilibili", "xiaohongshu"]);
+const port = Number(process.env.PORT ?? 3010);
 
 function findWorkspaceRoot(startDir: string) {
   let currentDir = startDir;
@@ -51,7 +53,7 @@ const outboxDir = process.env.DRAFT_CONNECTOR_OUTBOX_DIR
   : path.join(workspaceRoot, ".runtime", "drafts");
 
 function createDraftId(platform: string) {
-  return `${platform}-draft-${Date.now()}-${Math.random().toString(16).slice(2, 8)}`;
+  return `${platform}-draft-${randomUUID()}`;
 }
 
 async function readJsonBody(request: IncomingMessage) {
@@ -69,6 +71,45 @@ function sendJson(response: ServerResponse, statusCode: number, payload: unknown
   response.end(JSON.stringify(payload));
 }
 
+function sendHtml(response: ServerResponse, statusCode: number, html: string) {
+  response.writeHead(statusCode, { "content-type": "text/html; charset=utf-8" });
+  response.end(html);
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function firstHeaderValue(value: string | string[] | undefined) {
+  if (Array.isArray(value)) {
+    return value[0];
+  }
+
+  return value;
+}
+
+function resolvePublicBaseUrl(request: IncomingMessage) {
+  const configuredBaseUrl = process.env.DRAFT_CONNECTOR_PUBLIC_BASE_URL?.trim();
+  if (configuredBaseUrl) {
+    return configuredBaseUrl.replace(/\/+$/, "");
+  }
+
+  const forwardedProto = firstHeaderValue(request.headers["x-forwarded-proto"])?.split(",")[0]?.trim();
+  const forwardedHost = firstHeaderValue(request.headers["x-forwarded-host"])?.split(",")[0]?.trim();
+  const host = forwardedHost || request.headers.host || `localhost:${port}`;
+  const protocol = forwardedProto || "http";
+  return `${protocol}://${host}`;
+}
+
+function createDraftUrl(platform: string, draftId: string, request: IncomingMessage) {
+  return `${resolvePublicBaseUrl(request)}/${platform}/drafts/${draftId}`;
+}
+
 function requireAuthorized(request: IncomingMessage) {
   const apiKey = process.env.DRAFT_CONNECTOR_API_KEY?.trim();
   if (!apiKey) {
@@ -80,12 +121,16 @@ function requireAuthorized(request: IncomingMessage) {
 
 function parseRoute(url: string | undefined) {
   const parsed = new URL(url ?? "/", "http://localhost");
-  const [platform, operation] = parsed.pathname.split("/").filter(Boolean);
-  return { platform, operation };
+  const [platform, operation, draftId] = parsed.pathname.split("/").filter(Boolean);
+  return { platform, operation, draftId };
 }
 
 function validatePlatform(platform: string | undefined) {
   return platform && supportedPlatforms.has(platform) ? platform : null;
+}
+
+function validateDraftId(draftId: string | undefined) {
+  return draftId && /^[a-z0-9-]+$/i.test(draftId) ? draftId : null;
 }
 
 function validateDraftPayload(platform: string, payload: DraftPayload) {
@@ -107,6 +152,61 @@ function validateDraftPayload(platform: string, payload: DraftPayload) {
   }
 
   return null;
+}
+
+async function readStoredDraft(platform: string, draftId: string) {
+  const filePath = path.join(outboxDir, platform, `${draftId}.json`);
+  if (!existsSync(filePath)) {
+    return null;
+  }
+
+  return JSON.parse(await readFile(filePath, "utf8")) as StoredDraft;
+}
+
+function shouldReturnJson(request: IncomingMessage) {
+  const parsed = new URL(request.url ?? "/", "http://localhost");
+  const accept = firstHeaderValue(request.headers.accept) ?? "";
+  return parsed.searchParams.get("format") === "json" || accept.includes("application/json");
+}
+
+function renderDraftHtml(storedDraft: StoredDraft, url: string) {
+  const title = storedDraft.payload.draft?.title ?? storedDraft.payload.document?.title ?? storedDraft.draftId;
+  const body = storedDraft.payload.draft?.body ?? "";
+  const json = JSON.stringify(storedDraft, null, 2);
+
+  return `<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>${escapeHtml(title)}</title>
+    <style>
+      body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #172033; background: #f7f7f4; }
+      main { width: min(960px, calc(100vw - 32px)); margin: 32px auto; }
+      .meta, pre { background: #fff; border: 1px solid #d7d7cf; border-radius: 8px; padding: 16px; }
+      .meta { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; margin: 20px 0; }
+      .meta span { display: block; color: #626a73; font-size: 13px; }
+      .meta strong { display: block; margin-top: 4px; }
+      article { background: #fff; border: 1px solid #d7d7cf; border-radius: 8px; padding: 24px; line-height: 1.75; }
+      pre { overflow-x: auto; margin-top: 20px; font-size: 13px; line-height: 1.55; }
+      a { color: #225fd7; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>${escapeHtml(title)}</h1>
+      <div class="meta">
+        <div><span>Platform</span><strong>${escapeHtml(storedDraft.platform)}</strong></div>
+        <div><span>Account</span><strong>${escapeHtml(storedDraft.accountId ?? "unknown")}</strong></div>
+        <div><span>Draft ID</span><strong>${escapeHtml(storedDraft.draftId)}</strong></div>
+        <div><span>Created</span><strong>${escapeHtml(storedDraft.createdAt)}</strong></div>
+      </div>
+      <article>${escapeHtml(body).replaceAll("\n", "<br />")}</article>
+      <pre>${escapeHtml(json)}</pre>
+      <p><a href="${escapeHtml(`${url}?format=json`)}">JSON</a></p>
+    </main>
+  </body>
+</html>`;
 }
 
 async function handleCreateDraft(platform: string, request: IncomingMessage, response: ServerResponse) {
@@ -140,9 +240,35 @@ async function handleCreateDraft(platform: string, request: IncomingMessage, res
     ok: true,
     draftId,
     remoteId: draftId,
-    url: `draft-outbox://${platform}/${draftId}`,
+    url: createDraftUrl(platform, draftId, request),
     message: `${platform} draft stored in local outbox.`,
   });
+}
+
+async function handleGetDraft(platform: string, draftId: string | undefined, request: IncomingMessage, response: ServerResponse) {
+  const validDraftId = validateDraftId(draftId);
+  if (!validDraftId) {
+    sendJson(response, 422, { ok: false, message: "Draft route must include a valid draft id." });
+    return;
+  }
+
+  const storedDraft = await readStoredDraft(platform, validDraftId);
+  if (!storedDraft) {
+    sendJson(response, 404, {
+      ok: false,
+      message: `${platform} draft ${validDraftId} was not found in local outbox.`,
+      remoteId: validDraftId,
+    });
+    return;
+  }
+
+  const url = createDraftUrl(platform, storedDraft.draftId, request);
+  if (shouldReturnJson(request)) {
+    sendJson(response, 200, { ok: true, url, ...storedDraft });
+    return;
+  }
+
+  sendHtml(response, 200, renderDraftHtml(storedDraft, url));
 }
 
 async function handleDraftStatus(platform: string, request: IncomingMessage, response: ServerResponse) {
@@ -157,29 +283,34 @@ async function handleDraftStatus(platform: string, request: IncomingMessage, res
     return;
   }
 
-  const filePath = path.join(outboxDir, platform, `${payload.remoteId}.json`);
-  if (!existsSync(filePath)) {
+  const validDraftId = validateDraftId(payload.remoteId);
+  if (!validDraftId) {
+    sendJson(response, 422, { state: "needs_manual_action", detail: "Status payload remoteId is invalid." });
+    return;
+  }
+
+  const storedDraft = await readStoredDraft(platform, validDraftId);
+  if (!storedDraft) {
     sendJson(response, 404, {
       state: "needs_manual_action",
-      detail: `${platform} draft ${payload.remoteId} was not found in local outbox.`,
-      remoteId: payload.remoteId,
+      detail: `${platform} draft ${validDraftId} was not found in local outbox.`,
+      remoteId: validDraftId,
     });
     return;
   }
 
-  const storedDraft = JSON.parse(await readFile(filePath, "utf8")) as StoredDraft;
   sendJson(response, 200, {
     state: "draft",
     detail: `${platform} draft is stored in local outbox.`,
     remoteId: storedDraft.draftId,
-    url: `draft-outbox://${platform}/${storedDraft.draftId}`,
+    url: createDraftUrl(platform, storedDraft.draftId, request),
   });
 }
 
 const server = createServer((request, response) => {
   void (async () => {
     try {
-      const { platform: routePlatform, operation } = parseRoute(request.url);
+      const { platform: routePlatform, operation, draftId } = parseRoute(request.url);
       const platform = validatePlatform(routePlatform);
 
       if (request.method === "GET" && request.url === "/health") {
@@ -201,6 +332,11 @@ const server = createServer((request, response) => {
         return;
       }
 
+      if (request.method === "GET" && operation === "drafts") {
+        await handleGetDraft(platform, draftId, request, response);
+        return;
+      }
+
       if (request.method === "POST" && operation === "status") {
         await handleDraftStatus(platform, request, response);
         return;
@@ -216,7 +352,6 @@ const server = createServer((request, response) => {
   })();
 });
 
-const port = Number(process.env.PORT ?? 3010);
 server.listen(port, () => {
   console.log(`draft connector listening on ${port}`);
   console.log(`draft outbox: ${outboxDir}`);

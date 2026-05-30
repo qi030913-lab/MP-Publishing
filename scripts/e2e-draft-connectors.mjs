@@ -65,6 +65,16 @@ async function requestJson(pathname, options = {}) {
   return response.json();
 }
 
+async function requestAbsoluteJson(url) {
+  const response = await fetch(url, { headers: { accept: "application/json" } });
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`GET ${url} failed: ${response.status} ${body}`);
+  }
+
+  return response.json();
+}
+
 async function waitForApi(api) {
   for (let i = 0; i < 40; i += 1) {
     if (api.child.exitCode !== null) {
@@ -161,6 +171,7 @@ const draftConnectorEnv = {
   PORT: String(connectorPort),
   DRAFT_CONNECTOR_API_KEY: "draft-secret",
   DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
+  DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
 };
 
 const api = startService("api", ["apps/api/dist/main.js"], connectorEnv);
@@ -217,6 +228,32 @@ try {
   }
 
   const storedDrafts = readDraftOutbox(outboxDir, platforms);
+  if (task.status !== "succeeded") {
+    throw new Error(`Draft connector task did not succeed: ${task.status}`);
+  }
+
+  const draftDetails = [];
+  for (const platform of platforms) {
+    const target = task.results.find((item) => item.platform === platform);
+    const expectedUrlPrefix = `${connectorBaseUrl}/${platform}/drafts/`;
+    if (!target || target.status !== "succeeded" || !target.remoteId || !target.url?.startsWith(expectedUrlPrefix)) {
+      throw new Error(`Draft connector target did not produce an HTTP draft URL for ${platform}: ${JSON.stringify(target)}`);
+    }
+
+    const detail = await requestAbsoluteJson(target.url);
+    if (detail.draftId !== target.remoteId || detail.platform !== platform || detail.url !== target.url) {
+      throw new Error(`Draft connector detail URL returned an unexpected payload for ${platform}: ${JSON.stringify(detail)}`);
+    }
+
+    draftDetails.push({
+      platform: detail.platform,
+      draftId: detail.draftId,
+      title: detail.payload?.draft?.title,
+      accountId: detail.accountId,
+      url: detail.url,
+    });
+  }
+
   const result = {
     taskId: created.id,
     finalStatus: task.status,
@@ -233,21 +270,11 @@ try {
       title: draft.payload.draft?.title,
       accountId: draft.accountId,
     })),
+    draftDetails,
     queue: runtime.queue,
   };
 
   console.log(JSON.stringify(result, null, 2));
-
-  if (task.status !== "succeeded") {
-    throw new Error(`Draft connector task did not succeed: ${task.status}`);
-  }
-
-  for (const platform of platforms) {
-    const target = task.results.find((item) => item.platform === platform);
-    if (!target || target.status !== "succeeded" || !target.remoteId || !target.url?.startsWith("draft-outbox://")) {
-      throw new Error(`Draft connector target did not produce a draft reference for ${platform}: ${JSON.stringify(target)}`);
-    }
-  }
 
   if (storedDrafts.length !== platforms.length) {
     throw new Error(`Expected ${platforms.length} stored drafts, received ${storedDrafts.length}.`);

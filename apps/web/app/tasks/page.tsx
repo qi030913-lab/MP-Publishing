@@ -71,7 +71,7 @@ function taskModeLabel(mode: PublishTaskSummary["mode"] | PublishTaskDetail["mod
 }
 
 function resultLinkLabel(url: string) {
-  if (url.includes("://draft/")) return "打开草稿引用";
+  if (url.includes("/drafts/") || url.startsWith("draft-outbox://") || url.includes("://draft/")) return "打开草稿";
   if (url.startsWith("https://example.com/")) return "打开 mock 链接";
   return "打开发布结果";
 }
