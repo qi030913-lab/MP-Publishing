@@ -246,9 +246,12 @@ export class PublishService {
 
   async listTasks() {
     const tasks = await listTasks();
+    const sortedTasks = [...tasks].sort(
+      (left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
+    );
 
     return {
-      items: tasks.map((task) => ({
+      items: sortedTasks.map((task) => ({
         id: task.id,
         mode: task.mode,
         status: task.status,
@@ -257,6 +260,11 @@ export class PublishService {
         updatedAt: task.updatedAt,
         targetCount: task.targets.length,
         issueCount: task.targets.reduce((count, target) => count + target.issues.length, 0),
+        platforms: task.targets.map((target) => target.platform),
+        targetStatuses: task.targets.map((target) => ({
+          platform: target.platform,
+          status: target.status,
+        })),
       })),
     };
   }

@@ -27,6 +27,8 @@ import { useEffect, useMemo, useState } from "react";
 
 type PlatformName = "wechat" | "zhihu" | "bilibili" | "xiaohongshu";
 type ToneMode = "keep" | "platform-optimized";
+type TaskStatusFilter = "all" | "running" | "needs_attention" | "succeeded";
+type TaskViewMode = "latest" | "attention-first";
 
 type ValidationIssue = {
   code: string;
@@ -121,6 +123,11 @@ type PublishTaskSummary = {
   updatedAt: string;
   targetCount: number;
   issueCount: number;
+  platforms: PlatformName[];
+  targetStatuses: Array<{
+    platform: PlatformName;
+    status: "queued" | "running" | "succeeded" | "needs_retry" | "failed" | "needs_manual_action";
+  }>;
 };
 
 type AccountSummary = {
@@ -277,6 +284,27 @@ function eventStageLabel(stage: PublishTaskDetail["timeline"][number]["stage"]) 
   return "失败";
 }
 
+function statusFilterLabel(filter: TaskStatusFilter) {
+  if (filter === "running") return "执行中";
+  if (filter === "needs_attention") return "待处理";
+  if (filter === "succeeded") return "已完成";
+  return "全部";
+}
+
+function viewModeLabel(mode: TaskViewMode) {
+  if (mode === "attention-first") return "待处理优先";
+  return "最近更新";
+}
+
+function taskTargetStatusLabel(status: PublishTaskSummary["targetStatuses"][number]["status"]) {
+  if (status === "queued") return "排队中";
+  if (status === "running") return "执行中";
+  if (status === "succeeded") return "已完成";
+  if (status === "failed") return "失败";
+  if (status === "needs_manual_action") return "待人工";
+  return "待重试";
+}
+
 function createRuntimeFallback(): RuntimeStatus {
   return {
     worker: {
@@ -343,6 +371,10 @@ export default function HomePage() {
   const [taskSummaries, setTaskSummaries] = useState<PublishTaskSummary[]>([]);
   const [activeTask, setActiveTask] = useState<PublishTaskDetail | null>(null);
   const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
+  const [taskStatusFilter, setTaskStatusFilter] = useState<TaskStatusFilter>("all");
+  const [taskPlatformFilter, setTaskPlatformFilter] = useState<PlatformName | "all">("all");
+  const [taskViewMode, setTaskViewMode] = useState<TaskViewMode>("latest");
+  const [taskSearch, setTaskSearch] = useState("");
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
   const [isSimulationLoading, setIsSimulationLoading] = useState(false);
   const [isMockPublishLoading, setIsMockPublishLoading] = useState(false);
@@ -370,6 +402,74 @@ export default function HomePage() {
   const selectedAccounts = accounts.filter((account) => selectedAccountIds.includes(account.id));
   const totalWarnings = previewResults.reduce((count, preview) => count + preview.warnings.length, 0);
   const totalIssues = activeTask?.results.reduce((count, item) => count + item.issues.length, 0) ?? 0;
+  const filteredTaskSummaries = useMemo(() => {
+    const normalizedQuery = taskSearch.trim().toLowerCase();
+    const attentionStatuses: PublishTaskSummary["targetStatuses"][number]["status"][] = [
+      "needs_manual_action",
+      "needs_retry",
+      "failed",
+    ];
+
+    const matches = taskSummaries.filter((task) => {
+      const matchesStatus =
+        taskStatusFilter === "all"
+          ? true
+          : taskStatusFilter === "needs_attention"
+            ? task.status === "partial" ||
+              task.status === "needs_manual_action" ||
+              task.targetStatuses.some((item) => attentionStatuses.includes(item.status))
+            : taskStatusFilter === "running"
+              ? task.status === "running" || task.status === "queued"
+              : task.status === taskStatusFilter;
+
+      const matchesPlatform =
+        taskPlatformFilter === "all"
+          ? true
+          : task.platforms.includes(taskPlatformFilter);
+
+      const matchesQuery =
+        normalizedQuery.length === 0
+          ? true
+          : task.documentTitle.toLowerCase().includes(normalizedQuery) ||
+            task.id.toLowerCase().includes(normalizedQuery);
+
+      return matchesStatus && matchesPlatform && matchesQuery;
+    });
+
+    if (taskViewMode === "attention-first") {
+      return [...matches].sort((left, right) => {
+        const score = (status: PublishTaskSummary["status"]) => {
+          if (status === "needs_manual_action") return 0;
+          if (status === "partial") return 1;
+          if (status === "running" || status === "queued") return 2;
+          if (status === "failed") return 3;
+          return 4;
+        };
+
+        const scoreDiff = score(left.status) - score(right.status);
+        if (scoreDiff !== 0) {
+          return scoreDiff;
+        }
+
+        return new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime();
+      });
+    }
+
+    return [...matches].sort(
+      (left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime(),
+    );
+  }, [taskPlatformFilter, taskSearch, taskStatusFilter, taskSummaries, taskViewMode]);
+
+  useEffect(() => {
+    if (!activeTask) {
+      return;
+    }
+
+    const existsInFilteredList = filteredTaskSummaries.some((task) => task.id === activeTask.id);
+    if (!existsInFilteredList) {
+      setActiveTask(null);
+    }
+  }, [activeTask, filteredTaskSummaries]);
 
   async function refreshTasks(selectTaskId?: string) {
     setIsTasksLoading(true);
@@ -379,7 +479,7 @@ export default function HomePage() {
       const payload = (await response.json()) as { items: PublishTaskSummary[] };
       setTaskSummaries(payload.items);
 
-      const nextTaskId = selectTaskId ?? payload.items[0]?.id;
+      const nextTaskId = selectTaskId ?? activeTask?.id ?? payload.items[0]?.id;
       if (nextTaskId) {
         const detailResponse = await fetch(`http://localhost:3001/publish/tasks/${nextTaskId}`);
         const detailPayload = (await detailResponse.json()) as PublishTaskDetail;
@@ -1298,9 +1398,77 @@ export default function HomePage() {
                 </div>
               </div>
 
-              {taskSummaries.length > 0 ? (
+              <div className="task-filter-panel">
+                <label className="field compact-field">
+                  <span>检索任务</span>
+                  <input
+                    value={taskSearch}
+                    onChange={(event) => setTaskSearch(event.target.value)}
+                    placeholder="按标题或任务 ID 搜索"
+                  />
+                </label>
+
+                <div className="task-filter-grid">
+                  <div className="control-group compact-control">
+                    <span className="control-label">状态</span>
+                    <div className="segmented compact-segmented">
+                      {(["all", "running", "needs_attention", "succeeded"] as TaskStatusFilter[]).map((filter) => (
+                        <button
+                          key={filter}
+                          type="button"
+                          className={taskStatusFilter === filter ? "active" : ""}
+                          onClick={() => setTaskStatusFilter(filter)}
+                        >
+                          {statusFilterLabel(filter)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="control-group compact-control">
+                    <span className="control-label">排序视图</span>
+                    <div className="segmented compact-segmented">
+                      {(["latest", "attention-first"] as TaskViewMode[]).map((mode) => (
+                        <button
+                          key={mode}
+                          type="button"
+                          className={taskViewMode === mode ? "active" : ""}
+                          onClick={() => setTaskViewMode(mode)}
+                        >
+                          {viewModeLabel(mode)}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="control-group compact-control">
+                    <span className="control-label">平台</span>
+                    <div className="segmented compact-segmented">
+                      <button
+                        type="button"
+                        className={taskPlatformFilter === "all" ? "active" : ""}
+                        onClick={() => setTaskPlatformFilter("all")}
+                      >
+                        全部
+                      </button>
+                      {(Object.keys(platformMeta) as PlatformName[]).map((platform) => (
+                        <button
+                          key={platform}
+                          type="button"
+                          className={taskPlatformFilter === platform ? "active" : ""}
+                          onClick={() => setTaskPlatformFilter(platform)}
+                        >
+                          {platformMeta[platform].label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {filteredTaskSummaries.length > 0 ? (
                 <div className="task-summary-list">
-                  {taskSummaries.map((task) => (
+                  {filteredTaskSummaries.map((task) => (
                     <button
                       key={task.id}
                       type="button"
@@ -1316,11 +1484,23 @@ export default function HomePage() {
                         <span>{task.targetCount} 平台</span>
                         <span>{task.issueCount} 问题</span>
                       </div>
+                      <div className="task-platform-row">
+                        {task.targetStatuses.map((item) => (
+                          <span key={`${task.id}-${item.platform}`} className={`mini-platform-pill ${item.status}`}>
+                            {platformMeta[item.platform].label} · {taskTargetStatusLabel(item.status)}
+                          </span>
+                        ))}
+                      </div>
                     </button>
                   ))}
                 </div>
               ) : (
-                <EmptyTasks />
+                <div className="empty-state report-empty">
+                  <div>
+                    <strong>当前筛选条件下没有任务</strong>
+                    <p>试试切换状态、平台或清空关键词，看看别的任务视图。</p>
+                  </div>
+                </div>
               )}
             </div>
           </div>
@@ -1516,6 +1696,10 @@ export default function HomePage() {
           resize: vertical;
         }
 
+        .compact-field {
+          margin-top: 0;
+        }
+
         .editor-panel {
           margin-top: 18px;
           border-radius: 8px;
@@ -1567,6 +1751,12 @@ export default function HomePage() {
           gap: 16px;
         }
 
+        .compact-control {
+          align-items: flex-start;
+          flex-direction: column;
+          justify-content: flex-start;
+        }
+
         .segmented {
           display: inline-flex;
           padding: 4px;
@@ -1597,6 +1787,10 @@ export default function HomePage() {
         .tab-row button.active {
           background: rgba(37, 99, 235, 0.16);
           color: #dbeafe;
+        }
+
+        .compact-segmented {
+          flex-wrap: wrap;
         }
 
         .toggle-row {
@@ -1699,6 +1893,18 @@ export default function HomePage() {
           text-align: left;
         }
 
+        .task-filter-panel {
+          display: grid;
+          gap: 16px;
+          margin-top: 18px;
+          margin-bottom: 18px;
+        }
+
+        .task-filter-grid {
+          display: grid;
+          gap: 16px;
+        }
+
         .task-summary-head,
         .task-summary-meta,
         .task-meta-row {
@@ -1706,6 +1912,44 @@ export default function HomePage() {
           flex-wrap: wrap;
           justify-content: space-between;
           gap: 8px 12px;
+        }
+
+        .task-platform-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 8px;
+        }
+
+        .mini-platform-pill {
+          display: inline-flex;
+          align-items: center;
+          padding: 6px 10px;
+          border-radius: 999px;
+          font-size: 12px;
+          color: #cbd5e1;
+          background: rgba(15, 23, 42, 0.72);
+          border: 1px solid rgba(148, 163, 184, 0.16);
+        }
+
+        .mini-platform-pill.succeeded {
+          color: #bbf7d0;
+          border-color: rgba(22, 163, 74, 0.24);
+          background: rgba(22, 163, 74, 0.12);
+        }
+
+        .mini-platform-pill.queued,
+        .mini-platform-pill.running {
+          color: #bfdbfe;
+          border-color: rgba(37, 99, 235, 0.24);
+          background: rgba(37, 99, 235, 0.12);
+        }
+
+        .mini-platform-pill.failed,
+        .mini-platform-pill.needs_retry,
+        .mini-platform-pill.needs_manual_action {
+          color: #fed7aa;
+          border-color: rgba(217, 119, 6, 0.24);
+          background: rgba(217, 119, 6, 0.14);
         }
 
         .account-copy {
