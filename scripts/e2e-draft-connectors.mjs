@@ -159,6 +159,71 @@ function readDraftOutbox(outboxDir, platforms) {
   });
 }
 
+async function runDisabledDraftPreflightCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const preflightApiPort = await getFreePort();
+  const preflightQueueName = `mp-publishing-draft-preflight-e2e-${Date.now()}`;
+  apiBaseUrl = `http://127.0.0.1:${preflightApiPort}`;
+  const api = startService("api-draft-preflight", ["apps/api/dist/main.js"], {
+    PORT: String(preflightApiPort),
+    PUBLISH_QUEUE_NAME: preflightQueueName,
+    DRAFT_CONNECTOR_BASE_URL: "",
+    ZHIHU_REAL_PUBLISH_ENABLED: "false",
+    ZHIHU_DRAFT_ENDPOINT: "",
+  });
+
+  try {
+    await waitForApi(api);
+    const accountsResponse = await requestJson("/accounts");
+    const zhihuAccount = accountsResponse.items.find((account) => account.platform === "zhihu");
+    if (!zhihuAccount) {
+      throw new Error(`Missing zhihu account for preflight verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "非公众号平台真实草稿预检验证",
+          summary: "验证未启用连接器时不会把真实草稿任务排入 worker。",
+          body: "这条内容用于确认 API 会在创建真实草稿任务时做连接器预检。",
+          tags: ["draft", "preflight", "e2e"],
+        },
+        platforms: ["zhihu"],
+        accountIds: [zhihuAccount.id],
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+    const target = created.results.find((item) => item.platform === "zhihu");
+    const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+
+    if (
+      created.status !== "needs_manual_action" ||
+      target?.status !== "needs_manual_action" ||
+      !issueCodes.includes("ZHIHU_REAL_PUBLISH_DISABLED") ||
+      !issueCodes.includes("ZHIHU_DRAFT_ENDPOINT_MISSING")
+    ) {
+      throw new Error(`Draft preflight did not mark disabled connector target correctly: ${JSON.stringify(created)}`);
+    }
+
+    return {
+      taskId: created.id,
+      status: created.status,
+      targetStatus: target.status,
+      issueCodes,
+    };
+  } finally {
+    await stopService(api);
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 ensureBuildOutput();
 
 const connectorPort = await getFreePort();
@@ -183,6 +248,7 @@ const draftConnectorEnv = {
   DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
   DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
 };
+const disabledPreflight = await runDisabledDraftPreflightCheck();
 
 const api = startService("api", ["apps/api/dist/main.js"], connectorEnv);
 const worker = startService("worker", ["apps/worker/dist/main.js"], connectorEnv);
@@ -352,6 +418,7 @@ try {
       status: initialRuntime.draftConnector.status,
       outboxUrl: initialRuntime.draftConnector.outboxUrl,
     },
+    disabledPreflight,
     queue: runtime.queue,
   };
 

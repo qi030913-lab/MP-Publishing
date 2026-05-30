@@ -1,7 +1,7 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
 import { createDocumentFromInput } from "@mp-publishing/content-model";
 import { adapterRegistry } from "@mp-publishing/adapter-core";
-import type { PublishStatus } from "@mp-publishing/platform-sdk";
+import type { PlatformName, PublishStatus, ValidationIssue } from "@mp-publishing/platform-sdk";
 import {
   createContentSnapshot,
   enqueueTaskTargets,
@@ -27,6 +27,35 @@ import type {
   SimulatePublishDto,
   SyncPublishTaskDto,
 } from "./publish.dto.js";
+
+const draftConnectorPlatforms: Partial<Record<PlatformName, { envPrefix: string }>> = {
+  zhihu: { envPrefix: "ZHIHU" },
+  bilibili: { envPrefix: "BILIBILI" },
+  xiaohongshu: { envPrefix: "XIAOHONGSHU" },
+};
+
+function readEnvValue(key: string) {
+  const value = process.env[key]?.trim();
+  return value && value.length > 0 ? value : undefined;
+}
+
+function isEnabled(key: string) {
+  return readEnvValue(key)?.toLowerCase() === "true";
+}
+
+function trimTrailingSlash(value: string) {
+  return value.replace(/\/+$/, "");
+}
+
+function resolveDraftEndpoint(platform: PlatformName, envPrefix: string) {
+  const explicitEndpoint = readEnvValue(`${envPrefix}_DRAFT_ENDPOINT`);
+  if (explicitEndpoint) {
+    return explicitEndpoint;
+  }
+
+  const baseUrl = readEnvValue("DRAFT_CONNECTOR_BASE_URL");
+  return baseUrl ? `${trimTrailingSlash(baseUrl)}/${platform}/drafts` : undefined;
+}
 
 @Injectable()
 export class PublishService {
@@ -91,6 +120,40 @@ export class PublishService {
     }
 
     return "queued";
+  }
+
+  private createIssue(code: string, message: string, severity: ValidationIssue["severity"] = "error"): ValidationIssue {
+    return { code, message, severity };
+  }
+
+  private preflightRealDraftTarget(platform: PlatformName) {
+    const connectorConfig = draftConnectorPlatforms[platform];
+    const issues: ValidationIssue[] = [];
+
+    if (!connectorConfig) {
+      return issues;
+    }
+
+    const enabledKey = `${connectorConfig.envPrefix}_REAL_PUBLISH_ENABLED`;
+    if (!isEnabled(enabledKey)) {
+      issues.push(
+        this.createIssue(
+          `${platform.toUpperCase()}_REAL_PUBLISH_DISABLED`,
+          `Set ${enabledKey}=true before creating a real ${platform} draft.`,
+        ),
+      );
+    }
+
+    if (!resolveDraftEndpoint(platform, connectorConfig.envPrefix)) {
+      issues.push(
+        this.createIssue(
+          `${platform.toUpperCase()}_DRAFT_ENDPOINT_MISSING`,
+          `Configure ${connectorConfig.envPrefix}_DRAFT_ENDPOINT or DRAFT_CONNECTOR_BASE_URL before creating a real ${platform} draft.`,
+        ),
+      );
+    }
+
+    return issues;
   }
 
   private mapRemoteStateToTargetStatus(state: PublishStatus["state"]): PublishTaskTargetRecord["status"] {
@@ -182,6 +245,10 @@ export class PublishService {
 
     const targets = input.platforms.map((platform) => {
         const matchedAccount = accounts.find((account) => account.platform === platform) ?? null;
+        const preflightIssues = mode === "real-publish" ? this.preflightRealDraftTarget(platform) : [];
+        const initialStatus = this.resolveInitialTargetStatus(matchedAccount);
+        const targetStatus =
+          initialStatus === "queued" && preflightIssues.length > 0 ? "needs_manual_action" : initialStatus;
         const baseLogs = [
           this.createLog(
             "info",
@@ -194,13 +261,25 @@ export class PublishService {
           this.createLog("info", `${platform} 等待 BullMQ worker 执行。`),
         ];
 
+        if (targetStatus !== "queued") {
+          baseLogs.pop();
+          baseLogs.push(
+            this.createLog(
+              "warning",
+              preflightIssues.length > 0
+                ? `${platform} real draft preflight did not pass; connector configuration needs manual action.`
+                : `${platform} requires manual action before queueing.`,
+            ),
+          );
+        }
+
         return {
           platform,
           account: matchedAccount,
-          status: this.resolveInitialTargetStatus(matchedAccount),
+          status: targetStatus,
           attemptCount: 1,
           screenshots: [],
-          issues: [],
+          issues: preflightIssues,
           logs: baseLogs,
         } satisfies PublishTaskTargetRecord;
       });
