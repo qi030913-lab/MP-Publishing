@@ -1,0 +1,160 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id         String      @id
+  email      String?     @unique
+  name       String?
+  createdAt  DateTime    @default(now())
+  updatedAt  DateTime    @updatedAt
+  workspaces Workspace[]
+  auditLogs  AuditLog[]
+}
+
+model Workspace {
+  id               String            @id
+  name             String
+  ownerId          String?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  owner            User?             @relation(fields: [ownerId], references: [id])
+  platformAccounts PlatformAccount[]
+  documents        ContentDocument[]
+  publishJobs      PublishJob[]
+  auditLogs        AuditLog[]
+}
+
+model PlatformAccount {
+  id             String          @id
+  workspaceId    String
+  platform       String
+  displayName    String
+  handle         String
+  authMode       String
+  health         String
+  credentialRef  String?
+  lastCheckedAt  DateTime
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+  workspace      Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  publishTargets PublishTarget[]
+
+  @@index([workspaceId, platform])
+}
+
+model ContentDocument {
+  id          String           @id
+  workspaceId String
+  title       String
+  summary     String?
+  metadata    Json
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+  workspace   Workspace        @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  versions    ContentVersion[]
+  publishJobs PublishJob[]
+}
+
+model ContentVersion {
+  id          String          @id
+  documentId  String
+  versionNo   Int
+  body        Json
+  plainText   String
+  tags        Json
+  createdAt   DateTime        @default(now())
+  document    ContentDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  publishJobs PublishJob[]
+
+  @@unique([documentId, versionNo])
+}
+
+model PublishJob {
+  id            String          @id
+  workspaceId   String
+  documentId    String?
+  versionId     String?
+  mode          String
+  status        String
+  documentTitle String
+  timeline      Json
+  createdAt     DateTime        @default(now())
+  updatedAt     DateTime        @updatedAt
+  workspace     Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  document      ContentDocument? @relation(fields: [documentId], references: [id], onDelete: SetNull)
+  version       ContentVersion?  @relation(fields: [versionId], references: [id], onDelete: SetNull)
+  targets       PublishTarget[]
+  auditLogs     AuditLog[]
+
+  @@index([workspaceId, updatedAt])
+  @@index([status])
+}
+
+model PublishTarget {
+  id           String           @id
+  jobId        String
+  platform     String
+  accountId    String?
+  status       String
+  attemptCount Int
+  remoteId     String?
+  url          String?
+  screenshots  Json
+  issues       Json
+  logs         Json
+  startedAt    DateTime?
+  completedAt  DateTime?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+  job          PublishJob       @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  account      PlatformAccount? @relation(fields: [accountId], references: [id], onDelete: SetNull)
+  attempts     PublishAttempt[]
+
+  @@index([jobId, status])
+  @@index([platform, status])
+}
+
+model PublishAttempt {
+  id          String        @id
+  targetId    String
+  attemptNo   Int
+  status      String
+  startedAt   DateTime     @default(now())
+  completedAt DateTime?
+  result      Json?
+  error       String?
+  target      PublishTarget @relation(fields: [targetId], references: [id], onDelete: Cascade)
+
+  @@unique([targetId, attemptNo])
+}
+
+model WorkerRuntime {
+  id                  String   @id
+  name                String
+  status              String
+  lastHeartbeatAt     DateTime?
+  lastProcessedTaskId String?
+  currentTaskId       String?
+  processedCount      Int      @default(0)
+  updatedAt           DateTime @updatedAt
+}
+
+model AuditLog {
+  id          String     @id
+  workspaceId String
+  actorId     String?
+  publishJobId String?
+  action      String
+  detail      Json
+  createdAt   DateTime   @default(now())
+  workspace   Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  actor       User?      @relation(fields: [actorId], references: [id], onDelete: SetNull)
+  publishJob  PublishJob? @relation(fields: [publishJobId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, createdAt])
+}

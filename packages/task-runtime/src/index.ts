@@ -1,9 +1,62 @@
-import { fileURLToPath } from "node:url";
-import { existsSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
 
-import type { PlatformName, ValidationIssue } from "@mp-publishing/platform-sdk";
+import { Queue, Worker, type Job } from "bullmq";
+import { PrismaPg } from "@prisma/adapter-pg";
+import { PrismaClient, type Prisma } from "@prisma/client";
+
+import type { CanonicalDocument } from "@mp-publishing/content-model";
+import type {
+  PlatformName,
+  ValidationIssue,
+} from "@mp-publishing/platform-sdk";
+
+function findWorkspaceRoot(startDir: string) {
+  let currentDir = startDir;
+
+  while (true) {
+    if (existsSync(path.join(currentDir, "pnpm-workspace.yaml"))) {
+      return currentDir;
+    }
+
+    const parentDir = path.dirname(currentDir);
+    if (parentDir === currentDir) {
+      return startDir;
+    }
+
+    currentDir = parentDir;
+  }
+}
+
+function loadWorkspaceEnv() {
+  const envPath = path.join(findWorkspaceRoot(process.cwd()), ".env");
+  if (!existsSync(envPath)) {
+    return;
+  }
+
+  const raw = readFileSync(envPath, "utf8");
+  for (const line of raw.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    const separatorIndex = trimmed.indexOf("=");
+    if (separatorIndex < 1) {
+      continue;
+    }
+
+    const key = trimmed.slice(0, separatorIndex).trim();
+    const value = trimmed
+      .slice(separatorIndex + 1)
+      .trim()
+      .replace(/^["']|["']$/g, "");
+
+    process.env[key] ??= value;
+  }
+}
+
+loadWorkspaceEnv();
 
 export type PlatformAccountHealth = "healthy" | "expiring" | "needs-login";
 export type PublishTaskMode = "simulate" | "mock-publish";
@@ -57,6 +110,7 @@ export type PublishTaskEvent = {
 };
 
 export type PublishTaskTargetRecord = {
+  id?: string;
   platform: PlatformName;
   account: PlatformAccountRecord | null;
   status: PublishTaskTargetStatus;
@@ -75,6 +129,8 @@ export type PublishTaskRecord = {
   mode: PublishTaskMode;
   status: PublishTaskStatus;
   documentTitle: string;
+  documentId?: string;
+  versionId?: string;
   createdAt: string;
   updatedAt: string;
   timeline: PublishTaskEvent[];
@@ -90,11 +146,29 @@ export type WorkerRuntimeStatus = {
   processedCount: number;
 };
 
-type RuntimeState = {
-  accounts: PlatformAccountRecord[];
-  tasks: PublishTaskRecord[];
-  worker: WorkerRuntimeStatus;
+export type PublishQueueJobData = {
+  taskId: string;
+  targetId: string;
+  platform: PlatformName;
+  attemptCount: number;
 };
+
+export type PublishTargetProcessingContext = {
+  taskId: string;
+  targetId: string;
+  mode: PublishTaskMode;
+  platform: PlatformName;
+  attemptCount: number;
+  account: PlatformAccountRecord | null;
+  document: CanonicalDocument;
+};
+
+const defaultWorkspaceId = "workspace_demo";
+const defaultUserId = "user_demo";
+const defaultWorkerId = "publish-worker";
+const defaultDatabaseUrl =
+  "postgresql://mp_publishing:mp_publishing@localhost:5432/mp_publishing?schema=public";
+const publishQueueName = process.env.PUBLISH_QUEUE_NAME ?? "mp-publishing-publish-targets";
 
 const defaultAccounts: PlatformAccountRecord[] = [
   {
@@ -135,201 +209,928 @@ const defaultAccounts: PlatformAccountRecord[] = [
   },
 ];
 
-function createDefaultWorkerState(): WorkerRuntimeStatus {
+const globalForPrisma = globalThis as unknown as {
+  __mpPublishingPrisma?: PrismaClient;
+};
+
+export const prisma =
+  globalForPrisma.__mpPublishingPrisma ??
+  new PrismaClient({
+    adapter: new PrismaPg(process.env.DATABASE_URL ?? defaultDatabaseUrl),
+    log: process.env.PRISMA_QUERY_LOG === "true" ? ["query", "warn", "error"] : ["warn", "error"],
+  });
+
+globalForPrisma.__mpPublishingPrisma = prisma;
+
+function createTimestamp() {
+  return new Date().toISOString();
+}
+
+function createId(prefix: string) {
+  return `${prefix}_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
+}
+
+function toJson(value: unknown): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue;
+}
+
+function readJsonArray<T>(value: Prisma.JsonValue | null | undefined): T[] {
+  return Array.isArray(value) ? (value as T[]) : [];
+}
+
+function readJsonObject<T>(value: Prisma.JsonValue | null | undefined): T {
+  return value && typeof value === "object" && !Array.isArray(value) ? (value as T) : ({} as T);
+}
+
+function createLog(level: PublishTaskLog["level"], message: string): PublishTaskLog {
   return {
-    name: "publish-worker",
-    status: "offline",
-    processedCount: 0,
+    id: createId("log"),
+    timestamp: createTimestamp(),
+    level,
+    message,
   };
 }
 
-function findWorkspaceRoot(startDir: string) {
-  let currentDir = startDir;
+function createEvent(
+  stage: PublishTaskEvent["stage"],
+  level: PublishTaskEvent["level"],
+  message: string,
+  platform?: PublishTaskEvent["platform"],
+): PublishTaskEvent {
+  return {
+    id: createId("evt"),
+    timestamp: createTimestamp(),
+    level,
+    stage,
+    message,
+    platform,
+  };
+}
 
-  while (true) {
-    if (existsSync(path.join(currentDir, "pnpm-workspace.yaml"))) {
-      return currentDir;
-    }
+function summarizeTaskStatus(targets: Array<{ status: string }>): PublishTaskStatus {
+  const statuses = targets.map((target) => target.status);
 
-    const parentDir = path.dirname(currentDir);
-    if (parentDir === currentDir) {
-      return startDir;
-    }
-
-    currentDir = parentDir;
+  if (statuses.some((status) => status === "running" || status === "queued")) {
+    return "running";
   }
+
+  if (statuses.some((status) => status === "needs_manual_action")) {
+    return "needs_manual_action";
+  }
+
+  if (statuses.length > 0 && statuses.every((status) => status === "succeeded")) {
+    return "succeeded";
+  }
+
+  if (statuses.length > 0 && statuses.every((status) => status === "failed")) {
+    return "failed";
+  }
+
+  return "partial";
 }
 
-const packageDir = path.dirname(fileURLToPath(import.meta.url));
-const repoRoot = findWorkspaceRoot(process.cwd()) || findWorkspaceRoot(packageDir);
-const runtimeRoot = path.join(repoRoot, ".runtime");
-const stateFilePath = path.join(runtimeRoot, "publish-state.json");
+function createRedisConnection() {
+  const redisUrl = new URL(process.env.REDIS_URL ?? "redis://127.0.0.1:6379");
 
-function cloneState<T>(value: T): T {
-  return JSON.parse(JSON.stringify(value)) as T;
-}
-
-function createDefaultState(): RuntimeState {
   return {
-    accounts: cloneState(defaultAccounts),
-    tasks: [],
-    worker: createDefaultWorkerState(),
+    host: redisUrl.hostname,
+    port: Number(redisUrl.port || 6379),
+    username: redisUrl.username || undefined,
+    password: redisUrl.password || undefined,
+    db: redisUrl.pathname.length > 1 ? Number(redisUrl.pathname.slice(1)) : undefined,
+    maxRetriesPerRequest: null,
   };
 }
 
-function normalizeRuntimeState(input: Partial<RuntimeState> | null | undefined): RuntimeState {
-  const fallback = createDefaultState();
-
+function mapAccount(account: {
+  id: string;
+  platform: string;
+  displayName: string;
+  handle: string;
+  authMode: string;
+  health: string;
+  lastCheckedAt: Date;
+}): PlatformAccountRecord {
   return {
-    accounts: Array.isArray(input?.accounts) ? input.accounts : fallback.accounts,
-    tasks: Array.isArray(input?.tasks) ? input.tasks : fallback.tasks,
-    worker: {
-      ...fallback.worker,
-      ...(input?.worker ?? {}),
+    id: account.id,
+    platform: account.platform as PlatformName,
+    displayName: account.displayName,
+    handle: account.handle,
+    authMode: account.authMode as PlatformAccountRecord["authMode"],
+    health: account.health as PlatformAccountHealth,
+    lastCheckedAt: account.lastCheckedAt.toISOString(),
+  };
+}
+
+function mapTarget(target: {
+  id: string;
+  platform: string;
+  account: {
+    id: string;
+    platform: string;
+    displayName: string;
+    handle: string;
+    authMode: string;
+    health: string;
+    lastCheckedAt: Date;
+  } | null;
+  status: string;
+  attemptCount: number;
+  remoteId: string | null;
+  url: string | null;
+  screenshots: Prisma.JsonValue;
+  issues: Prisma.JsonValue;
+  logs: Prisma.JsonValue;
+  startedAt: Date | null;
+  completedAt: Date | null;
+}): PublishTaskTargetRecord {
+  return {
+    id: target.id,
+    platform: target.platform as PlatformName,
+    account: target.account ? mapAccount(target.account) : null,
+    status: target.status as PublishTaskTargetStatus,
+    attemptCount: target.attemptCount,
+    remoteId: target.remoteId ?? undefined,
+    url: target.url ?? undefined,
+    screenshots: readJsonArray<string>(target.screenshots),
+    issues: readJsonArray<ValidationIssue>(target.issues),
+    logs: readJsonArray<PublishTaskLog>(target.logs),
+    startedAt: target.startedAt?.toISOString(),
+    completedAt: target.completedAt?.toISOString(),
+  };
+}
+
+function mapTask(task: {
+  id: string;
+  mode: string;
+  status: string;
+  documentTitle: string;
+  documentId: string | null;
+  versionId: string | null;
+  createdAt: Date;
+  updatedAt: Date;
+  timeline: Prisma.JsonValue;
+  targets: Array<Parameters<typeof mapTarget>[0]>;
+}): PublishTaskRecord {
+  return {
+    id: task.id,
+    mode: task.mode as PublishTaskMode,
+    status: task.status as PublishTaskStatus,
+    documentTitle: task.documentTitle,
+    documentId: task.documentId ?? undefined,
+    versionId: task.versionId ?? undefined,
+    createdAt: task.createdAt.toISOString(),
+    updatedAt: task.updatedAt.toISOString(),
+    timeline: readJsonArray<PublishTaskEvent>(task.timeline),
+    targets: task.targets.map(mapTarget),
+  };
+}
+
+async function recalculateTaskStatus(taskId: string) {
+  const targets = await prisma.publishTarget.findMany({
+    where: { jobId: taskId },
+    select: { status: true },
+  });
+  const status = summarizeTaskStatus(targets);
+
+  await prisma.publishJob.update({
+    where: { id: taskId },
+    data: { status },
+  });
+
+  return status;
+}
+
+async function appendTargetLogAndTaskEvent(
+  targetId: string,
+  log: PublishTaskLog,
+  event: PublishTaskEvent,
+  patch: {
+    status?: PublishTaskTargetStatus;
+    remoteId?: string;
+    url?: string;
+    screenshots?: string[];
+    issues?: ValidationIssue[];
+    startedAt?: Date | null;
+    completedAt?: Date | null;
+  } = {},
+) {
+  const target = await prisma.publishTarget.findUnique({
+    where: { id: targetId },
+    include: { job: true },
+  });
+
+  if (!target) {
+    return null;
+  }
+
+  const logs = [...readJsonArray<PublishTaskLog>(target.logs), log];
+  const timeline = [...readJsonArray<PublishTaskEvent>(target.job.timeline), event];
+
+  await prisma.$transaction([
+    prisma.publishTarget.update({
+      where: { id: targetId },
+      data: {
+        status: patch.status ?? target.status,
+        remoteId: patch.remoteId,
+        url: patch.url,
+        screenshots: toJson(patch.screenshots ?? readJsonArray<string>(target.screenshots)),
+        issues: toJson(patch.issues ?? readJsonArray<ValidationIssue>(target.issues)),
+        logs: toJson(logs),
+        startedAt: patch.startedAt === undefined ? target.startedAt : patch.startedAt,
+        completedAt: patch.completedAt === undefined ? target.completedAt : patch.completedAt,
+      },
+    }),
+    prisma.publishJob.update({
+      where: { id: target.jobId },
+      data: {
+        timeline: toJson(timeline),
+      },
+    }),
+  ]);
+
+  await recalculateTaskStatus(target.jobId);
+  return findTaskById(target.jobId);
+}
+
+export async function ensureRuntimeReady() {
+  await prisma.user.upsert({
+    where: { id: defaultUserId },
+    update: {},
+    create: {
+      id: defaultUserId,
+      email: "demo@mp-publishing.local",
+      name: "Demo Creator",
     },
-  };
-}
+  });
 
-async function ensureRuntimeRoot() {
-  await mkdir(runtimeRoot, { recursive: true });
-}
+  await prisma.workspace.upsert({
+    where: { id: defaultWorkspaceId },
+    update: {},
+    create: {
+      id: defaultWorkspaceId,
+      name: "默认工作区",
+      ownerId: defaultUserId,
+    },
+  });
 
-export async function loadRuntimeState() {
-  await ensureRuntimeRoot();
-
-  try {
-    const raw = await readFile(stateFilePath, "utf8");
-    return normalizeRuntimeState(JSON.parse(raw) as Partial<RuntimeState>);
-  } catch {
-    const initialState = createDefaultState();
-    await saveRuntimeState(initialState);
-    return initialState;
+  for (const account of defaultAccounts) {
+    await prisma.platformAccount.upsert({
+      where: { id: account.id },
+      update: {},
+      create: {
+        id: account.id,
+        workspaceId: defaultWorkspaceId,
+        platform: account.platform,
+        displayName: account.displayName,
+        handle: account.handle,
+        authMode: account.authMode,
+        health: account.health,
+        lastCheckedAt: new Date(account.lastCheckedAt),
+      },
+    });
   }
+
+  await prisma.workerRuntime.upsert({
+    where: { id: defaultWorkerId },
+    update: {},
+    create: {
+      id: defaultWorkerId,
+      name: defaultWorkerId,
+      status: "offline",
+      processedCount: 0,
+    },
+  });
 }
 
-export async function saveRuntimeState(state: RuntimeState) {
-  await ensureRuntimeRoot();
-  await writeFile(stateFilePath, JSON.stringify(state, null, 2), "utf8");
+export async function createContentSnapshot(document: CanonicalDocument) {
+  await ensureRuntimeReady();
+  const documentId = document.id || createId("doc");
+  const versionId = createId("ver");
+
+  const contentDocument = await prisma.contentDocument.upsert({
+    where: { id: documentId },
+    update: {
+      title: document.title,
+      summary: document.summary,
+      metadata: toJson(document.metadata),
+    },
+    create: {
+      id: documentId,
+      workspaceId: defaultWorkspaceId,
+      title: document.title,
+      summary: document.summary,
+      metadata: toJson(document.metadata),
+    },
+  });
+
+  const latestVersion = await prisma.contentVersion.findFirst({
+    where: { documentId: contentDocument.id },
+    orderBy: { versionNo: "desc" },
+    select: { versionNo: true },
+  });
+
+  const version = await prisma.contentVersion.create({
+    data: {
+      id: versionId,
+      documentId: contentDocument.id,
+      versionNo: (latestVersion?.versionNo ?? 0) + 1,
+      body: toJson({
+        blocks: document.blocks,
+        assets: document.assets,
+      }),
+      plainText: document.blocks
+        .flatMap((block) => {
+          if (block.text) {
+            return [block.text];
+          }
+
+          if (block.items) {
+            return block.items;
+          }
+
+          return [];
+        })
+        .join("\n\n"),
+      tags: toJson(document.metadata.topics),
+    },
+  });
+
+  return {
+    documentId: contentDocument.id,
+    versionId: version.id,
+  };
 }
 
 export async function resetRuntimeState() {
-  const initialState = createDefaultState();
-  await saveRuntimeState(initialState);
-  return initialState;
+  await ensureRuntimeReady();
+  await prisma.$transaction([
+    prisma.auditLog.deleteMany({ where: { workspaceId: defaultWorkspaceId } }),
+    prisma.publishAttempt.deleteMany({}),
+    prisma.publishTarget.deleteMany({}),
+    prisma.publishJob.deleteMany({ where: { workspaceId: defaultWorkspaceId } }),
+    prisma.contentVersion.deleteMany({}),
+    prisma.contentDocument.deleteMany({ where: { workspaceId: defaultWorkspaceId } }),
+    prisma.workerRuntime.update({
+      where: { id: defaultWorkerId },
+      data: {
+        status: "offline",
+        currentTaskId: null,
+        lastProcessedTaskId: null,
+        lastHeartbeatAt: null,
+        processedCount: 0,
+      },
+    }),
+  ]);
+
+  return getRuntimeStats();
 }
 
 export async function listAccounts() {
-  const state = await loadRuntimeState();
-  return state.accounts;
+  await ensureRuntimeReady();
+  const accounts = await prisma.platformAccount.findMany({
+    where: { workspaceId: defaultWorkspaceId },
+    orderBy: [{ platform: "asc" }, { displayName: "asc" }],
+  });
+
+  return accounts.map(mapAccount);
 }
 
 export async function findAccountById(accountId: string) {
-  const state = await loadRuntimeState();
-  return state.accounts.find((account) => account.id === accountId) ?? null;
+  await ensureRuntimeReady();
+  const account = await prisma.platformAccount.findUnique({
+    where: { id: accountId },
+  });
+
+  return account ? mapAccount(account) : null;
 }
 
 export async function updateAccount(
   accountId: string,
   patch: Partial<PlatformAccountRecord>,
 ) {
-  const state = await loadRuntimeState();
-  const account = state.accounts.find((item) => item.id === accountId) ?? null;
-  if (!account) {
-    return null;
-  }
+  await ensureRuntimeReady();
+  const account = await prisma.platformAccount.update({
+    where: { id: accountId },
+    data: {
+      displayName: patch.displayName,
+      handle: patch.handle,
+      authMode: patch.authMode,
+      health: patch.health,
+      lastCheckedAt: patch.lastCheckedAt ? new Date(patch.lastCheckedAt) : undefined,
+    },
+  });
 
-  Object.assign(account, patch);
-  await saveRuntimeState(state);
-  return account;
+  return mapAccount(account);
 }
 
 export async function listTasks() {
-  const state = await loadRuntimeState();
-  return state.tasks;
+  await ensureRuntimeReady();
+  const tasks = await prisma.publishJob.findMany({
+    where: { workspaceId: defaultWorkspaceId },
+    include: {
+      targets: {
+        include: { account: true },
+        orderBy: { createdAt: "asc" },
+      },
+    },
+    orderBy: { updatedAt: "desc" },
+  });
+
+  return tasks.map(mapTask);
+}
+
+export async function findTaskById(taskId: string) {
+  await ensureRuntimeReady();
+  const task = await prisma.publishJob.findUnique({
+    where: { id: taskId },
+    include: {
+      targets: {
+        include: { account: true },
+        orderBy: { createdAt: "asc" },
+      },
+    },
+  });
+
+  return task ? mapTask(task) : null;
+}
+
+export async function upsertTask(task: PublishTaskRecord) {
+  await ensureRuntimeReady();
+  const existingTask = await prisma.publishJob.findUnique({
+    where: { id: task.id },
+    include: { targets: true },
+  });
+
+  if (!existingTask) {
+    await prisma.publishJob.create({
+      data: {
+        id: task.id,
+        workspaceId: defaultWorkspaceId,
+        documentId: task.documentId,
+        versionId: task.versionId,
+        mode: task.mode,
+        status: task.status,
+        documentTitle: task.documentTitle,
+        timeline: toJson(task.timeline),
+        createdAt: new Date(task.createdAt),
+        updatedAt: new Date(task.updatedAt),
+        targets: {
+          create: task.targets.map((target) => ({
+            id: target.id ?? createId("target"),
+            platform: target.platform,
+            accountId: target.account?.id,
+            status: target.status,
+            attemptCount: target.attemptCount,
+            remoteId: target.remoteId,
+            url: target.url,
+            screenshots: toJson(target.screenshots ?? []),
+            issues: toJson(target.issues),
+            logs: toJson(target.logs),
+            startedAt: target.startedAt ? new Date(target.startedAt) : undefined,
+            completedAt: target.completedAt ? new Date(target.completedAt) : undefined,
+          })),
+        },
+      },
+    });
+
+    return findTaskById(task.id);
+  }
+
+  await prisma.publishJob.update({
+    where: { id: task.id },
+    data: {
+      status: task.status,
+      documentTitle: task.documentTitle,
+      documentId: task.documentId,
+      versionId: task.versionId,
+      timeline: toJson(task.timeline),
+      updatedAt: new Date(task.updatedAt),
+    },
+  });
+
+  for (const target of task.targets) {
+    const existingTarget = existingTask.targets.find((item) => item.id === target.id || item.platform === target.platform);
+    if (!existingTarget) {
+      await prisma.publishTarget.create({
+        data: {
+          id: target.id ?? createId("target"),
+          jobId: task.id,
+          platform: target.platform,
+          accountId: target.account?.id,
+          status: target.status,
+          attemptCount: target.attemptCount,
+          screenshots: toJson(target.screenshots ?? []),
+          issues: toJson(target.issues),
+          logs: toJson(target.logs),
+        },
+      });
+      continue;
+    }
+
+    await prisma.publishTarget.update({
+      where: { id: existingTarget.id },
+      data: {
+        accountId: target.account?.id,
+        status: target.status,
+        attemptCount: target.attemptCount,
+        remoteId: target.remoteId,
+        url: target.url,
+        screenshots: toJson(target.screenshots ?? []),
+        issues: toJson(target.issues),
+        logs: toJson(target.logs),
+        startedAt: target.startedAt ? new Date(target.startedAt) : null,
+        completedAt: target.completedAt ? new Date(target.completedAt) : null,
+      },
+    });
+  }
+
+  await recalculateTaskStatus(task.id);
+  return findTaskById(task.id);
+}
+
+export async function replaceTasks(tasks: PublishTaskRecord[]) {
+  await resetRuntimeState();
+  const savedTasks = [];
+
+  for (const task of tasks) {
+    const savedTask = await upsertTask(task);
+    if (savedTask) {
+      savedTasks.push(savedTask);
+    }
+  }
+
+  return savedTasks;
 }
 
 export async function getWorkerStatus() {
-  const state = await loadRuntimeState();
-  return state.worker;
+  await ensureRuntimeReady();
+  const worker = await prisma.workerRuntime.findUnique({
+    where: { id: defaultWorkerId },
+  });
+
+  return {
+    name: worker?.name ?? defaultWorkerId,
+    status: (worker?.status ?? "offline") as WorkerRuntimeStatus["status"],
+    lastHeartbeatAt: worker?.lastHeartbeatAt?.toISOString(),
+    lastProcessedTaskId: worker?.lastProcessedTaskId ?? undefined,
+    currentTaskId: worker?.currentTaskId ?? undefined,
+    processedCount: worker?.processedCount ?? 0,
+  };
 }
 
 export async function updateWorkerStatus(
   patch: Partial<WorkerRuntimeStatus>,
 ) {
-  const state = await loadRuntimeState();
-  state.worker = {
-    ...state.worker,
-    ...patch,
+  await ensureRuntimeReady();
+  const hasCurrentTaskPatch = Object.prototype.hasOwnProperty.call(patch, "currentTaskId");
+  const hasLastProcessedPatch = Object.prototype.hasOwnProperty.call(patch, "lastProcessedTaskId");
+  const worker = await prisma.workerRuntime.update({
+    where: { id: defaultWorkerId },
+    data: {
+      status: patch.status,
+      lastHeartbeatAt: patch.lastHeartbeatAt ? new Date(patch.lastHeartbeatAt) : undefined,
+      lastProcessedTaskId: hasLastProcessedPatch ? patch.lastProcessedTaskId ?? null : undefined,
+      currentTaskId: hasCurrentTaskPatch ? patch.currentTaskId ?? null : undefined,
+      processedCount: patch.processedCount,
+    },
+  });
+
+  return {
+    name: worker.name,
+    status: worker.status as WorkerRuntimeStatus["status"],
+    lastHeartbeatAt: worker.lastHeartbeatAt?.toISOString(),
+    lastProcessedTaskId: worker.lastProcessedTaskId ?? undefined,
+    currentTaskId: worker.currentTaskId ?? undefined,
+    processedCount: worker.processedCount,
   };
-  await saveRuntimeState(state);
-  return state.worker;
 }
 
-export async function findTaskById(taskId: string) {
-  const state = await loadRuntimeState();
-  return state.tasks.find((task) => task.id === taskId) ?? null;
+export function createPublishQueue() {
+  return new Queue<PublishQueueJobData>(publishQueueName, {
+    connection: createRedisConnection(),
+    defaultJobOptions: {
+      attempts: 1,
+      removeOnComplete: 200,
+      removeOnFail: 500,
+    },
+  });
 }
 
-export async function upsertTask(task: PublishTaskRecord) {
-  const state = await loadRuntimeState();
-  const index = state.tasks.findIndex((item) => item.id === task.id);
-  if (index >= 0) {
-    state.tasks[index] = task;
-  } else {
-    state.tasks.unshift(task);
+export async function enqueueTaskTargets(taskId: string, platform?: PlatformName) {
+  await ensureRuntimeReady();
+  const targets = await prisma.publishTarget.findMany({
+    where: {
+      jobId: taskId,
+      status: "queued",
+      ...(platform ? { platform } : {}),
+    },
+    orderBy: { createdAt: "asc" },
+  });
+
+  if (targets.length === 0) {
+    return 0;
   }
 
-  await saveRuntimeState(state);
-  return task;
+  const queue = createPublishQueue();
+  try {
+    await queue.addBulk(
+      targets.map((target) => ({
+        name: "process-publish-target",
+        data: {
+          taskId,
+          targetId: target.id,
+          platform: target.platform as PlatformName,
+          attemptCount: target.attemptCount,
+        },
+        opts: {
+          jobId: `${target.id}-${target.attemptCount}`,
+        },
+      })),
+    );
+  } finally {
+    await queue.close();
+  }
+
+  return targets.length;
 }
 
-export async function updateTask(taskId: string, updater: (task: PublishTaskRecord) => PublishTaskRecord) {
-  const state = await loadRuntimeState();
-  const index = state.tasks.findIndex((task) => task.id === taskId);
-  if (index < 0) {
+export function createPublishTargetWorker(
+  processor: (job: Job<PublishQueueJobData>) => Promise<void>,
+) {
+  return new Worker<PublishQueueJobData>(publishQueueName, processor, {
+    connection: createRedisConnection(),
+    concurrency: Number(process.env.PUBLISH_WORKER_CONCURRENCY ?? 4),
+  });
+}
+
+export async function getPublishQueueStats() {
+  const queue = createPublishQueue();
+  try {
+    const counts = await queue.getJobCounts("waiting", "active", "delayed", "failed", "completed");
+    return {
+      waiting: counts.waiting ?? 0,
+      active: counts.active ?? 0,
+      delayed: counts.delayed ?? 0,
+      failed: counts.failed ?? 0,
+      completed: counts.completed ?? 0,
+    };
+  } finally {
+    await queue.close();
+  }
+}
+
+export async function startPublishTarget(targetId: string): Promise<PublishTargetProcessingContext | null> {
+  await ensureRuntimeReady();
+  const target = await prisma.publishTarget.findUnique({
+    where: { id: targetId },
+    include: {
+      account: true,
+      job: {
+        include: {
+          version: {
+            include: {
+              document: true,
+            },
+          },
+        },
+      },
+    },
+  });
+
+  if (!target || !target.job.version) {
     return null;
   }
 
-  state.tasks[index] = updater(state.tasks[index]);
-  await saveRuntimeState(state);
-  return state.tasks[index];
-}
+  await appendTargetLogAndTaskEvent(
+    target.id,
+    createLog("info", `${target.platform} 已进入 BullMQ worker 执行。`),
+    createEvent("running", "info", `${target.platform} 已进入 BullMQ worker 执行。`, target.platform as PlatformName),
+    {
+      status: "running",
+      startedAt: new Date(),
+      completedAt: null,
+    },
+  );
 
-export async function replaceTasks(tasks: PublishTaskRecord[]) {
-  const state = await loadRuntimeState();
-  state.tasks = tasks;
-  await saveRuntimeState(state);
-  return tasks;
-}
-
-export async function getRuntimeStats() {
-  const state = await loadRuntimeState();
-  const queuedCount = state.tasks.reduce(
-    (count, task) => count + task.targets.filter((target) => target.status === "queued").length,
-    0,
-  );
-  const runningCount = state.tasks.reduce(
-    (count, task) => count + task.targets.filter((target) => target.status === "running").length,
-    0,
-  );
-  const needsRetryCount = state.tasks.reduce(
-    (count, task) => count + task.targets.filter((target) => target.status === "needs_retry").length,
-    0,
-  );
-  const manualActionCount = state.tasks.reduce(
-    (count, task) =>
-      count + task.targets.filter((target) => target.status === "needs_manual_action").length,
-    0,
-  );
-  const succeededCount = state.tasks.reduce(
-    (count, task) => count + task.targets.filter((target) => target.status === "succeeded").length,
-    0,
+  const body = readJsonObject<{ blocks?: CanonicalDocument["blocks"]; assets?: CanonicalDocument["assets"] }>(
+    target.job.version.body,
   );
 
   return {
-    worker: state.worker,
+    taskId: target.jobId,
+    targetId: target.id,
+    mode: target.job.mode as PublishTaskMode,
+    platform: target.platform as PlatformName,
+    attemptCount: target.attemptCount,
+    account: target.account ? mapAccount(target.account) : null,
+    document: {
+      id: target.job.documentId ?? target.job.version.document.id,
+      title: target.job.version.document.title,
+      summary: target.job.version.document.summary ?? undefined,
+      blocks: body.blocks ?? [],
+      assets: body.assets ?? [],
+      metadata: readJsonObject<CanonicalDocument["metadata"]>(target.job.version.document.metadata),
+    },
+  };
+}
+
+export async function createPublishAttempt(targetId: string, attemptNo: number) {
+  await prisma.publishAttempt.upsert({
+    where: {
+      targetId_attemptNo: {
+        targetId,
+        attemptNo,
+      },
+    },
+    update: {
+      status: "running",
+      startedAt: new Date(),
+      completedAt: null,
+      error: null,
+      result: undefined,
+    },
+    create: {
+      id: createId("attempt"),
+      targetId,
+      attemptNo,
+      status: "running",
+    },
+  });
+}
+
+export async function markPublishTargetSucceeded(
+  targetId: string,
+  result: {
+    remoteId?: string;
+    url?: string;
+    screenshots?: string[];
+    issues: ValidationIssue[];
+  },
+) {
+  const target = await prisma.publishTarget.findUnique({
+    where: { id: targetId },
+    select: { attemptCount: true, platform: true },
+  });
+
+  if (!target) {
+    return null;
+  }
+
+  await prisma.publishAttempt.update({
+    where: {
+      targetId_attemptNo: {
+        targetId,
+        attemptNo: target.attemptCount,
+      },
+    },
+    data: {
+      status: "succeeded",
+      completedAt: new Date(),
+      result: toJson(result),
+    },
+  });
+
+  return appendTargetLogAndTaskEvent(
+    targetId,
+    createLog("info", `${target.platform} 任务执行完成。`),
+    createEvent("succeeded", "info", `${target.platform} 任务执行完成。`, target.platform as PlatformName),
+    {
+      status: "succeeded",
+      remoteId: result.remoteId,
+      url: result.url,
+      screenshots: result.screenshots ?? [],
+      issues: result.issues,
+      completedAt: new Date(),
+    },
+  );
+}
+
+export async function markPublishTargetFailed(targetId: string, error: string, issues: ValidationIssue[] = []) {
+  const target = await prisma.publishTarget.findUnique({
+    where: { id: targetId },
+    select: { attemptCount: true, platform: true },
+  });
+
+  if (!target) {
+    return null;
+  }
+
+  await prisma.publishAttempt.update({
+    where: {
+      targetId_attemptNo: {
+        targetId,
+        attemptNo: target.attemptCount,
+      },
+    },
+    data: {
+      status: "failed",
+      completedAt: new Date(),
+      error,
+    },
+  });
+
+  return appendTargetLogAndTaskEvent(
+    targetId,
+    createLog("error", `${target.platform} 执行失败：${error}`),
+    createEvent("failed", "error", `${target.platform} 执行失败：${error}`, target.platform as PlatformName),
+    {
+      status: "failed",
+      issues,
+      completedAt: new Date(),
+    },
+  );
+}
+
+export async function markPublishTargetNeedsRetry(targetId: string, message: string) {
+  const target = await prisma.publishTarget.findUnique({
+    where: { id: targetId },
+    select: { attemptCount: true, platform: true },
+  });
+
+  if (!target) {
+    return null;
+  }
+
+  await prisma.publishAttempt.update({
+    where: {
+      targetId_attemptNo: {
+        targetId,
+        attemptNo: target.attemptCount,
+      },
+    },
+    data: {
+      status: "needs_retry",
+      completedAt: new Date(),
+      error: message,
+    },
+  });
+
+  return appendTargetLogAndTaskEvent(
+    targetId,
+    createLog("warning", message),
+    createEvent("needs_retry", "warning", message, target.platform as PlatformName),
+    {
+      status: "needs_retry",
+      completedAt: new Date(),
+    },
+  );
+}
+
+export async function markPublishTargetNeedsManualAction(targetId: string, message: string) {
+  const target = await prisma.publishTarget.findUnique({
+    where: { id: targetId },
+    select: { attemptCount: true, platform: true },
+  });
+
+  if (!target) {
+    return null;
+  }
+
+  await prisma.publishAttempt.update({
+    where: {
+      targetId_attemptNo: {
+        targetId,
+        attemptNo: target.attemptCount,
+      },
+    },
+    data: {
+      status: "needs_manual_action",
+      completedAt: new Date(),
+      error: message,
+    },
+  });
+
+  return appendTargetLogAndTaskEvent(
+    targetId,
+    createLog("warning", message),
+    createEvent("needs_manual_action", "warning", message, target.platform as PlatformName),
+    {
+      status: "needs_manual_action",
+      completedAt: new Date(),
+    },
+  );
+}
+
+export async function getRuntimeStats() {
+  await ensureRuntimeReady();
+  const [worker, queue, total, queuedCount, runningCount, needsRetryCount, manualActionCount, succeededCount] =
+    await Promise.all([
+      getWorkerStatus(),
+      getPublishQueueStats(),
+      prisma.publishJob.count({ where: { workspaceId: defaultWorkspaceId } }),
+      prisma.publishTarget.count({ where: { status: "queued" } }),
+      prisma.publishTarget.count({ where: { status: "running" } }),
+      prisma.publishTarget.count({ where: { status: "needs_retry" } }),
+      prisma.publishTarget.count({ where: { status: "needs_manual_action" } }),
+      prisma.publishTarget.count({ where: { status: "succeeded" } }),
+    ]);
+
+  return {
+    worker,
+    queue,
     tasks: {
-      total: state.tasks.length,
+      total,
       queuedCount,
       runningCount,
       needsRetryCount,

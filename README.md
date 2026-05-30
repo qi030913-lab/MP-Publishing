@@ -16,17 +16,36 @@ MP-Publishing is a multi-platform content adaptation and publishing workspace fo
 
 ```bash
 pnpm install
+cp .env.example .env
+pnpm infra:up
+pnpm db:generate
+pnpm db:push
 pnpm build
+```
+
+On PowerShell, use this instead of `cp .env.example .env`:
+
+```powershell
+Copy-Item .env.example .env
 ```
 
 ## Development
 
-The publishing flow now uses a lightweight shared runtime plus an async worker loop.
+The publishing flow now uses Prisma-backed persistence plus a BullMQ publish-target queue.
 
 Run these services during local development:
 
 ```bash
+pnpm infra:up
+pnpm db:push
 pnpm --filter @mp-publishing/api dev
 pnpm --filter @mp-publishing/worker dev
 pnpm --filter @mp-publishing/web dev
 ```
+
+Required local services:
+
+- PostgreSQL: stores accounts, documents, content versions, publish jobs, targets, attempts, worker state, and audit logs.
+- Redis: backs the BullMQ queue consumed by `apps/worker`.
+
+`pnpm infra:up` requires Docker Compose. If Docker is not available, run PostgreSQL and Redis yourself with the values from `.env.example`.

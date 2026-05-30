@@ -1,168 +1,39 @@
+import { adapterRegistry } from "@mp-publishing/adapter-core";
 import {
+  createPublishAttempt,
+  createPublishTargetWorker,
+  ensureRuntimeReady,
   getWorkerStatus,
-  listAccounts,
-  listTasks,
-  type PublishTaskEvent,
-  type PublishTaskLog,
-  type PublishTaskRecord,
-  type PublishTaskTargetRecord,
-  upsertTask,
+  markPublishTargetFailed,
+  markPublishTargetNeedsManualAction,
+  markPublishTargetNeedsRetry,
+  markPublishTargetSucceeded,
+  startPublishTarget,
   updateWorkerStatus,
+  type PublishQueueJobData,
 } from "@mp-publishing/task-runtime";
-
-const tickIntervalMs = 1200;
-const completionDelayMs = 1500;
+import type { Job } from "bullmq";
 
 function createTimestamp() {
   return new Date().toISOString();
 }
 
-function createLog(level: PublishTaskLog["level"], message: string): PublishTaskLog {
-  return {
-    id: `log_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
-    timestamp: createTimestamp(),
-    level,
-    message,
-  };
-}
-
-function createEvent(
-  stage: PublishTaskEvent["stage"],
-  level: PublishTaskEvent["level"],
-  message: string,
-  platform?: PublishTaskEvent["platform"],
-): PublishTaskEvent {
-  return {
-    id: `evt_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
-    timestamp: createTimestamp(),
-    level,
-    stage,
-    message,
-    platform,
-  };
-}
-
-function summarizeTaskStatus(targets: PublishTaskTargetRecord[]): PublishTaskRecord["status"] {
-  const statuses = targets.map((target) => target.status);
-
-  if (statuses.some((status) => status === "running" || status === "queued")) {
-    return "running";
-  }
-
-  if (statuses.some((status) => status === "needs_manual_action")) {
-    return "needs_manual_action";
-  }
-
-  if (statuses.every((status) => status === "succeeded")) {
-    return "succeeded";
-  }
-
-  if (statuses.every((status) => status === "failed")) {
-    return "failed";
-  }
-
-  return "partial";
-}
-
-async function processTask(task: PublishTaskRecord) {
-  const accounts = await listAccounts();
-  let changed = false;
-
-  task.targets = task.targets.map((target) => {
-    const nextAccount = target.account
-      ? accounts.find((account) => account.id === target.account?.id) ?? target.account
-      : null;
-
-    return {
-      ...target,
-      account: nextAccount,
-    };
+async function markWorkerWorking(taskId?: string) {
+  await updateWorkerStatus({
+    status: "working",
+    currentTaskId: taskId,
+    lastHeartbeatAt: createTimestamp(),
   });
-
-  task.targets.forEach((target) => {
-    if (target.status === "queued") {
-      target.status = "running";
-      target.startedAt = createTimestamp();
-      target.logs.push(createLog("info", `${target.platform} 已进入 worker 执行队列。`));
-      task.timeline.push(createEvent("running", "info", `${target.platform} 已进入 worker 执行队列。`, target.platform));
-      changed = true;
-      return;
-    }
-
-    if (target.status !== "running" || !target.startedAt) {
-      return;
-    }
-
-    const elapsed = Date.now() - new Date(target.startedAt).getTime();
-    if (elapsed < completionDelayMs) {
-      return;
-    }
-
-    if (!target.account || target.account.health === "needs-login") {
-      target.status = "needs_manual_action";
-      target.logs.push(createLog("warning", `${target.platform} 需要人工登录后才能继续发布。`));
-      task.timeline.push(
-        createEvent("needs_manual_action", "warning", `${target.platform} 需要人工登录后才能继续发布。`, target.platform),
-      );
-      changed = true;
-      return;
-    }
-
-    if (target.account.health === "expiring" && target.attemptCount === 1) {
-      target.status = "needs_retry";
-      target.logs.push(createLog("warning", `${target.platform} 账号凭证接近过期，建议执行重试。`));
-      task.timeline.push(
-        createEvent("needs_retry", "warning", `${target.platform} 账号凭证接近过期，建议执行重试。`, target.platform),
-      );
-      changed = true;
-      return;
-    }
-
-    target.status = "succeeded";
-    target.completedAt = createTimestamp();
-    target.logs.push(createLog("info", `${target.platform} 任务执行完成。`));
-    task.timeline.push(createEvent("succeeded", "info", `${target.platform} 任务执行完成。`, target.platform));
-    changed = true;
-  });
-
-  if (!changed) {
-    return false;
-  }
-
-  task.status = summarizeTaskStatus(task.targets);
-  task.updatedAt = createTimestamp();
-  await upsertTask(task);
-  return true;
 }
 
-async function workOnce() {
-  const tasks = await listTasks();
-  let handledTaskId: string | undefined;
-  let workerStatus: "idle" | "working" = "idle";
-
-  for (const task of tasks) {
-    const hasActiveTarget = task.targets.some(
-      (target) => target.status === "queued" || target.status === "running",
-    );
-
-    if (hasActiveTarget) {
-      workerStatus = "working";
-      handledTaskId = task.id;
-    }
-
-    const changed = await processTask(task);
-    if (changed) {
-      handledTaskId = task.id;
-    }
-  }
-
+async function markWorkerIdle(lastProcessedTaskId?: string) {
   const currentWorker = await getWorkerStatus();
   await updateWorkerStatus({
-    status: workerStatus,
+    status: "idle",
+    currentTaskId: undefined,
     lastHeartbeatAt: createTimestamp(),
-    currentTaskId: workerStatus === "working" ? handledTaskId : undefined,
-    lastProcessedTaskId: handledTaskId ?? currentWorker.lastProcessedTaskId,
-    processedCount: handledTaskId ? currentWorker.processedCount + 1 : currentWorker.processedCount,
+    lastProcessedTaskId: lastProcessedTaskId ?? currentWorker.lastProcessedTaskId,
+    processedCount: lastProcessedTaskId ? currentWorker.processedCount + 1 : currentWorker.processedCount,
   });
 }
 
@@ -174,9 +45,85 @@ async function markWorkerOffline() {
   });
 }
 
-function registerShutdownHooks() {
+async function processPublishTarget(job: Job<PublishQueueJobData>) {
+  await markWorkerWorking(job.data.taskId);
+
+  const context = await startPublishTarget(job.data.targetId);
+  if (!context) {
+    await markWorkerIdle(job.data.taskId);
+    return;
+  }
+
+  await createPublishAttempt(context.targetId, context.attemptCount);
+
+  if (!context.account || context.account.health === "needs-login") {
+    await markPublishTargetNeedsManualAction(
+      context.targetId,
+      `${context.platform} 需要人工登录后才能继续发布。`,
+    );
+    await markWorkerIdle(context.taskId);
+    return;
+  }
+
+  if (context.account.health === "expiring" && context.attemptCount === 1) {
+    await markPublishTargetNeedsRetry(
+      context.targetId,
+      `${context.platform} 账号凭证接近过期，建议执行重试。`,
+    );
+    await markWorkerIdle(context.taskId);
+    return;
+  }
+
+  const adapter = adapterRegistry.get(context.platform);
+
+  try {
+    if (context.mode === "simulate") {
+      const result = await adapter.simulatePublish({
+        accountId: context.account.id,
+        document: context.document,
+        dryRun: true,
+      });
+
+      if (!result.ok) {
+        await markPublishTargetFailed(context.targetId, `${context.platform} 模拟发布校验未通过。`, result.issues);
+      } else {
+        await markPublishTargetSucceeded(context.targetId, {
+          screenshots: result.screenshots,
+          issues: result.issues,
+        });
+      }
+    } else {
+      const result = await adapter.publish({
+        accountId: context.account.id,
+        document: context.document,
+        dryRun: true,
+      });
+
+      if (!result.ok) {
+        await markPublishTargetFailed(context.targetId, `${context.platform} mock 发布失败。`, result.issues);
+      } else {
+        await markPublishTargetSucceeded(context.targetId, {
+          remoteId: result.remoteId,
+          url: result.url,
+          issues: result.issues,
+        });
+      }
+    }
+  } catch (error) {
+    await markPublishTargetFailed(
+      context.targetId,
+      error instanceof Error ? error.message : "未知发布执行异常。",
+    );
+  } finally {
+    await markWorkerIdle(context.taskId);
+  }
+}
+
+function registerShutdownHooks(worker: ReturnType<typeof createPublishTargetWorker>) {
   const shutdown = () => {
-    void markWorkerOffline().finally(() => process.exit(0));
+    void worker.close().finally(() => {
+      void markWorkerOffline().finally(() => process.exit(0));
+    });
   };
 
   process.once("SIGINT", shutdown);
@@ -184,16 +131,29 @@ function registerShutdownHooks() {
 }
 
 async function bootstrap() {
-  registerShutdownHooks();
+  await ensureRuntimeReady();
   await updateWorkerStatus({
     status: "idle",
     lastHeartbeatAt: createTimestamp(),
   });
-  console.log("worker bootstrap");
-  await workOnce();
-  setInterval(() => {
-    void workOnce();
-  }, tickIntervalMs);
+
+  const worker = createPublishTargetWorker(processPublishTarget);
+  worker.on("drained", () => {
+    void markWorkerIdle();
+  });
+  worker.on("failed", (job, error) => {
+    if (!job) {
+      return;
+    }
+
+    void markPublishTargetFailed(
+      job.data.targetId,
+      error instanceof Error ? error.message : "BullMQ job failed.",
+    );
+  });
+
+  registerShutdownHooks(worker);
+  console.log("publish worker is listening for BullMQ jobs");
 }
 
 void bootstrap();

@@ -8,7 +8,11 @@
   },
   "scripts": {
     "build": "turbo run build",
+    "db:generate": "pnpm --filter @mp-publishing/task-runtime db:generate",
+    "db:push": "pnpm --filter @mp-publishing/task-runtime db:push",
     "dev": "turbo run dev --parallel",
+    "infra:up": "docker compose up -d postgres redis",
+    "infra:down": "docker compose down",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "format": "turbo run format"

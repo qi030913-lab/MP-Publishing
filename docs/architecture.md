@@ -2,7 +2,7 @@
 
 ## 0. 当前实现快照（2026-05-30）
 
-当前工程已经从“架构建议”推进到一个可本地演示的 MVP 工作台。现状不是生产架构闭环，而是用轻量 runtime 先把创作、预览、模拟发布、任务推进、账号状态这些关键交互跑通。
+当前工程已经从“架构建议”推进到一个具备持久化任务链路的 MVP 工作台。创作、预览、模拟发布、任务推进、账号状态这些关键交互已经跑通，并且发布任务已从 `.runtime` 文件状态升级为 PostgreSQL + Prisma 数据模型和 Redis + BullMQ 队列。
 
 已落地：
 
@@ -13,18 +13,16 @@
   - `/publish`：发布确认页
   - `/tasks`：任务中心
   - `/accounts`：账号管理页
-- **后端 API**：`apps/api`，NestJS，提供平台能力、预览、账号、发布任务和 runtime 状态接口
-- **Worker**：`apps/worker`，本地轮询任务并推进 `queued -> running -> succeeded / needs_retry / needs_manual_action`
+- **后端 API**：`apps/api`，NestJS，提供平台能力、预览、账号、发布任务和 runtime 状态接口；创建发布任务时写入 Prisma 并投递 BullMQ target job
+- **Worker**：`apps/worker`，BullMQ consumer，消费发布 target job 并推进 `queued -> running -> succeeded / needs_retry / needs_manual_action`
 - **内容模型**：`packages/content-model`，提供 Canonical Content Model、输入转换和纯文本导出
 - **平台协议**：`packages/platform-sdk`，定义平台能力、草稿、校验、模拟发布、发布结果等类型
 - **适配器注册中心**：`packages/adapter-core`，注册并调度 4 个平台 adapter
 - **平台 adapters**：微信公众号、知乎、B站、小红书均已有 demo adapter
-- **本地 runtime**：`packages/task-runtime`，用 `.runtime/publish-state.json` 暂存 demo 账号、任务和 worker 状态
+- **任务 runtime**：`packages/task-runtime`，集中 Prisma Client、PostgreSQL 数据访问、BullMQ 队列封装和 demo 账号 seed
 
 暂未落地，仍属于生产化目标：
 
-- PostgreSQL + Prisma 的持久化数据模型
-- Redis + BullMQ 的真实任务队列
 - S3 兼容对象存储
 - Playwright 真实页面预演和截图验收
 - AI 改写/标签建议层 `ai-orchestrator`
@@ -165,20 +163,25 @@ flowchart LR
 flowchart LR
     U["创作者"] --> WEB["Next.js Web<br/>5 个核心页面"]
     WEB --> API["NestJS API<br/>preview / publish / accounts"]
+    API --> DB["PostgreSQL<br/>Prisma models"]
+    API --> Q["Redis / BullMQ<br/>publish-target queue"]
     API --> REG["Adapter Registry"]
     REG --> WX["Wechat demo adapter"]
     REG --> ZH["Zhihu demo adapter"]
     REG --> BL["Bilibili demo adapter"]
     REG --> XHS["Xiaohongshu demo adapter"]
-    API --> RT["task-runtime<br/>.runtime/publish-state.json"]
-    WK["Worker<br/>轮询本地 runtime"] --> RT
+    Q --> WK["Worker<br/>BullMQ consumer"]
+    WK --> DB
+    WK --> REG
 ```
 
-当前 MVP 用 `task-runtime` 代替数据库和队列，目的是先验证端到端交互。生产化时应把 runtime 拆成：
+当前 `task-runtime` 不再保存 `.runtime/publish-state.json`，而是作为数据与队列边界：
 
-- 数据库持久化：账号、文档、版本、任务、尝试记录、审计日志
-- 队列：适配、模拟发布、发布、重试、状态同步
-- 对象存储：素材、截图、回执快照
+- Prisma schema：账号、文档、版本、发布任务、平台 target、发布尝试、worker 状态、审计日志
+- PostgreSQL：持久保存发布链路和 worker 状态
+- BullMQ：将每个平台 target 拆成独立 job，由 worker 消费
+- Redis：BullMQ 的队列后端
+- 本地开发基础设施：`compose.yaml` 提供 Postgres 和 Redis
 
 ## 6. 核心模块设计
 
@@ -444,9 +447,9 @@ packages/
 
 说明：
 
-- `/preview` 直接从输入生成 Canonical Document 和平台草稿，没有持久化 `ContentDocument`
-- `/publish/simulate` 和 `/publish/mock` 会创建本地任务，由 worker 推进状态
-- `/accounts/*` 操作的是本地 demo 账号健康状态，不是真实平台授权
+- `/preview` 仍直接从输入生成 Canonical Document 和平台草稿，不写入内容库
+- `/publish/simulate` 和 `/publish/mock` 会创建 `ContentDocument / ContentVersion / PublishJob / PublishTarget`，然后将可执行 target 投递到 BullMQ
+- `/accounts/*` 操作 Prisma 中的 demo 账号健康状态，不是真实平台授权
 - `/runtime/status` 用于前端任务中心展示 worker 心跳和队列统计
 
 ### 9.2 生产目标 API
@@ -505,12 +508,11 @@ MVP 前端已经从聚合式单页控制台拆成 5 个核心页面：
    - 查看凭证状态
    - 触发健康检查
 
-当前页面仍使用浏览器 `localStorage` 保存编辑草稿和最近任务 ID。生产化时建议：
+当前页面仍使用浏览器 `localStorage` 保存编辑草稿和最近任务 ID。后续建议：
 
 - 草稿保存迁移到 `ContentDocument / ContentVersion`
 - 预览迁移到 `PlatformDraft / AdaptationJob`
-- 任务中心迁移到 `PublishJob / PublishTarget / PublishAttempt`
-- API 地址从硬编码默认值升级为环境变量和部署配置
+- API 地址继续通过 `NEXT_PUBLIC_API_BASE_URL` 做环境配置
 
 ## 11. AI 在系统中的正确位置
 
@@ -595,28 +597,19 @@ AI 不适合直接负责：
 
 ## 15. 下一步建议
 
-工程初始化和基础模块已经完成。下一步建议从 demo MVP 进入“可信闭环”阶段，优先级如下：
+工程初始化、基础模块、Prisma 数据模型和 BullMQ 队列已经完成。下一步建议从“可信任务链路”进入“真实平台链路”阶段，优先级如下：
 
-1. **替换本地 runtime**
-   - 引入 PostgreSQL + Prisma
-   - 建立 `User / Workspace / PlatformAccount / ContentDocument / ContentVersion / PublishJob / PublishTarget / PublishAttempt / AuditLog`
-   - 保留 `task-runtime` 作为测试 fixture 或迁移脚手架，而不是业务 runtime
-
-2. **接入真实队列**
-   - 用 Redis + BullMQ 替代 worker 对 `.runtime` 文件的轮询
-   - 把模拟发布、mock 发布、重试、状态同步拆成明确 job
-
-3. **做深一个平台**
+1. **做深一个平台**
    - 优先选择公众号或知乎作为第一个真实发布平台
    - 补齐真实 validator、renderer、publisher、status-sync
    - 明确失败原因、重试策略和人工处理状态
 
-4. **补齐模拟发布**
+2. **补齐模拟发布**
    - 引入 Playwright
    - 生成截图、字段校验报告和风险项
    - 保证模拟发布不点击最终确认按钮
 
-5. **补测试与可观测性**
+3. **补测试与可观测性**
    - adapter 单元测试
    - API e2e 测试
    - worker 状态流转测试

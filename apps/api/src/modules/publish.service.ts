@@ -1,7 +1,8 @@
 import { Injectable, NotFoundException } from "@nestjs/common";
-import { adapterRegistry } from "@mp-publishing/adapter-core";
 import { createDocumentFromInput } from "@mp-publishing/content-model";
 import {
+  createContentSnapshot,
+  enqueueTaskTargets,
   findAccountById,
   findTaskById,
   listAccounts,
@@ -156,58 +157,33 @@ export class PublishService {
     const taskCreatedAt = this.createTimestamp();
 
     const document = this.createBaseDocument(input);
+    const contentSnapshot = await createContentSnapshot(document);
 
-    const targets = await Promise.all(
-      input.platforms.map(async (platform) => {
-        const adapter = adapterRegistry.get(platform);
+    const targets = input.platforms.map((platform) => {
         const matchedAccount = accounts.find((account) => account.platform === platform) ?? null;
         const baseLogs = [
           this.createLog("info", mode === "simulate" ? `已创建 ${platform} 模拟发布任务。` : `已创建 ${platform} mock 发布任务。`),
-          this.createLog("info", `${platform} 等待 worker 执行。`),
+          this.createLog("info", `${platform} 等待 BullMQ worker 执行。`),
         ];
-
-        if (mode === "simulate") {
-          const simulateResult = await adapter.simulatePublish({
-            accountId: matchedAccount?.id ?? `unbound-${platform}`,
-            document,
-            dryRun: true,
-          });
-
-          return {
-            platform,
-            account: matchedAccount,
-            status: this.resolveInitialTargetStatus(matchedAccount),
-            attemptCount: 1,
-            screenshots: simulateResult.screenshots,
-            issues: simulateResult.issues,
-            logs: baseLogs,
-          } satisfies PublishTaskTargetRecord;
-        }
-
-        const publishResult = await adapter.publish({
-          accountId: matchedAccount?.id ?? `unbound-${platform}`,
-          document,
-          dryRun: true,
-        });
 
         return {
           platform,
           account: matchedAccount,
           status: this.resolveInitialTargetStatus(matchedAccount),
           attemptCount: 1,
-          remoteId: publishResult.remoteId,
-          url: publishResult.url,
-          issues: publishResult.issues,
+          screenshots: [],
+          issues: [],
           logs: baseLogs,
         } satisfies PublishTaskTargetRecord;
-      }),
-    );
+      });
 
     const task: PublishTaskRecord = {
       id: `task_${Date.now()}`,
       mode,
       status: this.summarizeTaskStatus(targets),
       documentTitle: document.title,
+      documentId: contentSnapshot.documentId,
+      versionId: contentSnapshot.versionId,
       createdAt: taskCreatedAt,
       updatedAt: this.createTimestamp(),
       timeline: [
@@ -222,7 +198,7 @@ export class PublishService {
             target.status === "needs_manual_action" ? "warning" : "info",
             target.status === "needs_manual_action"
               ? `${target.platform} 初始化时需要人工处理。`
-              : `${target.platform} 已进入发布队列，等待 worker 执行。`,
+              : `${target.platform} 已进入 BullMQ 发布队列，等待 worker 执行。`,
             target.platform,
           ),
         ),
@@ -230,8 +206,13 @@ export class PublishService {
       targets,
     };
 
-    await upsertTask(task);
-    return task;
+    const savedTask = await upsertTask(task);
+    if (!savedTask) {
+      throw new Error("failed to create publish task");
+    }
+
+    await enqueueTaskTargets(savedTask.id);
+    return savedTask;
   }
 
   async simulate(input: SimulatePublishDto) {
@@ -276,7 +257,6 @@ export class PublishService {
     }
 
     const refreshedTask = await this.refreshTaskAccounts(task);
-    await upsertTask(refreshedTask);
     return this.mapTaskForResponse(refreshedTask);
   }
 
@@ -313,9 +293,9 @@ export class PublishService {
           ),
         );
       } else {
-        target.logs.push(this.createLog("info", `${target.platform} 已重新排入执行队列。`));
+        target.logs.push(this.createLog("info", `${target.platform} 已重新排入 BullMQ 执行队列。`));
         refreshedTask.timeline.push(
-          this.createEvent("queued", "info", `${target.platform} 已重新排入执行队列。`, target.platform),
+          this.createEvent("queued", "info", `${target.platform} 已重新排入 BullMQ 执行队列。`, target.platform),
         );
         if (target.account.health === "expiring") {
           const updatedAccount = await updateAccount(target.account.id, {
@@ -336,8 +316,9 @@ export class PublishService {
 
     refreshedTask.status = this.summarizeTaskStatus(refreshedTask.targets);
     refreshedTask.updatedAt = this.createTimestamp();
-    await upsertTask(refreshedTask);
+    const savedTask = await upsertTask(refreshedTask);
+    await enqueueTaskTargets(refreshedTask.id, input.platform);
 
-    return this.mapTaskForResponse(refreshedTask);
+    return this.mapTaskForResponse(savedTask ?? refreshedTask);
   }
 }
