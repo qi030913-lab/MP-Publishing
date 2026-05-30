@@ -498,6 +498,76 @@ async function runDraftConnectorWorkspaceEnvCheck() {
   }
 }
 
+async function runDraftConnectorPublicBaseRuntimeCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const apiPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const publicBaseUrl = "https://drafts.example.test/mp";
+  const queueName = `mp-publishing-draft-public-base-e2e-${Date.now()}`;
+  const outboxDir = path.join(runtimeDir, `draft-public-base-e2e-${Date.now()}`);
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+
+  const api = startService("api-draft-public-base", ["apps/api/dist/main.js"], {
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: publicBaseUrl,
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+  });
+  const draftConnector = startService("draft-connector-public-base", ["apps/draft-connector/dist/main.js"], {
+    PORT: String(connectorPort),
+    DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: publicBaseUrl,
+  });
+
+  try {
+    await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector public base");
+    await waitForApi(api);
+    const runtime = await requestJson("/runtime/status");
+
+    if (
+      runtime.draftConnector?.status !== "online" ||
+      runtime.draftConnector?.baseUrl !== connectorBaseUrl ||
+      runtime.draftConnector?.publicBaseUrl !== publicBaseUrl ||
+      runtime.draftConnector?.outboxUrl !== `${publicBaseUrl}/drafts` ||
+      platforms.some((platform) => {
+        const platformStatus = runtime.draftConnector?.platforms?.find((item) => item.platform === platform);
+        return (
+          platformStatus?.draftEndpoint !== `${connectorBaseUrl}/${platform}/drafts` ||
+          platformStatus?.outboxUrl !== `${publicBaseUrl}/${platform}/drafts`
+        );
+      })
+    ) {
+      throw new Error(`Runtime did not expose public draft connector outbox URLs: ${JSON.stringify(runtime.draftConnector)}`);
+    }
+
+    return {
+      status: runtime.draftConnector.status,
+      baseUrl: runtime.draftConnector.baseUrl,
+      publicBaseUrl: runtime.draftConnector.publicBaseUrl,
+      outboxUrl: runtime.draftConnector.outboxUrl,
+      platformOutboxUrls: runtime.draftConnector.platforms.map((platformStatus) => ({
+        platform: platformStatus.platform,
+        outboxUrl: platformStatus.outboxUrl,
+      })),
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(draftConnector)]);
+    fs.rmSync(outboxDir, { recursive: true, force: true });
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runLocalDraftEnablementCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -2848,6 +2918,7 @@ const draftConnectorEnv = {
   DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
 };
 const workspaceEnvCheck = await runDraftConnectorWorkspaceEnvCheck();
+const publicBaseRuntime = await runDraftConnectorPublicBaseRuntimeCheck();
 const localEnablement = await runLocalDraftEnablementCheck();
 const disabledPreflight = await runDisabledDraftPreflightCheck();
 const credentialPreflight = await runCredentialPreflightCheck();
@@ -3258,6 +3329,7 @@ try {
       outbox: finalRuntime.draftConnector.outbox,
     },
     workspaceEnvCheck,
+    publicBaseRuntime,
     localEnablement,
     disabledPreflight,
     credentialPreflight,

@@ -167,6 +167,7 @@ export type RuntimeStatus = {
   draftConnector: {
     status: "online" | "offline" | "configured" | "unconfigured";
     baseUrl?: string;
+    publicBaseUrl?: string;
     outboxUrl?: string;
     healthUrl?: string;
     outboxDir?: string;

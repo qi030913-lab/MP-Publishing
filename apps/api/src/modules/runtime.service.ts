@@ -176,6 +176,11 @@ function inferBaseUrlFromHealthUrl(healthUrl: string | undefined) {
   }
 }
 
+function resolvePublicBaseUrl(fallbackBaseUrl: string | undefined) {
+  const publicBaseUrl = readEnvValue("DRAFT_CONNECTOR_PUBLIC_BASE_URL");
+  return publicBaseUrl ? trimTrailingSlash(publicBaseUrl) : fallbackBaseUrl;
+}
+
 function resolvePlatformOutboxUrl(platformStatus: DraftConnectorPlatformStatus, baseUrl: string | undefined) {
   if (baseUrl) {
     return `${baseUrl}/${platformStatus.platform}/drafts`;
@@ -297,19 +302,24 @@ export class RuntimeService {
 
     if (!healthUrl) {
       const status = hasConnectorConfig ? "configured" : "unconfigured";
+      const publicBaseUrl = resolvePublicBaseUrl(undefined);
 
       return {
         status,
+        publicBaseUrl,
+        outboxUrl: publicBaseUrl ? `${publicBaseUrl}/drafts` : undefined,
         detail: hasConnectorConfig
           ? "Draft endpoints are configured directly; set DRAFT_CONNECTOR_HEALTH_URL or DRAFT_CONNECTOR_BASE_URL to enable health checks."
           : "Set DRAFT_CONNECTOR_BASE_URL to enable local draft connector health checks.",
         platforms: platforms.map((platformStatus) => ({
           ...platformStatus,
-          outboxUrl: resolvePlatformOutboxUrl(platformStatus, undefined),
+          outboxUrl: resolvePlatformOutboxUrl(platformStatus, publicBaseUrl),
           ...resolveDraftReadiness(platformStatus, status, resolveEnvPrefix(platformStatus.platform)),
         })),
       } satisfies {
         status: DraftConnectorStatus;
+        publicBaseUrl?: string;
+        outboxUrl?: string;
         detail: string;
         platforms: DraftConnectorPlatformStatus[];
       };
@@ -318,6 +328,7 @@ export class RuntimeService {
     const normalizedBaseUrl = readEnvValue("DRAFT_CONNECTOR_BASE_URL")
       ? trimTrailingSlash(readEnvValue("DRAFT_CONNECTOR_BASE_URL")!)
       : inferBaseUrlFromHealthUrl(healthUrl);
+    const normalizedPublicBaseUrl = resolvePublicBaseUrl(normalizedBaseUrl);
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 1500);
 
@@ -332,7 +343,7 @@ export class RuntimeService {
 
         return {
           ...platformStatus,
-          outboxUrl: resolvePlatformOutboxUrl(platformStatus, normalizedBaseUrl),
+          outboxUrl: resolvePlatformOutboxUrl(platformStatus, normalizedPublicBaseUrl),
           ...resolveDraftReadiness(platformStatus, status, resolveEnvPrefix(platformStatus.platform), upstreamStatus),
           outbox: payload.outbox?.platforms?.find((item) => item.platform === platformStatus.platform),
           upstreamDraftEndpointConfigured: upstreamStatus?.draftEndpointConfigured,
@@ -348,7 +359,8 @@ export class RuntimeService {
       return {
         status,
         baseUrl: normalizedBaseUrl,
-        outboxUrl: normalizedBaseUrl ? `${normalizedBaseUrl}/drafts` : undefined,
+        publicBaseUrl: normalizedPublicBaseUrl,
+        outboxUrl: normalizedPublicBaseUrl ? `${normalizedPublicBaseUrl}/drafts` : undefined,
         healthUrl,
         detail: response.ok
           ? `Draft connector is ${payload.status ?? "reachable"}.`
@@ -361,12 +373,13 @@ export class RuntimeService {
       return {
         status: "offline",
         baseUrl: normalizedBaseUrl,
-        outboxUrl: normalizedBaseUrl ? `${normalizedBaseUrl}/drafts` : undefined,
+        publicBaseUrl: normalizedPublicBaseUrl,
+        outboxUrl: normalizedPublicBaseUrl ? `${normalizedPublicBaseUrl}/drafts` : undefined,
         healthUrl,
         detail: error instanceof Error ? error.message : "Draft connector health check failed.",
         platforms: platforms.map((platformStatus) => ({
           ...platformStatus,
-          outboxUrl: resolvePlatformOutboxUrl(platformStatus, normalizedBaseUrl),
+          outboxUrl: resolvePlatformOutboxUrl(platformStatus, normalizedPublicBaseUrl),
           ...resolveDraftReadiness(platformStatus, "offline", resolveEnvPrefix(platformStatus.platform)),
         })),
       };
