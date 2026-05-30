@@ -65,11 +65,17 @@ async function requestJson(pathname, options = {}) {
   return response.json();
 }
 
-async function requestAbsoluteJson(url) {
-  const response = await fetch(url, { headers: { accept: "application/json" } });
+async function requestAbsoluteJson(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      accept: "application/json",
+      ...(options.headers ?? {}),
+    },
+  });
   if (!response.ok) {
     const body = await response.text();
-    throw new Error(`GET ${url} failed: ${response.status} ${body}`);
+    throw new Error(`${options.method ?? "GET"} ${url} failed: ${response.status} ${body}`);
   }
 
   return response.json();
@@ -397,6 +403,87 @@ try {
 
   task = syncedTask;
 
+  const externalizedTargets = [];
+  for (const platform of platforms) {
+    const syncedTarget = task.results.find((item) => item.platform === platform);
+    const connectorDraftId = syncedTarget?.remoteId;
+    if (!connectorDraftId) {
+      throw new Error(`Cannot externalize ${platform} draft without connector draft id: ${JSON.stringify(syncedTarget)}`);
+    }
+
+    const externalDraftId = `${platform}-external-draft-${created.id}`;
+    const externalUrl = `https://draft.example.test/${platform}/${externalDraftId}`;
+    const updatePayload = await requestAbsoluteJson(`${connectorBaseUrl}/${platform}/drafts/${connectorDraftId}/status`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer draft-secret",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        state: "ready",
+        externalDraftId,
+        url: externalUrl,
+        detail: `${platform} external draft has been linked by the connector.`,
+      }),
+    });
+
+    if (updatePayload.state !== "ready" || updatePayload.remoteId !== externalDraftId || updatePayload.url !== externalUrl) {
+      throw new Error(`Draft connector status update returned an unexpected payload for ${platform}: ${JSON.stringify(updatePayload)}`);
+    }
+
+    const updatedDetail = await requestAbsoluteJson(`${connectorBaseUrl}/${platform}/drafts/${connectorDraftId}`);
+    if (updatedDetail.state !== "ready" || updatedDetail.externalDraftId !== externalDraftId || updatedDetail.externalUrl !== externalUrl) {
+      throw new Error(`Draft connector detail did not persist external draft status for ${platform}: ${JSON.stringify(updatedDetail)}`);
+    }
+  }
+
+  const externalSyncedTask = await requestJson(`/publish/tasks/${created.id}/sync`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+
+  for (const platform of platforms) {
+    const afterExternalSync = externalSyncedTask.results.find((item) => item.platform === platform);
+    const expectedRemoteId = `${platform}-external-draft-${created.id}`;
+    const expectedUrl = `https://draft.example.test/${platform}/${expectedRemoteId}`;
+    if (
+      !afterExternalSync ||
+      afterExternalSync.status !== "succeeded" ||
+      afterExternalSync.remoteId !== expectedRemoteId ||
+      afterExternalSync.url !== expectedUrl
+    ) {
+      throw new Error(`Draft connector sync did not expose external draft status for ${platform}: ${JSON.stringify(afterExternalSync)}`);
+    }
+
+    externalizedTargets.push({
+      platform: afterExternalSync.platform,
+      status: afterExternalSync.status,
+      remoteId: afterExternalSync.remoteId,
+      url: afterExternalSync.url,
+    });
+  }
+
+  task = await requestJson(`/publish/tasks/${created.id}/sync`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+
+  for (const platform of platforms) {
+    const resyncedTarget = task.results.find((item) => item.platform === platform);
+    const expectedRemoteId = `${platform}-external-draft-${created.id}`;
+    const expectedUrl = `https://draft.example.test/${platform}/${expectedRemoteId}`;
+    if (
+      !resyncedTarget ||
+      resyncedTarget.status !== "succeeded" ||
+      resyncedTarget.remoteId !== expectedRemoteId ||
+      resyncedTarget.url !== expectedUrl
+    ) {
+      throw new Error(`Draft connector could not resolve status by external draft id for ${platform}: ${JSON.stringify(resyncedTarget)}`);
+    }
+  }
+
   const outboxIndex = await requestAbsoluteJson(`${connectorBaseUrl}/drafts?format=json`);
   const outboxHtml = await requestAbsoluteText(`${connectorBaseUrl}/drafts`);
   if (outboxIndex.items?.length !== platforms.length) {
@@ -414,7 +501,12 @@ try {
     }
 
     const platformOutbox = await requestAbsoluteJson(`${connectorBaseUrl}/${platform}/drafts?format=json`);
-    if (platformOutbox.items?.length !== 1 || platformOutbox.items[0]?.platform !== platform) {
+    if (
+      platformOutbox.items?.length !== 1 ||
+      platformOutbox.items[0]?.platform !== platform ||
+      platformOutbox.items[0]?.state !== "ready" ||
+      !platformOutbox.items[0]?.externalUrl
+    ) {
       throw new Error(`Draft connector platform outbox is incorrect for ${platform}: ${JSON.stringify(platformOutbox)}`);
     }
   }
@@ -437,10 +529,13 @@ try {
     })),
     draftDetails,
     syncedTargets,
+    externalizedTargets,
     outboxIndex: outboxIndex.items.map((item) => ({
       platform: item.platform,
       draftId: item.draftId,
       title: item.title,
+      state: item.state,
+      externalUrl: item.externalUrl,
       url: item.url,
     })),
     draftConnector: {

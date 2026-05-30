@@ -14,9 +14,29 @@ type DraftPayload = {
   draft?: {
     platform?: string;
     title?: string;
+    summary?: string;
     body?: string;
+    hashtags?: string[];
+    warnings?: ValidationIssue[];
   };
+  credential?: unknown;
   requestedAt?: string;
+};
+
+type DraftState =
+  | "draft"
+  | "adapting"
+  | "ready"
+  | "publishing"
+  | "partially_succeeded"
+  | "succeeded"
+  | "failed"
+  | "needs_manual_action";
+
+type ValidationIssue = {
+  code: string;
+  message: string;
+  severity: "info" | "warning" | "error";
 };
 
 type StoredDraft = {
@@ -24,6 +44,12 @@ type StoredDraft = {
   platform: string;
   accountId?: string;
   createdAt: string;
+  updatedAt: string;
+  state: DraftState;
+  externalDraftId?: string;
+  externalUrl?: string;
+  statusDetail?: string;
+  statusIssues?: ValidationIssue[];
   payload: DraftPayload;
 };
 
@@ -33,10 +59,25 @@ type DraftSummary = {
   accountId?: string;
   title: string;
   createdAt: string;
+  updatedAt: string;
+  state: DraftState;
+  externalDraftId?: string;
+  externalUrl?: string;
+  statusDetail?: string;
   url: string;
 };
 
 const supportedPlatforms = new Set(["zhihu", "bilibili", "xiaohongshu"]);
+const supportedDraftStates = new Set<DraftState>([
+  "draft",
+  "adapting",
+  "ready",
+  "publishing",
+  "partially_succeeded",
+  "succeeded",
+  "failed",
+  "needs_manual_action",
+]);
 const port = Number(process.env.PORT ?? 3010);
 
 function findWorkspaceRoot(startDir: string) {
@@ -130,8 +171,8 @@ function requireAuthorized(request: IncomingMessage) {
 
 function parseRoute(url: string | undefined) {
   const parsed = new URL(url ?? "/", "http://localhost");
-  const [platform, operation, draftId] = parsed.pathname.split("/").filter(Boolean);
-  return { platform, operation, draftId };
+  const [platform, operation, draftId, action] = parsed.pathname.split("/").filter(Boolean);
+  return { platform, operation, draftId, action };
 }
 
 function validatePlatform(platform: string | undefined) {
@@ -140,6 +181,40 @@ function validatePlatform(platform: string | undefined) {
 
 function validateDraftId(draftId: string | undefined) {
   return draftId && /^[a-z0-9-]+$/i.test(draftId) ? draftId : null;
+}
+
+function validateRemoteId(remoteId: string | undefined) {
+  return remoteId && remoteId.length <= 200 && /^[a-z0-9_.:-]+$/i.test(remoteId) ? remoteId : null;
+}
+
+function readOptionalString(value: unknown) {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function normalizeDraftState(value: unknown): DraftState | null {
+  return typeof value === "string" && supportedDraftStates.has(value as DraftState) ? (value as DraftState) : null;
+}
+
+function isValidationIssue(value: unknown): value is ValidationIssue {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+
+  const issue = value as Partial<ValidationIssue>;
+  return (
+    typeof issue.code === "string" &&
+    typeof issue.message === "string" &&
+    (issue.severity === "info" || issue.severity === "warning" || issue.severity === "error")
+  );
+}
+
+function normalizeStoredDraft(raw: StoredDraft): StoredDraft {
+  return {
+    ...raw,
+    state: normalizeDraftState(raw.state) ?? "draft",
+    updatedAt: raw.updatedAt ?? raw.createdAt,
+    statusIssues: Array.isArray(raw.statusIssues) ? raw.statusIssues.filter(isValidationIssue) : undefined,
+  };
 }
 
 function validateDraftPayload(platform: string, payload: DraftPayload) {
@@ -163,13 +238,53 @@ function validateDraftPayload(platform: string, payload: DraftPayload) {
   return null;
 }
 
+function sanitizeDraftPayload(payload: DraftPayload): DraftPayload {
+  const payloadRecord = { ...(payload as Record<string, unknown>) };
+  delete payloadRecord.credential;
+  return payloadRecord as DraftPayload;
+}
+
 async function readStoredDraft(platform: string, draftId: string) {
   const filePath = path.join(outboxDir, platform, `${draftId}.json`);
   if (!existsSync(filePath)) {
     return null;
   }
 
-  return JSON.parse(await readFile(filePath, "utf8")) as StoredDraft;
+  return normalizeStoredDraft(JSON.parse(await readFile(filePath, "utf8")) as StoredDraft);
+}
+
+async function writeStoredDraft(storedDraft: StoredDraft) {
+  const platformOutboxDir = path.join(outboxDir, storedDraft.platform);
+  const filePath = path.join(platformOutboxDir, `${storedDraft.draftId}.json`);
+
+  await mkdir(platformOutboxDir, { recursive: true });
+  await writeFile(filePath, `${JSON.stringify(storedDraft, null, 2)}\n`, "utf8");
+}
+
+async function findStoredDraftByRemoteId(platform: string, remoteId: string) {
+  const localDraftId = validateDraftId(remoteId);
+  if (localDraftId) {
+    const directMatch = await readStoredDraft(platform, localDraftId);
+    if (directMatch) {
+      return directMatch;
+    }
+  }
+
+  const platformOutboxDir = path.join(outboxDir, platform);
+  if (!existsSync(platformOutboxDir)) {
+    return null;
+  }
+
+  const fileNames = await readdir(platformOutboxDir);
+  for (const fileName of fileNames.filter((name) => name.endsWith(".json"))) {
+    const content = await readFile(path.join(platformOutboxDir, fileName), "utf8");
+    const storedDraft = normalizeStoredDraft(JSON.parse(content) as StoredDraft);
+    if (storedDraft.externalDraftId === remoteId) {
+      return storedDraft;
+    }
+  }
+
+  return null;
 }
 
 function shouldReturnJson(request: IncomingMessage) {
@@ -181,6 +296,10 @@ function shouldReturnJson(request: IncomingMessage) {
 function renderDraftHtml(storedDraft: StoredDraft, url: string) {
   const title = storedDraft.payload.draft?.title ?? storedDraft.payload.document?.title ?? storedDraft.draftId;
   const body = storedDraft.payload.draft?.body ?? "";
+  const hashtags = storedDraft.payload.draft?.hashtags?.join(" ") ?? "";
+  const externalLink = storedDraft.externalUrl
+    ? `<p><a href="${escapeHtml(storedDraft.externalUrl)}" target="_blank" rel="noreferrer">Open external platform draft</a></p>`
+    : "";
   const json = JSON.stringify(storedDraft, null, 2);
 
   return `<!doctype html>
@@ -207,10 +326,16 @@ function renderDraftHtml(storedDraft: StoredDraft, url: string) {
       <div class="meta">
         <div><span>Platform</span><strong>${escapeHtml(storedDraft.platform)}</strong></div>
         <div><span>Account</span><strong>${escapeHtml(storedDraft.accountId ?? "unknown")}</strong></div>
+        <div><span>State</span><strong>${escapeHtml(storedDraft.state)}</strong></div>
         <div><span>Draft ID</span><strong>${escapeHtml(storedDraft.draftId)}</strong></div>
+        <div><span>External Draft</span><strong>${escapeHtml(storedDraft.externalDraftId ?? "not linked")}</strong></div>
         <div><span>Created</span><strong>${escapeHtml(storedDraft.createdAt)}</strong></div>
+        <div><span>Updated</span><strong>${escapeHtml(storedDraft.updatedAt)}</strong></div>
       </div>
+      ${storedDraft.statusDetail ? `<p>${escapeHtml(storedDraft.statusDetail)}</p>` : ""}
       <article>${escapeHtml(body).replaceAll("\n", "<br />")}</article>
+      ${hashtags ? `<p>${escapeHtml(hashtags)}</p>` : ""}
+      ${externalLink}
       <pre>${escapeHtml(json)}</pre>
       <p><a href="${escapeHtml(`${url}?format=json`)}">JSON</a></p>
     </main>
@@ -225,6 +350,11 @@ function createDraftSummary(storedDraft: StoredDraft, request: IncomingMessage):
     accountId: storedDraft.accountId,
     title: storedDraft.payload.draft?.title ?? storedDraft.payload.document?.title ?? storedDraft.draftId,
     createdAt: storedDraft.createdAt,
+    updatedAt: storedDraft.updatedAt,
+    state: storedDraft.state,
+    externalDraftId: storedDraft.externalDraftId,
+    externalUrl: storedDraft.externalUrl,
+    statusDetail: storedDraft.statusDetail,
     url: createDraftUrl(storedDraft.platform, storedDraft.draftId, request),
   };
 }
@@ -243,7 +373,7 @@ async function listStoredDrafts(platforms: string[], request: IncomingMessage) {
           .filter((fileName) => fileName.endsWith(".json"))
           .map(async (fileName) => {
             const content = await readFile(path.join(platformOutboxDir, fileName), "utf8");
-            return JSON.parse(content) as StoredDraft;
+            return normalizeStoredDraft(JSON.parse(content) as StoredDraft);
           }),
       );
 
@@ -253,7 +383,7 @@ async function listStoredDrafts(platforms: string[], request: IncomingMessage) {
 
   return drafts
     .flat()
-    .sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime());
+    .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime());
 }
 
 function renderDraftListHtml(items: DraftSummary[], title: string) {
@@ -263,7 +393,8 @@ function renderDraftListHtml(items: DraftSummary[], title: string) {
           .map(
             (item) => `<a class="draft-row" href="${escapeHtml(item.url)}">
           <strong>${escapeHtml(item.title)}</strong>
-          <span>${escapeHtml(item.platform)} · ${escapeHtml(item.accountId ?? "unknown")} · ${escapeHtml(item.createdAt)}</span>
+          <span>${escapeHtml(item.platform)} / ${escapeHtml(item.state)} / ${escapeHtml(item.accountId ?? "unknown")} / ${escapeHtml(item.updatedAt)}</span>
+          ${item.externalUrl ? `<span>External: ${escapeHtml(item.externalUrl)}</span>` : ""}
         </a>`,
           )
           .join("")}</div>`
@@ -316,18 +447,18 @@ async function handleCreateDraft(platform: string, request: IncomingMessage, res
   }
 
   const draftId = createDraftId(platform);
-  const platformOutboxDir = path.join(outboxDir, platform);
-  const filePath = path.join(platformOutboxDir, `${draftId}.json`);
+  const createdAt = new Date().toISOString();
   const storedDraft: StoredDraft = {
     draftId,
     platform,
     accountId: payload.accountId,
-    createdAt: new Date().toISOString(),
-    payload,
+    createdAt,
+    updatedAt: createdAt,
+    state: "draft",
+    payload: sanitizeDraftPayload(payload),
   };
 
-  await mkdir(platformOutboxDir, { recursive: true });
-  await writeFile(filePath, `${JSON.stringify(storedDraft, null, 2)}\n`, "utf8");
+  await writeStoredDraft(storedDraft);
 
   sendJson(response, 200, {
     ok: true,
@@ -335,6 +466,65 @@ async function handleCreateDraft(platform: string, request: IncomingMessage, res
     remoteId: draftId,
     url: createDraftUrl(platform, draftId, request),
     message: `${platform} draft stored in local outbox.`,
+  });
+}
+
+async function handleUpdateDraftStatus(platform: string, draftId: string | undefined, request: IncomingMessage, response: ServerResponse) {
+  if (!requireAuthorized(request)) {
+    sendJson(response, 401, { ok: false, message: "Draft connector API key is invalid." });
+    return;
+  }
+
+  const validDraftId = validateDraftId(draftId);
+  if (!validDraftId) {
+    sendJson(response, 422, { ok: false, message: "Draft status route must include a valid draft id." });
+    return;
+  }
+
+  const storedDraft = await readStoredDraft(platform, validDraftId);
+  if (!storedDraft) {
+    sendJson(response, 404, {
+      ok: false,
+      message: `${platform} draft ${validDraftId} was not found in local outbox.`,
+      remoteId: validDraftId,
+    });
+    return;
+  }
+
+  const payload = (await readJsonBody(request)) as Record<string, unknown>;
+  const state = normalizeDraftState(payload.state);
+  if (!state) {
+    sendJson(response, 422, {
+      ok: false,
+      message: `Draft status state must be one of: ${Array.from(supportedDraftStates).join(", ")}.`,
+    });
+    return;
+  }
+
+  const externalDraftId = readOptionalString(payload.externalDraftId) ?? readOptionalString(payload.remoteId);
+  const externalUrl = readOptionalString(payload.externalUrl) ?? readOptionalString(payload.url);
+  const statusDetail = readOptionalString(payload.detail);
+  const statusIssues = Array.isArray(payload.issues) ? payload.issues.filter(isValidationIssue) : undefined;
+  const updatedDraft: StoredDraft = {
+    ...storedDraft,
+    state,
+    externalDraftId: externalDraftId ?? storedDraft.externalDraftId,
+    externalUrl: externalUrl ?? storedDraft.externalUrl,
+    statusDetail: statusDetail ?? storedDraft.statusDetail,
+    statusIssues: statusIssues ?? storedDraft.statusIssues,
+    updatedAt: new Date().toISOString(),
+  };
+
+  await writeStoredDraft(updatedDraft);
+
+  sendJson(response, 200, {
+    ok: true,
+    draftId: updatedDraft.draftId,
+    remoteId: updatedDraft.externalDraftId ?? updatedDraft.draftId,
+    state: updatedDraft.state,
+    url: updatedDraft.externalUrl ?? createDraftUrl(platform, updatedDraft.draftId, request),
+    detail: updatedDraft.statusDetail,
+    issues: updatedDraft.statusIssues,
   });
 }
 
@@ -389,34 +579,35 @@ async function handleDraftStatus(platform: string, request: IncomingMessage, res
     return;
   }
 
-  const validDraftId = validateDraftId(payload.remoteId);
-  if (!validDraftId) {
+  const validRemoteId = validateRemoteId(payload.remoteId);
+  if (!validRemoteId) {
     sendJson(response, 422, { state: "needs_manual_action", detail: "Status payload remoteId is invalid." });
     return;
   }
 
-  const storedDraft = await readStoredDraft(platform, validDraftId);
+  const storedDraft = await findStoredDraftByRemoteId(platform, validRemoteId);
   if (!storedDraft) {
     sendJson(response, 404, {
       state: "needs_manual_action",
-      detail: `${platform} draft ${validDraftId} was not found in local outbox.`,
-      remoteId: validDraftId,
+      detail: `${platform} draft ${validRemoteId} was not found in local outbox.`,
+      remoteId: validRemoteId,
     });
     return;
   }
 
   sendJson(response, 200, {
-    state: "draft",
-    detail: `${platform} draft is stored in local outbox.`,
-    remoteId: storedDraft.draftId,
-    url: createDraftUrl(platform, storedDraft.draftId, request),
+    state: storedDraft.state,
+    detail: storedDraft.statusDetail ?? `${platform} draft is stored in local outbox.`,
+    remoteId: storedDraft.externalDraftId ?? storedDraft.draftId,
+    url: storedDraft.externalUrl ?? createDraftUrl(platform, storedDraft.draftId, request),
+    issues: storedDraft.statusIssues,
   });
 }
 
 const server = createServer((request, response) => {
   void (async () => {
     try {
-      const { platform: routePlatform, operation, draftId } = parseRoute(request.url);
+      const { platform: routePlatform, operation, draftId, action } = parseRoute(request.url);
       const platform = validatePlatform(routePlatform);
 
       if (request.method === "GET" && request.url === "/health") {
@@ -438,7 +629,12 @@ const server = createServer((request, response) => {
         return;
       }
 
-      if (request.method === "POST" && operation === "drafts") {
+      if (request.method === "POST" && operation === "drafts" && draftId && action === "status") {
+        await handleUpdateDraftStatus(platform, draftId, request, response);
+        return;
+      }
+
+      if (request.method === "POST" && operation === "drafts" && !draftId) {
         await handleCreateDraft(platform, request, response);
         return;
       }
