@@ -430,6 +430,27 @@ function createCleanServiceEnv(extraEnv = {}) {
   };
 }
 
+function parseEnvFile(filePath) {
+  const values = new Map();
+  const content = fs.readFileSync(filePath, "utf8");
+
+  for (const line of content.split(/\r?\n/)) {
+    const match = line.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
+    if (!match) {
+      continue;
+    }
+
+    let value = match[2].trim();
+    if (value.startsWith('"') && value.endsWith('"')) {
+      value = value.slice(1, -1).replaceAll('\\"', '"').replaceAll("\\\\", "\\");
+    }
+
+    values.set(match[1], value);
+  }
+
+  return values;
+}
+
 async function runDraftConnectorWorkspaceEnvCheck() {
   const connectorPort = await getFreePort();
   const upstreamPort = await getFreePort();
@@ -629,6 +650,90 @@ async function runUpstreamContractCheckScriptCheck() {
     };
   } finally {
     await upstream.close();
+  }
+}
+
+async function runUpstreamProxyEnablementCheck() {
+  const upstreamPort = await getFreePort();
+  const upstream = await startFakeUpstreamDraftService(upstreamPort, "upstream-secret");
+  const workspaceDir = path.join(runtimeDir, `draft-upstream-enable-e2e-${Date.now()}`);
+  const envPath = path.join(workspaceDir, ".env");
+  const connectorBaseUrl = "http://127.0.0.1:3010";
+
+  fs.rmSync(workspaceDir, { recursive: true, force: true });
+  fs.mkdirSync(workspaceDir, { recursive: true });
+
+  try {
+    await runNodeCommand("enable draft upstream proxy", [
+      path.join(root, "scripts/enable-draft-upstream-proxy.mjs"),
+      "--target-env-file",
+      envPath,
+      "--proxy-base-url",
+      upstream.baseUrl,
+      "--connector-base-url",
+      connectorBaseUrl,
+      "--outbox-dir",
+      "outbox",
+      "--api-key",
+      "upstream-secret",
+      "--include-credential",
+      "--status-include-credential",
+      "--check",
+    ]);
+
+    const env = parseEnvFile(envPath);
+    const enabledPlatforms = [];
+    for (const platform of platforms) {
+      const envPrefix = platform.toUpperCase();
+      const upstreamPrefix = `DRAFT_CONNECTOR_${envPrefix}_UPSTREAM`;
+      const expectedDraftEndpoint = `${upstream.baseUrl}/${platform}/drafts`;
+      const expectedStatusEndpoint = `${upstream.baseUrl}/${platform}/status`;
+      if (
+        env.get(`${envPrefix}_REAL_PUBLISH_ENABLED`) !== "true" ||
+        env.get(`${envPrefix}_DRAFT_INCLUDE_CREDENTIAL`) !== "true" ||
+        env.get(`${envPrefix}_STATUS_INCLUDE_CREDENTIAL`) !== "true" ||
+        env.get(`${upstreamPrefix}_DRAFT_ENDPOINT`) !== expectedDraftEndpoint ||
+        env.get(`${upstreamPrefix}_STATUS_ENDPOINT`) !== expectedStatusEndpoint ||
+        env.get(`${upstreamPrefix}_HEALTH_ENDPOINT`) !== `${upstream.baseUrl}/health` ||
+        env.get(`${upstreamPrefix}_INCLUDE_CREDENTIAL`) !== "true" ||
+        env.get(`${upstreamPrefix}_STATUS_INCLUDE_CREDENTIAL`) !== "true"
+      ) {
+        throw new Error(`Upstream enablement script wrote unexpected ${platform} config: ${JSON.stringify(Object.fromEntries(env))}`);
+      }
+
+      enabledPlatforms.push({
+        platform,
+        draftEndpoint: expectedDraftEndpoint,
+        statusEndpoint: expectedStatusEndpoint,
+      });
+    }
+
+    if (
+      env.get("DRAFT_CONNECTOR_BASE_URL") !== connectorBaseUrl ||
+      env.get("DRAFT_CONNECTOR_OUTBOX_DIR") !== "outbox" ||
+      env.get("DRAFT_CONNECTOR_UPSTREAM_API_KEY") !== "upstream-secret" ||
+      upstream.requests.length !== platforms.length ||
+      upstream.statusRequests.length !== platforms.length ||
+      upstream.requests.some((request) => !request.hasCredential) ||
+      upstream.statusRequests.some((request) => !request.hasCredential)
+    ) {
+      throw new Error(
+        `Upstream enablement script did not configure or check every platform: ${JSON.stringify({
+          env: Object.fromEntries(env),
+          draftRequests: upstream.requests,
+          statusRequests: upstream.statusRequests,
+        })}`,
+      );
+    }
+
+    return {
+      platforms: enabledPlatforms,
+      draftCredentialPlatforms: upstream.requests.map((request) => request.platform).sort(),
+      statusCredentialPlatforms: upstream.statusRequests.map((request) => request.platform).sort(),
+    };
+  } finally {
+    await upstream.close();
+    fs.rmSync(workspaceDir, { recursive: true, force: true });
   }
 }
 
@@ -3137,6 +3242,7 @@ const draftConnectorEnv = {
 const workspaceEnvCheck = await runDraftConnectorWorkspaceEnvCheck();
 const publicBaseRuntime = await runDraftConnectorPublicBaseRuntimeCheck();
 const upstreamContractCheck = await runUpstreamContractCheckScriptCheck();
+const upstreamProxyEnablement = await runUpstreamProxyEnablementCheck();
 const localEnablement = await runLocalDraftEnablementCheck();
 const disabledPreflight = await runDisabledDraftPreflightCheck();
 const workerConfigManualAction = await runWorkerDraftConfigManualActionCheck();
@@ -3565,6 +3671,7 @@ try {
     workspaceEnvCheck,
     publicBaseRuntime,
     upstreamContractCheck,
+    upstreamProxyEnablement,
     localEnablement,
     disabledPreflight,
     workerConfigManualAction,
