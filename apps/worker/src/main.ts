@@ -18,12 +18,20 @@ function createTimestamp() {
   return new Date().toISOString();
 }
 
-function isDraftConnectorExecutionIssue(issue: { code: string }) {
-  return issue.code.endsWith("_DRAFT_CONNECTOR_REJECTED") || issue.code.endsWith("_DRAFT_CONNECTOR_ERROR");
+const realDraftManualActionIssueSuffixes = [
+  "_REAL_DRAFT_UNSUPPORTED",
+  "_REAL_PUBLISH_DISABLED",
+  "_DRAFT_ENDPOINT_MISSING",
+  "_DRAFT_CONNECTOR_REJECTED",
+  "_DRAFT_CONNECTOR_ERROR",
+];
+
+function isRealDraftManualActionIssue(issue: { code: string }) {
+  return realDraftManualActionIssueSuffixes.some((suffix) => issue.code.endsWith(suffix));
 }
 
 function shouldHoldRealDraftForManualAction(mode: string, issues: Array<{ code: string }>) {
-  return mode === "real-publish" && issues.some(isDraftConnectorExecutionIssue);
+  return mode === "real-publish" && issues.some(isRealDraftManualActionIssue);
 }
 
 async function markWorkerWorking(taskId?: string) {
