@@ -764,6 +764,7 @@ async function runUpstreamSandboxCallbackCheck() {
   const outboxDir = path.join(runtimeDir, `draft-upstream-sandbox-callback-outbox-e2e-${Date.now()}`);
   const sandboxOutboxDir = path.join(runtimeDir, `draft-upstream-sandbox-callback-proxy-e2e-${Date.now()}`);
   const connectorApiKey = "draft-secret";
+  const connectorCallbackApiKey = "callback-secret";
   const sandboxApiKey = "sandbox-secret";
 
   apiBaseUrl = `http://127.0.0.1:${apiPort}`;
@@ -792,6 +793,7 @@ async function runUpstreamSandboxCallbackCheck() {
   const draftConnectorEnv = {
     PORT: String(connectorPort),
     DRAFT_CONNECTOR_API_KEY: connectorApiKey,
+    DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY: connectorCallbackApiKey,
     DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
     DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
     DRAFT_CONNECTOR_UPSTREAM_API_KEY: sandboxApiKey,
@@ -805,7 +807,8 @@ async function runUpstreamSandboxCallbackCheck() {
     DRAFT_UPSTREAM_SANDBOX_CALLBACK: "true",
     DRAFT_UPSTREAM_SANDBOX_CALLBACK_DELAY_MS: "100",
     DRAFT_UPSTREAM_SANDBOX_ASYNC_RESPONSE: "true",
-    DRAFT_CONNECTOR_API_KEY: connectorApiKey,
+    DRAFT_CONNECTOR_API_KEY: "",
+    DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY: connectorCallbackApiKey,
   });
   const api = startService("api-draft-upstream-sandbox-callback", ["apps/api/dist/main.js"], apiAndWorkerEnv);
   const { PORT: _apiPort, ...workerEnv } = apiAndWorkerEnv;
@@ -822,6 +825,27 @@ async function runUpstreamSandboxCallbackCheck() {
       })
     ) {
       throw new Error(`Draft connector did not see sandbox upstream services online: ${JSON.stringify(connectorHealth.upstreamDrafts)}`);
+    }
+
+    let callbackKeyDraftCreateRejected = false;
+    try {
+      await requestAbsoluteJson(`${connectorBaseUrl}/zhihu/drafts`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${connectorCallbackApiKey}`,
+        },
+        body: JSON.stringify({}),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!message.includes("401")) {
+        throw new Error(`Callback-only key failed draft creation with an unexpected response: ${message}`);
+      }
+      callbackKeyDraftCreateRejected = true;
+    }
+    if (!callbackKeyDraftCreateRejected) {
+      throw new Error("Callback-only key unexpectedly authorized connector draft creation.");
     }
 
     await waitForApi(api);
@@ -935,6 +959,7 @@ async function runUpstreamSandboxCallbackCheck() {
       taskId: created.id,
       initialStatus: task.status,
       finalStatus: syncedTask.status,
+      callbackKeyDraftCreateRejected,
       callbackDrafts,
       sandboxCallbacks: sandboxOutbox.items.map((item) => ({
         platform: item.platform,
@@ -3600,7 +3625,8 @@ try {
     platforms.some((platform) => !connectorContract.supportedPlatforms?.includes(platform)) ||
     !connectorContract.upstream?.draftEndpoint ||
     !connectorContract.upstream?.statusEndpoint ||
-    !connectorContract.upstream?.statusCallback
+    !connectorContract.upstream?.statusCallback ||
+    !connectorContract.upstream.statusCallback.relatedEnv?.includes("DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY")
   ) {
     throw new Error(`Draft connector upstream contract is incomplete: ${JSON.stringify(connectorContract)}`);
   }

@@ -21,7 +21,7 @@ Options:
   --initial-state <state>          Defaults to ready.
   --callback                       POST accepted draft status to connector.statusCallbackUrl.
   --callback-delay-ms <ms>         Delay callback delivery; defaults to 0.
-  --connector-api-key <key>        Bearer token for connector status callbacks.
+  --connector-api-key <key>        Bearer token for connector status callbacks; defaults to DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY then DRAFT_CONNECTOR_API_KEY.
   --async-response                 Return publishing without remoteId/url and rely on callback/status sync.
   --help`;
 
@@ -391,7 +391,7 @@ async function main() {
   const port = parsePort(readOption(args, "port", ["DRAFT_UPSTREAM_SANDBOX_PORT"]) ?? "3020");
   const outboxDir = resolveWorkspacePath(readOption(args, "outbox-dir", ["DRAFT_UPSTREAM_SANDBOX_OUTBOX_DIR"]) ?? ".runtime/draft-upstream-sandbox");
   const apiKey = readOption(args, "api-key", ["DRAFT_UPSTREAM_SANDBOX_API_KEY"]);
-  const connectorApiKey = readOption(args, "connector-api-key", ["DRAFT_CONNECTOR_API_KEY"]);
+  const connectorApiKey = readOption(args, "connector-api-key", ["DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY", "DRAFT_CONNECTOR_API_KEY"]);
   const initialState = normalizeState(readOption(args, "initial-state", ["DRAFT_UPSTREAM_SANDBOX_INITIAL_STATE"]) ?? "ready");
   const callbackEnabled = readBoolean(args, "callback", ["DRAFT_UPSTREAM_SANDBOX_CALLBACK"]);
   const callbackDelayMs = parseNonNegativeInteger(readOption(args, "callback-delay-ms", ["DRAFT_UPSTREAM_SANDBOX_CALLBACK_DELAY_MS"]) ?? "0", "--callback-delay-ms");

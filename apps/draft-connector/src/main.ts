@@ -379,6 +379,9 @@ function createUpstreamContract(request: IncomingMessage) {
       statusCallback: {
         endpoint: `${baseUrl}/:platform/drafts/:draftId/status`,
         method: "POST",
+        auth:
+          "Authorization: Bearer <callback or connector api key>. Uses DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY for upstream callbacks when configured; DRAFT_CONNECTOR_API_KEY remains accepted and is the fallback when no callback key is configured.",
+        relatedEnv: ["DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY", "DRAFT_CONNECTOR_API_KEY"],
         purpose:
           "External upstream workers can call this route after async creator-center automation creates or updates the real platform draft.",
         request: {
@@ -402,13 +405,31 @@ function createUpstreamContract(request: IncomingMessage) {
   };
 }
 
+function readSecretEnv(name: string) {
+  const value = process.env[name]?.trim();
+  return value ? value : undefined;
+}
+
+function hasBearerToken(request: IncomingMessage, apiKey: string | undefined) {
+  return Boolean(apiKey && request.headers.authorization === `Bearer ${apiKey}`);
+}
+
 function requireAuthorized(request: IncomingMessage) {
-  const apiKey = process.env.DRAFT_CONNECTOR_API_KEY?.trim();
+  const apiKey = readSecretEnv("DRAFT_CONNECTOR_API_KEY");
   if (!apiKey) {
     return true;
   }
 
-  return request.headers.authorization === `Bearer ${apiKey}`;
+  return hasBearerToken(request, apiKey);
+}
+
+function requireStatusCallbackAuthorized(request: IncomingMessage) {
+  const callbackApiKey = readSecretEnv("DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY");
+  if (!callbackApiKey) {
+    return requireAuthorized(request);
+  }
+
+  return hasBearerToken(request, callbackApiKey) || hasBearerToken(request, readSecretEnv("DRAFT_CONNECTOR_API_KEY"));
 }
 
 function parseRoute(url: string | undefined) {
@@ -1253,8 +1274,8 @@ async function handleCreateDraft(platform: string, request: IncomingMessage, res
 }
 
 async function handleUpdateDraftStatus(platform: string, draftId: string | undefined, request: IncomingMessage, response: ServerResponse) {
-  if (!requireAuthorized(request)) {
-    sendJson(response, 401, { ok: false, message: "Draft connector API key is invalid." });
+  if (!requireStatusCallbackAuthorized(request)) {
+    sendJson(response, 401, { ok: false, message: "Draft connector status callback API key is invalid." });
     return;
   }
 
