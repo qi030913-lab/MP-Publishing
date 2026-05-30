@@ -63,9 +63,19 @@ export type PublishTaskRecord = {
   targets: PublishTaskTargetRecord[];
 };
 
+export type WorkerRuntimeStatus = {
+  name: string;
+  status: "idle" | "working" | "offline";
+  lastHeartbeatAt?: string;
+  lastProcessedTaskId?: string;
+  currentTaskId?: string;
+  processedCount: number;
+};
+
 type RuntimeState = {
   accounts: PlatformAccountRecord[];
   tasks: PublishTaskRecord[];
+  worker: WorkerRuntimeStatus;
 };
 
 const defaultAccounts: PlatformAccountRecord[] = [
@@ -107,6 +117,14 @@ const defaultAccounts: PlatformAccountRecord[] = [
   },
 ];
 
+function createDefaultWorkerState(): WorkerRuntimeStatus {
+  return {
+    name: "publish-worker",
+    status: "offline",
+    processedCount: 0,
+  };
+}
+
 function findWorkspaceRoot(startDir: string) {
   let currentDir = startDir;
 
@@ -137,6 +155,20 @@ function createDefaultState(): RuntimeState {
   return {
     accounts: cloneState(defaultAccounts),
     tasks: [],
+    worker: createDefaultWorkerState(),
+  };
+}
+
+function normalizeRuntimeState(input: Partial<RuntimeState> | null | undefined): RuntimeState {
+  const fallback = createDefaultState();
+
+  return {
+    accounts: Array.isArray(input?.accounts) ? input.accounts : fallback.accounts,
+    tasks: Array.isArray(input?.tasks) ? input.tasks : fallback.tasks,
+    worker: {
+      ...fallback.worker,
+      ...(input?.worker ?? {}),
+    },
   };
 }
 
@@ -149,7 +181,7 @@ export async function loadRuntimeState() {
 
   try {
     const raw = await readFile(stateFilePath, "utf8");
-    return JSON.parse(raw) as RuntimeState;
+    return normalizeRuntimeState(JSON.parse(raw) as Partial<RuntimeState>);
   } catch {
     const initialState = createDefaultState();
     await saveRuntimeState(initialState);
@@ -198,6 +230,23 @@ export async function listTasks() {
   return state.tasks;
 }
 
+export async function getWorkerStatus() {
+  const state = await loadRuntimeState();
+  return state.worker;
+}
+
+export async function updateWorkerStatus(
+  patch: Partial<WorkerRuntimeStatus>,
+) {
+  const state = await loadRuntimeState();
+  state.worker = {
+    ...state.worker,
+    ...patch,
+  };
+  await saveRuntimeState(state);
+  return state.worker;
+}
+
 export async function findTaskById(taskId: string) {
   const state = await loadRuntimeState();
   return state.tasks.find((task) => task.id === taskId) ?? null;
@@ -233,4 +282,41 @@ export async function replaceTasks(tasks: PublishTaskRecord[]) {
   state.tasks = tasks;
   await saveRuntimeState(state);
   return tasks;
+}
+
+export async function getRuntimeStats() {
+  const state = await loadRuntimeState();
+  const queuedCount = state.tasks.reduce(
+    (count, task) => count + task.targets.filter((target) => target.status === "queued").length,
+    0,
+  );
+  const runningCount = state.tasks.reduce(
+    (count, task) => count + task.targets.filter((target) => target.status === "running").length,
+    0,
+  );
+  const needsRetryCount = state.tasks.reduce(
+    (count, task) => count + task.targets.filter((target) => target.status === "needs_retry").length,
+    0,
+  );
+  const manualActionCount = state.tasks.reduce(
+    (count, task) =>
+      count + task.targets.filter((target) => target.status === "needs_manual_action").length,
+    0,
+  );
+  const succeededCount = state.tasks.reduce(
+    (count, task) => count + task.targets.filter((target) => target.status === "succeeded").length,
+    0,
+  );
+
+  return {
+    worker: state.worker,
+    tasks: {
+      total: state.tasks.length,
+      queuedCount,
+      runningCount,
+      needsRetryCount,
+      manualActionCount,
+      succeededCount,
+    },
+  };
 }

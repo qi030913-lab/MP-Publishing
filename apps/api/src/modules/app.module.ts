@@ -8,6 +8,8 @@ import { PublishController } from "./publish.controller.js";
 import { PublishService } from "./publish.service.js";
 import { PreviewController } from "./preview.controller.js";
 import { PreviewService } from "./preview.service.js";
+import { RuntimeController } from "./runtime.controller.js";
+import { RuntimeService } from "./runtime.service.js";
 
 @Module({
   controllers: [
@@ -16,7 +18,8 @@ import { PreviewService } from "./preview.service.js";
     PlatformController,
     PreviewController,
     PublishController,
+    RuntimeController,
   ],
-  providers: [AccountService, PreviewService, PublishService],
+  providers: [AccountService, PreviewService, PublishService, RuntimeService],
 })
 export class AppModule {}

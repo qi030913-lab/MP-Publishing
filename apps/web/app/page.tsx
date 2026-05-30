@@ -12,7 +12,9 @@ import {
   LayoutTemplate,
   ListRestart,
   LoaderCircle,
+  MonitorSmartphone,
   MessageSquare,
+  Orbit,
   Radio,
   RefreshCcw,
   ScrollText,
@@ -110,6 +112,25 @@ type AccountSummary = {
   healthy: number;
   expiring: number;
   needsLogin: number;
+};
+
+type RuntimeStatus = {
+  worker: {
+    name: string;
+    status: "idle" | "working" | "offline";
+    lastHeartbeatAt?: string;
+    lastProcessedTaskId?: string;
+    currentTaskId?: string;
+    processedCount: number;
+  };
+  tasks: {
+    total: number;
+    queuedCount: number;
+    runningCount: number;
+    needsRetryCount: number;
+    manualActionCount: number;
+    succeededCount: number;
+  };
 };
 
 const platformMeta: Record<
@@ -223,6 +244,30 @@ function taskStatusLabel(status: PublishTaskDetail["status"]) {
   return "部分完成";
 }
 
+function workerStatusLabel(status: RuntimeStatus["worker"]["status"]) {
+  if (status === "working") return "执行中";
+  if (status === "idle") return "空闲";
+  return "离线";
+}
+
+function createRuntimeFallback(): RuntimeStatus {
+  return {
+    worker: {
+      name: "publish-worker",
+      status: "offline",
+      processedCount: 0,
+    },
+    tasks: {
+      total: 0,
+      queuedCount: 0,
+      runningCount: 0,
+      needsRetryCount: 0,
+      manualActionCount: 0,
+      succeededCount: 0,
+    },
+  };
+}
+
 function EmptyPreview() {
   return (
     <div className="empty-state">
@@ -270,10 +315,12 @@ export default function HomePage() {
   const [selectedAccountIds, setSelectedAccountIds] = useState<string[]>([]);
   const [taskSummaries, setTaskSummaries] = useState<PublishTaskSummary[]>([]);
   const [activeTask, setActiveTask] = useState<PublishTaskDetail | null>(null);
+  const [runtimeStatus, setRuntimeStatus] = useState<RuntimeStatus | null>(null);
   const [isPreviewLoading, setIsPreviewLoading] = useState(false);
   const [isSimulationLoading, setIsSimulationLoading] = useState(false);
   const [isMockPublishLoading, setIsMockPublishLoading] = useState(false);
   const [isTasksLoading, setIsTasksLoading] = useState(false);
+  const [isRuntimeLoading, setIsRuntimeLoading] = useState(false);
   const [isRetryingTaskId, setIsRetryingTaskId] = useState<string | null>(null);
   const [isAccountActionLoading, setIsAccountActionLoading] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -290,6 +337,7 @@ export default function HomePage() {
   });
 
   const body = useMemo(() => extractPlainText(editor?.getHTML() ?? ""), [editor]);
+  const runtimeSnapshot = runtimeStatus ?? createRuntimeFallback();
   const activePreview = previewResults.find((item) => item.platform === activePlatform);
   const currentCapability = capabilities.find((item) => item.platform === activePlatform);
   const selectedAccounts = accounts.filter((account) => selectedAccountIds.includes(account.id));
@@ -316,6 +364,20 @@ export default function HomePage() {
       setError("任务中心刷新失败，请确认 API 服务可用后重试。");
     } finally {
       setIsTasksLoading(false);
+    }
+  }
+
+  async function refreshRuntimeStatus() {
+    setIsRuntimeLoading(true);
+
+    try {
+      const response = await fetch("http://localhost:3001/runtime/status");
+      const payload = (await response.json()) as RuntimeStatus;
+      setRuntimeStatus(payload);
+    } catch {
+      setError("运行监控刷新失败，请确认 worker 与 API 服务可用。");
+    } finally {
+      setIsRuntimeLoading(false);
     }
   }
 
@@ -351,7 +413,7 @@ export default function HomePage() {
         setAccounts(accountPayload.items);
         setAccountSummary(accountPayload.summary);
         setSelectedAccountIds(accountPayload.items.map((item) => item.id));
-        await refreshTasks();
+        await Promise.all([refreshTasks(), refreshRuntimeStatus()]);
       } catch {
         setError("无法连接到本地 API，请确认 http://localhost:3001 已启动。");
       }
@@ -379,6 +441,14 @@ export default function HomePage() {
 
     return () => window.clearInterval(timer);
   }, [activeTask]);
+
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      void refreshRuntimeStatus();
+    }, 3000);
+
+    return () => window.clearInterval(timer);
+  }, []);
 
   async function openTask(taskId: string) {
     try {
@@ -964,11 +1034,92 @@ export default function HomePage() {
                 <p className="section-kicker">Step 3</p>
                 <h2>发布任务中心</h2>
               </div>
-              <button type="button" className="secondary-button compact-button" onClick={() => refreshTasks()} disabled={isTasksLoading}>
-                <History size={16} />
-                {isTasksLoading ? "刷新中..." : "刷新任务"}
-              </button>
+              <div className="task-toolbar">
+                <button
+                  type="button"
+                  className="secondary-button compact-button"
+                  onClick={() => void refreshRuntimeStatus()}
+                  disabled={isRuntimeLoading}
+                >
+                  <Orbit size={16} />
+                  {isRuntimeLoading ? "监控刷新中..." : "刷新监控"}
+                </button>
+                <button
+                  type="button"
+                  className="secondary-button compact-button"
+                  onClick={() => refreshTasks()}
+                  disabled={isTasksLoading}
+                >
+                  <History size={16} />
+                  {isTasksLoading ? "刷新中..." : "刷新任务"}
+                </button>
+              </div>
             </div>
+
+            {runtimeStatus ? (
+              <div className="runtime-panel">
+                <div className="runtime-head">
+                  <div>
+                    <p className="section-kicker">Runtime</p>
+                    <h3>Worker 运行监控</h3>
+                  </div>
+                  <div className={`status-pill ${runtimeSnapshot.worker.status === "offline" ? "warning" : "success"}`}>
+                    <MonitorSmartphone size={16} />
+                    {workerStatusLabel(runtimeSnapshot.worker.status)}
+                  </div>
+                </div>
+
+                <div className="runtime-summary-grid">
+                  <div className="metric-tile">
+                    <span>任务总数</span>
+                    <strong>{runtimeSnapshot.tasks.total}</strong>
+                  </div>
+                  <div className="metric-tile">
+                    <span>排队中</span>
+                    <strong>{runtimeSnapshot.tasks.queuedCount}</strong>
+                  </div>
+                  <div className="metric-tile">
+                    <span>执行中</span>
+                    <strong>{runtimeSnapshot.tasks.runningCount}</strong>
+                  </div>
+                  <div className="metric-tile">
+                    <span>待重试</span>
+                    <strong>{runtimeSnapshot.tasks.needsRetryCount}</strong>
+                  </div>
+                  <div className="metric-tile">
+                    <span>待人工处理</span>
+                    <strong>{runtimeSnapshot.tasks.manualActionCount}</strong>
+                  </div>
+                  <div className="metric-tile">
+                    <span>累计完成</span>
+                    <strong>{runtimeSnapshot.tasks.succeededCount}</strong>
+                  </div>
+                </div>
+
+                <div className="runtime-meta-grid">
+                  <div>
+                    <span className="meta-label">最近心跳</span>
+                    <strong>
+                      {runtimeSnapshot.worker.lastHeartbeatAt
+                        ? new Date(runtimeSnapshot.worker.lastHeartbeatAt).toLocaleTimeString("zh-CN")
+                        : "未上报"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span className="meta-label">当前任务</span>
+                    <strong>{runtimeSnapshot.worker.currentTaskId ?? "无"}</strong>
+                  </div>
+                  <div>
+                    <span className="meta-label">最近处理</span>
+                    <strong>{runtimeSnapshot.worker.lastProcessedTaskId ?? "暂无"}</strong>
+                  </div>
+                  <div>
+                    <span className="meta-label">心跳计数</span>
+                    <strong>{runtimeSnapshot.worker.processedCount}</strong>
+                  </div>
+                </div>
+              </div>
+            ) : null}
 
             {activeTask ? (
               <div className="task-overview">
@@ -1219,11 +1370,18 @@ export default function HomePage() {
         .preview-card-header,
         .report-card-head,
         .task-header,
-        .list-header {
+        .list-header,
+        .runtime-head {
           display: flex;
           justify-content: space-between;
           gap: 16px;
           align-items: flex-start;
+        }
+
+        .task-toolbar {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 12px;
         }
 
         .status-pill,
@@ -1611,10 +1769,37 @@ export default function HomePage() {
         }
 
         .preview-card,
-        .task-overview {
+        .task-overview,
+        .runtime-panel {
           display: grid;
           gap: 22px;
           padding-top: 22px;
+        }
+
+        .runtime-head h3 {
+          margin: 0;
+          font-size: 20px;
+        }
+
+        .runtime-summary-grid {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 12px;
+        }
+
+        .runtime-meta-grid {
+          display: grid;
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+          gap: 12px;
+        }
+
+        .runtime-meta-grid > div {
+          padding: 16px;
+          border-radius: 8px;
+          background: rgba(2, 6, 23, 0.34);
+          border: 1px solid rgba(148, 163, 184, 0.14);
+          display: grid;
+          gap: 8px;
         }
 
         .preview-card-header h3 {
@@ -1773,7 +1958,9 @@ export default function HomePage() {
           .field-grid,
           .platform-grid,
           .meta-grid,
-          .account-summary-grid {
+          .account-summary-grid,
+          .runtime-summary-grid,
+          .runtime-meta-grid {
             grid-template-columns: 1fr;
           }
 

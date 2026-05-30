@@ -1,10 +1,12 @@
 import {
+  getWorkerStatus,
   listAccounts,
   listTasks,
   type PublishTaskLog,
   type PublishTaskRecord,
   type PublishTaskTargetRecord,
   upsertTask,
+  updateWorkerStatus,
 } from "@mp-publishing/task-runtime";
 
 const tickIntervalMs = 1200;
@@ -110,12 +112,58 @@ async function processTask(task: PublishTaskRecord) {
 
 async function workOnce() {
   const tasks = await listTasks();
+  let handledTaskId: string | undefined;
+  let workerStatus: "idle" | "working" = "idle";
+
   for (const task of tasks) {
-    await processTask(task);
+    const hasActiveTarget = task.targets.some(
+      (target) => target.status === "queued" || target.status === "running",
+    );
+
+    if (hasActiveTarget) {
+      workerStatus = "working";
+      handledTaskId = task.id;
+    }
+
+    const changed = await processTask(task);
+    if (changed) {
+      handledTaskId = task.id;
+    }
   }
+
+  const currentWorker = await getWorkerStatus();
+  await updateWorkerStatus({
+    status: workerStatus,
+    lastHeartbeatAt: createTimestamp(),
+    currentTaskId: workerStatus === "working" ? handledTaskId : undefined,
+    lastProcessedTaskId: handledTaskId ?? currentWorker.lastProcessedTaskId,
+    processedCount: handledTaskId ? currentWorker.processedCount + 1 : currentWorker.processedCount,
+  });
+}
+
+async function markWorkerOffline() {
+  await updateWorkerStatus({
+    status: "offline",
+    currentTaskId: undefined,
+    lastHeartbeatAt: createTimestamp(),
+  });
+}
+
+function registerShutdownHooks() {
+  const shutdown = () => {
+    void markWorkerOffline().finally(() => process.exit(0));
+  };
+
+  process.once("SIGINT", shutdown);
+  process.once("SIGTERM", shutdown);
 }
 
 async function bootstrap() {
+  registerShutdownHooks();
+  await updateWorkerStatus({
+    status: "idle",
+    lastHeartbeatAt: createTimestamp(),
+  });
   console.log("worker bootstrap");
   await workOnce();
   setInterval(() => {
