@@ -167,6 +167,23 @@ async function startFakeUpstreamDraftService(port, expectedApiKey) {
   const requests = [];
   const statusRequests = [];
   const baseUrl = `http://127.0.0.1:${port}`;
+
+  function summarizeCredential(credential) {
+    if (!credential || typeof credential !== "object") {
+      return null;
+    }
+
+    return {
+      platform: credential.platform,
+      accountId: credential.accountId,
+      authMode: credential.authMode,
+      credentialRef: credential.credentialRef,
+      hasAccessToken: Boolean(credential.accessToken),
+      hasCookies: Boolean(credential.cookies),
+      hasStorageStateJson: Boolean(credential.storageStateJson),
+    };
+  }
+
   const server = createServer((request, response) => {
     void (async () => {
       const pathname = new URL(request.url ?? "/", baseUrl).pathname;
@@ -213,6 +230,7 @@ async function startFakeUpstreamDraftService(port, expectedApiKey) {
           remoteId,
           accountId: payload.accountId,
           hasCredential: Boolean(payload.credential),
+          credential: summarizeCredential(payload.credential),
         });
         response.writeHead(200, { "content-type": "application/json" });
         response.end(
@@ -243,6 +261,7 @@ async function startFakeUpstreamDraftService(port, expectedApiKey) {
         statusCallbackUrl: payload.connector.statusCallbackUrl,
         title: payload.draft.title,
         hasCredential: Boolean(payload.credential),
+        credential: summarizeCredential(payload.credential),
       });
       response.writeHead(200, { "content-type": "application/json" });
       response.end(
@@ -1277,6 +1296,183 @@ async function runUpstreamDraftForwardingCheck() {
   }
 }
 
+async function runCredentialForwardingCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const upstreamPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const apiPort = await getFreePort();
+  const upstream = await startFakeUpstreamDraftService(upstreamPort, "credential-upstream-secret");
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const outboxDir = path.join(runtimeDir, `draft-connector-credential-e2e-${Date.now()}`);
+  const queueName = `mp-publishing-draft-credential-e2e-${Date.now()}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+  const expectedCredentials = {
+    zhihu: { accountId: "acct_zhihu_main", authMode: "official-api", credentialRef: "env:ZHIHU", hasAccessToken: true },
+    bilibili: { accountId: "acct_bilibili_main", authMode: "hybrid", credentialRef: "env:BILIBILI", hasCookies: true },
+    xiaohongshu: {
+      accountId: "acct_xhs_main",
+      authMode: "hybrid",
+      credentialRef: "env:XIAOHONGSHU",
+      hasStorageStateJson: true,
+    },
+  };
+
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+
+  const connectorEnv = {
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+    ZHIHU_DRAFT_INCLUDE_CREDENTIAL: "true",
+    BILIBILI_DRAFT_INCLUDE_CREDENTIAL: "true",
+    XIAOHONGSHU_DRAFT_INCLUDE_CREDENTIAL: "true",
+    ZHIHU_STATUS_INCLUDE_CREDENTIAL: "true",
+    BILIBILI_STATUS_INCLUDE_CREDENTIAL: "true",
+    XIAOHONGSHU_STATUS_INCLUDE_CREDENTIAL: "true",
+    ZHIHU_ACCESS_TOKEN: "zhihu-e2e-token",
+    BILIBILI_COOKIES: "SESSDATA=bilibili-e2e-cookie",
+    XIAOHONGSHU_STORAGE_STATE_JSON: "{\"cookies\":[{\"name\":\"xhs\",\"value\":\"e2e\"}]}",
+  };
+  const draftConnectorEnv = {
+    PORT: String(connectorPort),
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_UPSTREAM_API_KEY: "credential-upstream-secret",
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/zhihu/drafts`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_STATUS_ENDPOINT: `${upstream.baseUrl}/zhihu/status`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_INCLUDE_CREDENTIAL: "true",
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_STATUS_INCLUDE_CREDENTIAL: "true",
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/bilibili/drafts`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_STATUS_ENDPOINT: `${upstream.baseUrl}/bilibili/status`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_INCLUDE_CREDENTIAL: "true",
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_STATUS_INCLUDE_CREDENTIAL: "true",
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/xiaohongshu/drafts`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_STATUS_ENDPOINT: `${upstream.baseUrl}/xiaohongshu/status`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_INCLUDE_CREDENTIAL: "true",
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_STATUS_INCLUDE_CREDENTIAL: "true",
+  };
+
+  const api = startService("api-draft-credential", ["apps/api/dist/main.js"], connectorEnv);
+  const worker = startService("worker-draft-credential", ["apps/worker/dist/main.js"], connectorEnv);
+  const draftConnector = startService("draft-connector-credential", ["apps/draft-connector/dist/main.js"], draftConnectorEnv);
+
+  function assertCredential(platform, credential, context) {
+    const expected = expectedCredentials[platform];
+    if (
+      !credential ||
+      credential.platform !== platform ||
+      credential.accountId !== expected.accountId ||
+      credential.authMode !== expected.authMode ||
+      credential.credentialRef !== expected.credentialRef ||
+      Boolean(credential.hasAccessToken) !== Boolean(expected.hasAccessToken) ||
+      Boolean(credential.hasCookies) !== Boolean(expected.hasCookies) ||
+      Boolean(credential.hasStorageStateJson) !== Boolean(expected.hasStorageStateJson)
+    ) {
+      throw new Error(`Credential forwarding mismatch for ${platform} ${context}: ${JSON.stringify(credential)}`);
+    }
+  }
+
+  try {
+    await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector credential forwarding");
+    await waitForApi(api);
+    await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
+
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length || accounts.some((account) => account.credentialStatus !== "configured")) {
+      throw new Error(`Credential forwarding accounts were not configured: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "三平台凭证转发草稿验证",
+          summary: "验证显式开启后，平台凭证可以穿过 connector 到达上游草稿服务。",
+          body: "这条内容用于确认官方 API 代理或自动化服务需要凭证时，草稿链路可以转发凭证，同时本地 outbox 不持久化凭证。",
+          tags: ["draft", "credential", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+
+    let task = created;
+    for (let i = 0; i < 50; i += 1) {
+      await delay(600);
+      task = await requestJson(`/publish/tasks/${created.id}`);
+      if (!["running", "queued"].includes(task.status)) {
+        break;
+      }
+    }
+
+    if (task.status !== "succeeded") {
+      throw new Error(`Credential forwarding task did not succeed: ${task.status} ${JSON.stringify(task.results)}`);
+    }
+
+    if (upstream.requests.length !== platforms.length) {
+      throw new Error(`Credential forwarding upstream did not receive every draft: ${JSON.stringify(upstream.requests)}`);
+    }
+
+    for (const request of upstream.requests) {
+      assertCredential(request.platform, request.credential, "draft request");
+      const detail = await requestAbsoluteJson(request.connectorDraftUrl);
+      if (detail.payload?.credential) {
+        throw new Error(`Credential was persisted in outbox payload for ${request.platform}: ${JSON.stringify(detail)}`);
+      }
+    }
+
+    const syncedTask = await requestJson(`/publish/tasks/${created.id}/sync`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({}),
+    });
+
+    if (syncedTask.status !== "succeeded") {
+      throw new Error(`Credential forwarding sync did not preserve succeeded status: ${JSON.stringify(syncedTask)}`);
+    }
+
+    if (upstream.statusRequests.length !== platforms.length) {
+      throw new Error(`Credential forwarding upstream did not receive every status query: ${JSON.stringify(upstream.statusRequests)}`);
+    }
+
+    for (const statusRequest of upstream.statusRequests) {
+      assertCredential(statusRequest.platform, statusRequest.credential, "status request");
+      const detail = await requestAbsoluteJson(statusRequest.connectorDraftUrl);
+      if (detail.payload?.credential) {
+        throw new Error(`Credential was persisted after status sync for ${statusRequest.platform}: ${JSON.stringify(detail)}`);
+      }
+    }
+
+    return {
+      taskId: created.id,
+      finalStatus: syncedTask.status,
+      draftCredentialPlatforms: upstream.requests.map((request) => request.platform).sort(),
+      statusCredentialPlatforms: upstream.statusRequests.map((request) => request.platform).sort(),
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector)]);
+    await upstream.close();
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 ensureBuildOutput();
 
 const connectorPort = await getFreePort();
@@ -1308,6 +1504,7 @@ const offlinePreflight = await runOfflineDraftConnectorPreflightCheck();
 const offlineUpstreamPreflight = await runOfflineUpstreamDraftPreflightCheck();
 const offlineUpstreamRecovery = await runOfflineUpstreamDraftRecoveryCheck();
 const upstreamForwarding = await runUpstreamDraftForwardingCheck();
+const credentialForwarding = await runCredentialForwardingCheck();
 
 const api = startService("api", ["apps/api/dist/main.js"], connectorEnv);
 const worker = startService("worker", ["apps/worker/dist/main.js"], connectorEnv);
@@ -1573,6 +1770,7 @@ try {
     offlineUpstreamPreflight,
     offlineUpstreamRecovery,
     upstreamForwarding,
+    credentialForwarding,
     queue: runtime.queue,
   };
 
