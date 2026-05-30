@@ -21,6 +21,7 @@ import {
 } from "../components/ui";
 
 type FilterMode = "all" | "running" | "attention" | "succeeded";
+type DraftConnectorPlatformRuntime = RuntimeStatus["draftConnector"]["platforms"][number];
 
 function matchesFilter(task: PublishTaskSummary, filter: FilterMode) {
   if (filter === "all") return true;
@@ -83,6 +84,39 @@ function resultLinkLabel(url: string, mode: PublishTaskDetail["mode"]) {
   return "打开发布结果";
 }
 
+function connectorStatusLabel(status: RuntimeStatus["draftConnector"]["status"]) {
+  if (status === "online") return "连接器在线";
+  if (status === "configured") return "端点已配置";
+  if (status === "offline") return "连接器离线";
+  return "未配置";
+}
+
+function formatOutboxSummary(summary: DraftConnectorPlatformRuntime["outbox"]) {
+  if (!summary) {
+    return null;
+  }
+
+  const byState = summary.byState ?? {};
+  const parts = [`${summary.total ?? 0} 个草稿`];
+  if (byState.publishing) {
+    parts.push(`${byState.publishing} 发布中`);
+  }
+  if (byState.ready) {
+    parts.push(`${byState.ready} 已就绪`);
+  }
+  if (byState.needs_manual_action) {
+    parts.push(`${byState.needs_manual_action} 待处理`);
+  }
+  if (summary.externalizedCount) {
+    parts.push(`${summary.externalizedCount} 外部草稿`);
+  }
+  if (summary.stalePublishingCount) {
+    parts.push(`${summary.stalePublishingCount} 可恢复`);
+  }
+
+  return parts.join(" / ");
+}
+
 export default function TasksPage() {
   const [tasks, setTasks] = useState<PublishTaskSummary[]>([]);
   const [activeTask, setActiveTask] = useState<PublishTaskDetail | null>(null);
@@ -93,6 +127,9 @@ export default function TasksPage() {
   const [retryingKey, setRetryingKey] = useState<string | null>(null);
   const [syncingKey, setSyncingKey] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const draftConnectorOutboxTotal =
+    runtime.draftConnector.outbox?.total ??
+    runtime.draftConnector.platforms.reduce((total, platformStatus) => total + (platformStatus.outbox?.total ?? 0), 0);
 
   const filteredTasks = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -229,6 +266,38 @@ export default function TasksPage() {
             <strong>{runtime.worker.processedCount}</strong>
           </div>
         </div>
+        <div className="runtime-grid" style={{ marginTop: 12 }}>
+          <div className="capability-item">
+            <span>Draft connector</span>
+            <strong>{connectorStatusLabel(runtime.draftConnector.status)}</strong>
+          </div>
+          <div className="capability-item">
+            <span>草稿收件箱</span>
+            <strong>{draftConnectorOutboxTotal}</strong>
+          </div>
+          <div className="capability-item">
+            <span>连接器说明</span>
+            <strong>{runtime.draftConnector.detail}</strong>
+          </div>
+          {runtime.draftConnector.outboxUrl ? (
+            <div className="capability-item">
+              <span>Outbox</span>
+              <a className="secondary-button compact" href={runtime.draftConnector.outboxUrl} target="_blank" rel="noreferrer">
+                打开草稿收件箱
+              </a>
+            </div>
+          ) : null}
+        </div>
+        {runtime.draftConnector.platforms.length > 0 ? (
+          <div className="runtime-grid" style={{ marginTop: 12 }}>
+            {runtime.draftConnector.platforms.map((platformStatus) => (
+              <div key={platformStatus.platform} className="capability-item">
+                <span>{platformLabel(platformStatus.platform)} 草稿</span>
+                <strong>{formatOutboxSummary(platformStatus.outbox) ?? "暂无草稿"}</strong>
+              </div>
+            ))}
+          </div>
+        ) : null}
       </section>
 
       {tasks.length === 0 ? (
