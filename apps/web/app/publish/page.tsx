@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { PlayCircle, RadioTower, Rocket, ShieldCheck } from "lucide-react";
+import { PlayCircle, RadioTower, RefreshCcw, Rocket, ShieldCheck } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useMemo, useState } from "react";
 
@@ -101,6 +101,7 @@ export default function PublishPage() {
   const [isSimulating, setIsSimulating] = useState(false);
   const [isPublishing, setIsPublishing] = useState(false);
   const [isRealPublishing, setIsRealPublishing] = useState(false);
+  const [isRefreshingStatus, setIsRefreshingStatus] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const selectedAccounts = useMemo(
@@ -131,14 +132,27 @@ export default function PublishPage() {
     const storedDraft = loadDraft();
     setDraft(storedDraft);
 
-    void Promise.all([listAccounts(), getRuntimeStatus()])
-      .then(([payload, runtimePayload]) => {
-        setAccounts(payload.items);
-        setSelectedAccountIds(payload.items.map((account) => account.id));
-        setRuntime(runtimePayload);
-      })
-      .catch(() => setError("读取发布运行状态失败，请确认 API 服务已经启动。"));
+    void refreshPublishContext(true);
   }, []);
+
+  async function refreshPublishContext(selectAllAccounts = false) {
+    setIsRefreshingStatus(true);
+    setError(null);
+
+    try {
+      const [payload, runtimePayload] = await Promise.all([listAccounts(), getRuntimeStatus()]);
+      const availableAccountIds = new Set(payload.items.map((account) => account.id));
+      setAccounts(payload.items);
+      setSelectedAccountIds((current) =>
+        selectAllAccounts ? payload.items.map((account) => account.id) : current.filter((id) => availableAccountIds.has(id)),
+      );
+      setRuntime(runtimePayload);
+    } catch {
+      setError("读取发布运行状态失败，请确认 API 服务已经启动。");
+    } finally {
+      setIsRefreshingStatus(false);
+    }
+  }
 
   function toggleAccount(accountId: string) {
     setSelectedAccountIds((current) =>
@@ -274,11 +288,17 @@ export default function PublishPage() {
                     {runtime?.draftConnector.detail ?? "正在读取连接器状态。"}
                   </p>
                 </div>
-                {runtime?.draftConnector ? (
-                  <StatusBadge tone={connectorTone(runtime.draftConnector.status)}>
-                    {connectorLabel(runtime.draftConnector.status)}
-                  </StatusBadge>
-                ) : null}
+                <div className="button-row">
+                  {runtime?.draftConnector ? (
+                    <StatusBadge tone={connectorTone(runtime.draftConnector.status)}>
+                      {connectorLabel(runtime.draftConnector.status)}
+                    </StatusBadge>
+                  ) : null}
+                  <button className="secondary-button compact" type="button" onClick={() => refreshPublishContext()} disabled={isRefreshingStatus}>
+                    {isRefreshingStatus ? <LoadingInline label="刷新中" /> : <RefreshCcw size={16} />}
+                    刷新状态
+                  </button>
+                </div>
               </div>
               <div className="issue-list">
                 {runtime?.draftConnector.platforms.map((platformStatus) => {
