@@ -322,7 +322,7 @@ export class PublishService {
             mode === "simulate"
               ? `已创建 ${platform} 模拟发布任务。`
               : mode === "real-publish"
-                ? `已创建 ${platform} 真实发布任务。`
+                ? `已创建 ${platform} 真实草稿任务。`
                 : `已创建 ${platform} mock 发布任务。`,
           ),
           this.createLog("info", `${platform} 等待 BullMQ worker 执行。`),
@@ -367,7 +367,7 @@ export class PublishService {
           mode === "simulate"
             ? "已创建模拟发布任务。"
             : mode === "real-publish"
-              ? "已创建真实平台发布任务。"
+              ? "已创建真实草稿任务。"
               : "已创建 mock 一键发布任务。",
         ),
         ...targets.map((target) =>

@@ -72,7 +72,7 @@ function runtimeFallback(): RuntimeStatus {
 
 function taskModeLabel(mode: PublishTaskSummary["mode"] | PublishTaskDetail["mode"]) {
   if (mode === "simulate") return "模拟发布";
-  if (mode === "real-publish") return "真实发布";
+  if (mode === "real-publish") return "真实草稿";
   return "mock 发布";
 }
 

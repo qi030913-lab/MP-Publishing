@@ -164,7 +164,7 @@ export default function PublishPage() {
       <PageHeader
         kicker="Publish"
         title="发布确认"
-        description="发布前确认目标平台、账号健康状态和执行模式。真实发布默认进入平台草稿或连接器草稿，不会越过平台最终确认。"
+        description="发布前确认目标平台、账号健康状态和执行模式。真实草稿默认进入平台草稿或连接器草稿，不会越过平台最终确认。"
         actions={
           <>
             <button className="secondary-button" type="button" onClick={() => submit("simulate")} disabled={isSimulating}>
