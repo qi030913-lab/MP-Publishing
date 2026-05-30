@@ -977,6 +977,162 @@ export async function createDraft({ platform, workOrder, runner, platformSession
   }
 }
 
+async function runDraftAutomationDirectUpstreamCheck() {
+  const automationPort = await getFreePort();
+  const automationBaseUrl = `http://127.0.0.1:${automationPort}`;
+  const automationDir = path.join(runtimeDir, `draft-automation-direct-upstream-e2e-${Date.now()}`);
+  const outboxDir = path.join(automationDir, "outbox");
+  const handlerPath = path.join(automationDir, "handler.mjs");
+  const apiKey = "automation-secret";
+  fs.rmSync(automationDir, { recursive: true, force: true });
+  fs.mkdirSync(automationDir, { recursive: true });
+  fs.writeFileSync(
+    handlerPath,
+    `
+export async function createDraft({ platform, workOrder, runner, platformSession, sessionSummary }) {
+  if (
+    platform !== "zhihu" ||
+    workOrder.version !== "draft-upstream-work-order-v1" ||
+    workOrder.remoteId !== "zhihu-draft-direct-upstream-check" ||
+    workOrder.connector?.draftId !== "zhihu-draft-direct-upstream-check" ||
+    workOrder.credential?.summary?.hasAccessToken !== true ||
+    workOrder.credential?.summary?.hasCookies !== true ||
+    workOrder.credential?.summary?.hasStorageStateJson !== true ||
+    workOrder.credential?.summary?.accessToken ||
+    runner.source !== "draft-connector-upstream-v1" ||
+    !platformSession?.cookies ||
+    !sessionSummary?.hasCookies
+  ) {
+    throw new Error("handler received an incomplete direct upstream work order");
+  }
+
+  return {
+    ok: true,
+    remoteId: "zhihu-real-" + workOrder.connector.draftId,
+    url: "https://creator.zhihu.example.test/drafts/" + workOrder.connector.draftId,
+    state: "ready",
+    detail: platform + " direct upstream draft saved",
+  };
+}
+`.trim(),
+    "utf8",
+  );
+
+  const automation = startService("draft-automation-direct-upstream-check", ["scripts/start-draft-automation-service.mjs"], {
+    DRAFT_AUTOMATION_SERVICE_PORT: String(automationPort),
+    DRAFT_AUTOMATION_SERVICE_OUTBOX_DIR: outboxDir,
+    DRAFT_AUTOMATION_SERVICE_API_KEY: apiKey,
+    DRAFT_AUTOMATION_SERVICE_HANDLER_MODULE: handlerPath,
+    DRAFT_AUTOMATION_ZHIHU_REQUIRE_SESSION: "true",
+    DRAFT_AUTOMATION_ZHIHU_COOKIES: "SESSION=zhihu-automation-cookie",
+    DRAFT_AUTOMATION_ZHIHU_CREATOR_BASE_URL: "https://creator.zhihu.example.test",
+    DRAFT_AUTOMATION_ZHIHU_CREATOR_DRAFT_URL: "https://creator.zhihu.example.test/drafts/new",
+  });
+  const authHeaders = {
+    authorization: `Bearer ${apiKey}`,
+  };
+
+  try {
+    const health = await waitForAuthorizedHealth(automation, `${automationBaseUrl}/health`, "Draft automation direct upstream", apiKey);
+    const contract = await requestAbsoluteJson(`${automationBaseUrl}/contract`, { headers: authHeaders });
+    const connectorPayload = {
+      platform: "zhihu",
+      accountId: "acct_zhihu_direct",
+      document: {
+        id: "doc-direct-upstream-check",
+        title: "Direct upstream connector check",
+      },
+      draft: {
+        platform: "zhihu",
+        title: "Direct upstream connector check",
+        summary: "Direct upstream summary.",
+        body: "Direct upstream body.",
+        hashtags: ["draft", "direct"],
+        warnings: [{ code: "MISSING_VISUAL_ASSET", message: "Synthetic warning.", severity: "warning" }],
+      },
+      execution: {
+        taskId: "task-direct-upstream-check",
+        targetId: "target-direct-upstream-check",
+        attemptCount: 1,
+      },
+      credential: {
+        platform: "zhihu",
+        accountId: "acct_zhihu_direct",
+        authMode: "cookie",
+        credentialRef: "env:ZHIHU",
+        accessToken: "zhihu-forwarded-secret-token",
+        cookies: "SESSION=zhihu-forwarded-secret-cookie",
+        storageStateJson: "{\"cookies\":[{\"value\":\"zhihu-forwarded-storage-secret\"}],\"origins\":[]}",
+      },
+      requestedAt: new Date().toISOString(),
+      connector: {
+        draftId: "zhihu-draft-direct-upstream-check",
+        draftUrl: "https://connector.example.test/zhihu/drafts/zhihu-draft-direct-upstream-check",
+        statusCallbackUrl: "https://connector.example.test/zhihu/drafts/zhihu-draft-direct-upstream-check/status",
+      },
+    };
+    const created = await requestAbsoluteJson(`${automationBaseUrl}/zhihu/drafts`, {
+      method: "POST",
+      headers: {
+        ...authHeaders,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(connectorPayload),
+    });
+    const detail = await requestAbsoluteJson(`${automationBaseUrl}/zhihu/drafts/${created.automationDraft.automationDraftId}`, {
+      headers: authHeaders,
+    });
+    const list = await requestAbsoluteJson(`${automationBaseUrl}/zhihu/drafts`, { headers: authHeaders });
+    const detailJson = JSON.stringify(detail);
+
+    if (
+      health.status !== "ok" ||
+      contract.routes?.createDraftFromConnector !== "POST /:platform/drafts" ||
+      created.remoteId !== "zhihu-real-zhihu-draft-direct-upstream-check" ||
+      created.url !== "https://creator.zhihu.example.test/drafts/zhihu-draft-direct-upstream-check" ||
+      created.automationDraft?.mode !== "handler" ||
+      list.total !== 1 ||
+      detail.mode !== "handler" ||
+      detail.runner?.source !== "draft-connector-upstream-v1" ||
+      detail.workOrder?.version !== "draft-upstream-work-order-v1" ||
+      detail.workOrder?.connector?.statusCallbackUrl !== connectorPayload.connector.statusCallbackUrl ||
+      !detail.workOrder?.draft?.renderedBody?.includes("Direct upstream summary.") ||
+      !detail.workOrder?.draft?.renderedBody?.includes("Direct upstream body.") ||
+      !detail.workOrder?.draft?.renderedBody?.includes("draft direct") ||
+      detail.workOrder?.credential?.summary?.hasAccessToken !== true ||
+      detail.workOrder?.credential?.summary?.hasCookies !== true ||
+      detail.workOrder?.credential?.summary?.hasStorageStateJson !== true ||
+      !detail.workOrder?.checklist?.some((item) => item.id === "save-draft" && item.required) ||
+      !detail.workOrder?.checklist?.some((item) => item.id === "review-validation-warnings" && item.required) ||
+      detailJson.includes("zhihu-forwarded-secret-token") ||
+      detailJson.includes("zhihu-forwarded-secret-cookie") ||
+      detailJson.includes("zhihu-forwarded-storage-secret")
+    ) {
+      throw new Error(
+        `Draft automation direct upstream check failed: ${JSON.stringify({
+          health,
+          contract,
+          created,
+          list,
+          detail,
+        })}`,
+      );
+    }
+
+    return {
+      contractVersion: contract.version,
+      route: contract.routes.createDraftFromConnector,
+      remoteId: created.remoteId,
+      url: created.url,
+      mode: detail.mode,
+      credentialRedacted: !detailJson.includes("zhihu-forwarded-secret-token"),
+    };
+  } finally {
+    await stopService(automation);
+    fs.rmSync(automationDir, { recursive: true, force: true });
+  }
+}
+
 async function runDraftPlaywrightHandlerCheck() {
   const automationPort = await getFreePort();
   const automationBaseUrl = `http://127.0.0.1:${automationPort}`;
@@ -4114,6 +4270,7 @@ const publicBaseRuntime = await runDraftConnectorPublicBaseRuntimeCheck();
 const upstreamContractCheck = await runUpstreamContractCheckScriptCheck();
 const upstreamSandboxCheck = await runUpstreamSandboxScriptCheck();
 const draftAutomationServiceCheck = await runDraftAutomationServiceScriptCheck();
+const draftAutomationDirectUpstreamCheck = await runDraftAutomationDirectUpstreamCheck();
 const draftPlaywrightHandlerCheck = await runDraftPlaywrightHandlerCheck();
 const upstreamSandboxCallback = await runUpstreamSandboxCallbackCheck();
 const upstreamProxyEnablement = await runUpstreamProxyEnablementCheck();
@@ -4548,6 +4705,7 @@ try {
     upstreamContractCheck,
     upstreamSandboxCheck,
     draftAutomationServiceCheck,
+    draftAutomationDirectUpstreamCheck,
     draftPlaywrightHandlerCheck,
     upstreamSandboxCallback,
     upstreamProxyEnablement,

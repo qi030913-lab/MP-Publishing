@@ -31,10 +31,12 @@ Routes:
   GET /:platform/drafts
   GET /:platform/drafts/:automationDraftId
   POST /drafts                     Accept a draft-upstream-work-order-v1 runner payload.
+  POST /:platform/drafts           Accept the draft-connector-upstream-v1 draft endpoint payload directly.
 
-Without --handler-module, POST /drafts stores a local automation handoff record and returns
-that inspection URL as the draft URL. A handler module can call Playwright or an official API
-and return the real platform draft id/url while keeping the runner contract unchanged.
+Without --handler-module, POST /drafts and POST /:platform/drafts store a local automation
+handoff record and return that inspection URL as the draft URL. A handler module can call
+Playwright or an official API and return the real platform draft id/url while keeping both
+the runner and draft-connector upstream contracts unchanged.
 
 Session env:
   DRAFT_AUTOMATION_<PLATFORM>_ACCESS_TOKEN
@@ -344,6 +346,155 @@ function validateAutomationPayload(payload) {
   return { platform, workOrder };
 }
 
+function readStringArray(value) {
+  return Array.isArray(value)
+    ? value.filter((item) => typeof item === "string" && item.trim().length > 0).map((item) => item.trim())
+    : [];
+}
+
+function readValidationIssues(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  return value
+    .filter((item) => item && typeof item === "object" && typeof item.code === "string" && typeof item.message === "string")
+    .map((item) => ({
+      code: item.code,
+      message: item.message,
+      severity: ["info", "warning", "error"].includes(item.severity) ? item.severity : "warning",
+    }));
+}
+
+function summarizeForwardedCredential(credential) {
+  if (!credential || typeof credential !== "object") {
+    return undefined;
+  }
+
+  return {
+    platform: credential.platform,
+    accountId: credential.accountId,
+    authMode: credential.authMode,
+    credentialRef: credential.credentialRef,
+    hasAccessToken: Boolean(credential.accessToken),
+    hasCookies: Boolean(credential.cookies),
+    hasStorageStateJson: Boolean(credential.storageStateJson),
+    hasStorageStatePath: Boolean(credential.storageStatePath),
+  };
+}
+
+function createRenderedBody(draft) {
+  const segments = [asString(draft.summary), asString(draft.body)].filter(Boolean);
+  const hashtags = readStringArray(draft.hashtags);
+  return [...segments, hashtags.length > 0 ? hashtags.join(" ") : undefined].filter(Boolean).join("\n\n");
+}
+
+function createConnectorWorkOrderChecklist(platform, draft) {
+  const checklist = [
+    {
+      id: "open-creator-center",
+      label: `Open the ${platform} creator center with the intended account selected.`,
+      required: true,
+    },
+    {
+      id: "fill-title",
+      label: "Fill the platform draft title.",
+      required: true,
+      sourceField: "draft.title",
+    },
+    {
+      id: "fill-body",
+      label: "Fill the main draft body without clicking final publish.",
+      required: true,
+      sourceField: "draft.body",
+    },
+    {
+      id: "apply-tags",
+      label: "Apply hashtags or topic tags when the platform compose form supports them.",
+      required: false,
+      sourceField: "draft.hashtags",
+    },
+    {
+      id: "save-draft",
+      label: "Save as draft and capture the real platform draft id or URL.",
+      required: true,
+    },
+  ];
+
+  if (readValidationIssues(draft.warnings).length > 0) {
+    checklist.splice(4, 0, {
+      id: "review-validation-warnings",
+      label: "Review platform validation warnings before saving the draft.",
+      required: true,
+      sourceField: "draft.warnings",
+    });
+  }
+
+  return checklist;
+}
+
+function createWorkOrderFromConnectorDraft(platform, payload, now) {
+  const draft = payload.draft ?? {};
+  const payloadPlatform = asString(payload.platform) ?? asString(draft.platform);
+  const connectorDraftId = asString(payload.connector?.draftId);
+  const statusCallbackUrl = asString(payload.connector?.statusCallbackUrl);
+  const title = asString(draft.title);
+  const body = asString(draft.body);
+
+  if ((payloadPlatform && payloadPlatform !== platform) || !connectorDraftId || !statusCallbackUrl || !title || !body) {
+    throw new Error(
+      "Connector draft payload must include matching platform, connector.draftId, connector.statusCallbackUrl, draft.title, and draft.body.",
+    );
+  }
+
+  const warnings = readValidationIssues(draft.warnings);
+  const hashtags = readStringArray(draft.hashtags);
+
+  return {
+    version: "draft-upstream-work-order-v1",
+    platform,
+    remoteId: connectorDraftId,
+    url: asString(payload.connector?.draftUrl),
+    accountId: asString(payload.accountId),
+    createdAt: now,
+    connector: {
+      draftId: connectorDraftId,
+      draftUrl: asString(payload.connector?.draftUrl),
+      statusCallbackUrl,
+      callbackAuthEnv: "DRAFT_CONNECTOR_STATUS_CALLBACK_API_KEY",
+    },
+    document: {
+      id: asString(payload.document?.id),
+      title: asString(payload.document?.title),
+    },
+    draft: {
+      title,
+      summary: asString(draft.summary),
+      body,
+      hashtags,
+      warnings,
+      renderedBody: createRenderedBody(draft),
+    },
+    credential: {
+      required: Boolean(payload.credential),
+      summary: summarizeForwardedCredential(payload.credential),
+    },
+    automation: {
+      mode: "creator-center-draft-fill",
+      safeMode: true,
+      finalPublishMustRemainManual: true,
+      expectedResult: "A platform draft id or draft URL, not a published public URL.",
+    },
+    callbackPayloadTemplate: {
+      state: "ready",
+      remoteId: "<real-platform-draft-id>",
+      url: "<real-platform-draft-url>",
+      detail: `${platform} creator-center draft was saved by upstream automation.`,
+    },
+    checklist: createConnectorWorkOrderChecklist(platform, draft),
+  };
+}
+
 function normalizeAutomationResult(result, fallback) {
   const payload = result && typeof result === "object" ? result : {};
   if (payload.ok === false) {
@@ -383,12 +534,14 @@ async function loadHandler(handlerModulePath) {
 function createContract({ publicBaseUrl, hasHandler, platformSessions }) {
   return {
     version: "draft-automation-service-v1",
-    purpose: "Receives draft-upstream-work-order-v1 payloads and turns them into platform draft ids/URLs.",
+    purpose:
+      "Receives draft-upstream-work-order-v1 runner payloads or draft-connector-upstream-v1 draft requests and turns them into platform draft ids/URLs.",
     supportedPlatforms: Array.from(supportedPlatforms),
     routes: {
       health: "GET /health",
       contract: "GET /contract",
       createDraft: "POST /drafts",
+      createDraftFromConnector: "POST /:platform/drafts",
       listDrafts: "GET /drafts or GET /:platform/drafts",
       readDraft: "GET /:platform/drafts/:automationDraftId",
     },
@@ -396,6 +549,8 @@ function createContract({ publicBaseUrl, hasHandler, platformSessions }) {
       platform: "zhihu | bilibili | xiaohongshu",
       accountId: "Platform account id from the work order.",
       workOrder: "draft-upstream-work-order-v1",
+      connectorUpstreamPayload:
+        "draft-connector-upstream-v1 draft endpoint payload accepted at POST /:platform/drafts and converted into a safe work order.",
       runner: {
         completedBy: "Runner identity.",
         safeMode: true,
@@ -419,6 +574,107 @@ function createContract({ publicBaseUrl, hasHandler, platformSessions }) {
       : "none; default mode stages local handoff records. Set --handler-module to run Playwright or official API automation.",
     platformSessions: summarizePlatformSessions(platformSessions),
     exampleLocalUrl: `${publicBaseUrl}/zhihu/drafts/<automationDraftId>`,
+  };
+}
+
+async function createAutomationDraft({
+  platform,
+  accountId,
+  workOrder,
+  requestedAt,
+  runner,
+  outboxDir,
+  publicBaseUrl,
+  handler,
+  handlerModulePath,
+  urlTemplates,
+  platformSessions,
+}) {
+  const platformSession = platformSessions.get(platform);
+  if (platformSession?.required && !platformSession.ready) {
+    return {
+      statusCode: 428,
+      body: {
+        ok: false,
+        state: "needs_manual_action",
+        message: `${platform} automation session is required but not configured.`,
+        sessionSummary: summarizePlatformSession(platformSession),
+      },
+    };
+  }
+
+  const now = new Date().toISOString();
+  const automationDraftId = `${platform}-automation-${sanitizeSegment(workOrder.remoteId || Date.now())}`;
+  const detailUrl = `${publicBaseUrl}/${platform}/drafts/${automationDraftId}`;
+  const fallback = createDefaultAutomationResult({
+    workOrder,
+    automationDraftId,
+    publicBaseUrl,
+    urlTemplate: urlTemplates.get(platform),
+  });
+
+  let result;
+  try {
+    const handlerResult = handler
+      ? await handler({
+          platform,
+          accountId,
+          workOrder,
+          requestedAt: requestedAt ?? now,
+          runner: runner ?? {},
+          platformSession,
+          sessionSummary: platformSession ? summarizePlatformSession(platformSession) : undefined,
+          context: {
+            outboxDir,
+            publicBaseUrl,
+            detailUrl,
+            fallback,
+          },
+        })
+      : fallback;
+    result = normalizeAutomationResult(handlerResult, fallback);
+  } catch (error) {
+    return {
+      statusCode: 502,
+      body: {
+        ok: false,
+        message: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+
+  const record = {
+    platform,
+    automationDraftId,
+    workOrderId: workOrder.remoteId,
+    accountId: accountId ?? workOrder.accountId,
+    title: workOrder.draft.title,
+    state: result.state,
+    remoteId: result.remoteId ?? automationDraftId,
+    url: result.url ?? detailUrl,
+    mode: handler ? "handler" : "local-handoff",
+    handlerModule: handler ? handlerModulePath : undefined,
+    detail: result.detail,
+    issues: result.issues ?? [],
+    detailUrl,
+    workOrder,
+    runner: runner ?? {},
+    createdAt: now,
+    updatedAt: now,
+  };
+  await writeRecord(outboxDir, record);
+
+  return {
+    statusCode: result.ok ? 200 : 202,
+    body: {
+      ok: result.ok,
+      remoteId: record.remoteId,
+      url: record.url,
+      state: record.state,
+      detail: record.detail,
+      ...(record.issues.length > 0 ? { issues: record.issues } : {}),
+      automationDraft: summarizeRecord(record),
+    },
   };
 }
 
@@ -448,85 +704,67 @@ async function handleCreateDraft({
     return;
   }
 
-  const platformSession = platformSessions.get(platform);
-  if (platformSession?.required && !platformSession.ready) {
-    sendJson(response, 428, {
-      ok: false,
-      state: "needs_manual_action",
-      message: `${platform} automation session is required but not configured.`,
-      sessionSummary: summarizePlatformSession(platformSession),
-    });
-    return;
-  }
-
-  const now = new Date().toISOString();
-  const automationDraftId = `${platform}-automation-${sanitizeSegment(workOrder.remoteId || Date.now())}`;
-  const detailUrl = `${publicBaseUrl}/${platform}/drafts/${automationDraftId}`;
-  const fallback = createDefaultAutomationResult({
-    workOrder,
-    automationDraftId,
-    publicBaseUrl,
-    urlTemplate: urlTemplates.get(platform),
-  });
-
-  let result;
-  try {
-    const handlerResult = handler
-      ? await handler({
-          platform,
-          accountId: payload.accountId,
-          workOrder,
-          requestedAt: payload.requestedAt ?? now,
-          runner: payload.runner ?? {},
-          platformSession,
-          sessionSummary: platformSession ? summarizePlatformSession(platformSession) : undefined,
-          context: {
-            outboxDir,
-            publicBaseUrl,
-            detailUrl,
-            fallback,
-          },
-        })
-      : fallback;
-    result = normalizeAutomationResult(handlerResult, fallback);
-  } catch (error) {
-    sendJson(response, 502, {
-      ok: false,
-      message: error instanceof Error ? error.message : String(error),
-    });
-    return;
-  }
-
-  const record = {
+  const result = await createAutomationDraft({
     platform,
-    automationDraftId,
-    workOrderId: workOrder.remoteId,
-    accountId: payload.accountId ?? workOrder.accountId,
-    title: workOrder.draft.title,
-    state: result.state,
-    remoteId: result.remoteId ?? automationDraftId,
-    url: result.url ?? detailUrl,
-    mode: handler ? "handler" : "local-handoff",
-    handlerModule: handler ? handlerModulePath : undefined,
-    detail: result.detail,
-    issues: result.issues ?? [],
-    detailUrl,
+    accountId: payload.accountId,
     workOrder,
-    runner: payload.runner ?? {},
-    createdAt: now,
-    updatedAt: now,
-  };
-  await writeRecord(outboxDir, record);
-
-  sendJson(response, result.ok ? 200 : 202, {
-    ok: result.ok,
-    remoteId: record.remoteId,
-    url: record.url,
-    state: record.state,
-    detail: record.detail,
-    ...(record.issues.length > 0 ? { issues: record.issues } : {}),
-    automationDraft: summarizeRecord(record),
+    requestedAt: payload.requestedAt,
+    runner: payload.runner,
+    outboxDir,
+    publicBaseUrl,
+    handler,
+    handlerModulePath,
+    urlTemplates,
+    platformSessions,
   });
+  sendJson(response, result.statusCode, result.body);
+}
+
+async function handleCreateConnectorDraft({
+  request,
+  response,
+  platform,
+  outboxDir,
+  publicBaseUrl,
+  apiKey,
+  handler,
+  handlerModulePath,
+  urlTemplates,
+  platformSessions,
+}) {
+  if (!isAuthorized(request, apiKey)) {
+    sendJson(response, 401, { ok: false, message: "automation api key is invalid" });
+    return;
+  }
+
+  const payload = await readRequestJson(request);
+  const now = new Date().toISOString();
+  let workOrder;
+  try {
+    workOrder = createWorkOrderFromConnectorDraft(platform, payload, now);
+  } catch (error) {
+    sendJson(response, 422, { ok: false, message: error instanceof Error ? error.message : String(error) });
+    return;
+  }
+
+  const result = await createAutomationDraft({
+    platform,
+    accountId: asString(payload.accountId) ?? workOrder.accountId,
+    workOrder,
+    requestedAt: payload.requestedAt ?? now,
+    runner: {
+      completedBy: "draft-connector-upstream",
+      safeMode: true,
+      source: "draft-connector-upstream-v1",
+    },
+    outboxDir,
+    publicBaseUrl,
+    handler,
+    handlerModulePath,
+    urlTemplates,
+    platformSessions,
+  });
+  sendJson(response, result.statusCode, result.body);
 }
 
 async function main() {
@@ -607,6 +845,22 @@ async function main() {
 
       if (!supportedPlatforms.has(platform) || operation !== "drafts") {
         sendJson(response, 404, { ok: false, message: "automation route not found" });
+        return;
+      }
+
+      if (request.method === "POST" && !automationDraftId) {
+        await handleCreateConnectorDraft({
+          request,
+          response,
+          platform,
+          outboxDir,
+          publicBaseUrl,
+          apiKey,
+          handler,
+          handlerModulePath,
+          urlTemplates,
+          platformSessions,
+        });
         return;
       }
 
