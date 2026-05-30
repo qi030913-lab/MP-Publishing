@@ -254,6 +254,39 @@ try {
     });
   }
 
+  const syncedTask = await requestJson(`/publish/tasks/${created.id}/sync`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  const syncedTargets = [];
+  if (syncedTask.status !== "succeeded") {
+    throw new Error(`Draft connector sync changed task status unexpectedly: ${syncedTask.status}`);
+  }
+
+  for (const platform of platforms) {
+    const beforeSync = task.results.find((item) => item.platform === platform);
+    const afterSync = syncedTask.results.find((item) => item.platform === platform);
+    const expectedUrlPrefix = `${connectorBaseUrl}/${platform}/drafts/`;
+    if (
+      !afterSync ||
+      afterSync.status !== "succeeded" ||
+      afterSync.remoteId !== beforeSync?.remoteId ||
+      !afterSync.url?.startsWith(expectedUrlPrefix)
+    ) {
+      throw new Error(`Draft connector sync did not preserve a draft status for ${platform}: ${JSON.stringify(afterSync)}`);
+    }
+
+    syncedTargets.push({
+      platform: afterSync.platform,
+      status: afterSync.status,
+      remoteId: afterSync.remoteId,
+      url: afterSync.url,
+    });
+  }
+
+  task = syncedTask;
+
   const result = {
     taskId: created.id,
     finalStatus: task.status,
@@ -271,6 +304,7 @@ try {
       accountId: draft.accountId,
     })),
     draftDetails,
+    syncedTargets,
     queue: runtime.queue,
   };
 
