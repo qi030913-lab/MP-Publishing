@@ -13,6 +13,7 @@
     "@mp-publishing/adapter-core": "workspace:*",
     "@mp-publishing/content-model": "workspace:*",
     "@mp-publishing/platform-sdk": "workspace:*",
+    "@mp-publishing/task-runtime": "workspace:*",
     "@nestjs/common": "^11.1.24",
     "@nestjs/core": "^11.1.24",
     "@nestjs/platform-express": "^11.1.24",

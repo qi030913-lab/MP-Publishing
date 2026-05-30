@@ -1,11 +1,11 @@
 import { Injectable, NotFoundException } from "@nestjs/common";
 
 import {
-  findPlatformAccountById,
+  findAccountById,
+  listAccounts,
   type PlatformAccountHealth,
-  platformAccounts,
-  updatePlatformAccount,
-} from "./publish.data.js";
+  updateAccount,
+} from "@mp-publishing/task-runtime";
 
 @Injectable()
 export class AccountService {
@@ -13,8 +13,8 @@ export class AccountService {
     return new Date().toISOString();
   }
 
-  private getAccountOrThrow(accountId: string) {
-    const account = findPlatformAccountById(accountId);
+  private async getAccountOrThrow(accountId: string) {
+    const account = await findAccountById(accountId);
     if (!account) {
       throw new NotFoundException("platform account not found");
     }
@@ -22,42 +22,43 @@ export class AccountService {
     return account;
   }
 
-  listAccounts() {
+  async listAccounts() {
+    const accounts = await listAccounts();
     return {
-      items: platformAccounts,
+      items: accounts,
       summary: {
-        total: platformAccounts.length,
-        healthy: platformAccounts.filter((account) => account.health === "healthy").length,
-        expiring: platformAccounts.filter((account) => account.health === "expiring").length,
-        needsLogin: platformAccounts.filter((account) => account.health === "needs-login").length,
+        total: accounts.length,
+        healthy: accounts.filter((account) => account.health === "healthy").length,
+        expiring: accounts.filter((account) => account.health === "expiring").length,
+        needsLogin: accounts.filter((account) => account.health === "needs-login").length,
       },
     };
   }
 
-  checkAccount(accountId: string) {
-    const account = this.getAccountOrThrow(accountId);
+  async checkAccount(accountId: string) {
+    const account = await this.getAccountOrThrow(accountId);
     const nextHealth: PlatformAccountHealth =
       account.health === "healthy" ? "healthy" : account.health === "expiring" ? "expiring" : "needs-login";
 
-    return updatePlatformAccount(account.id, {
+    return updateAccount(account.id, {
       health: nextHealth,
       lastCheckedAt: this.createTimestamp(),
     });
   }
 
-  refreshCredential(accountId: string) {
-    const account = this.getAccountOrThrow(accountId);
+  async refreshCredential(accountId: string) {
+    const account = await this.getAccountOrThrow(accountId);
 
-    return updatePlatformAccount(account.id, {
+    return updateAccount(account.id, {
       health: "healthy",
       lastCheckedAt: this.createTimestamp(),
     });
   }
 
-  markNeedsLogin(accountId: string) {
-    const account = this.getAccountOrThrow(accountId);
+  async markNeedsLogin(accountId: string) {
+    const account = await this.getAccountOrThrow(accountId);
 
-    return updatePlatformAccount(account.id, {
+    return updateAccount(account.id, {
       health: "needs-login",
       lastCheckedAt: this.createTimestamp(),
     });

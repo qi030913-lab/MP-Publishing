@@ -12,6 +12,7 @@
   "dependencies": {
     "@mp-publishing/adapter-core": "workspace:*",
     "@mp-publishing/content-model": "workspace:*",
+    "@mp-publishing/task-runtime": "workspace:*",
     "bullmq": "^5.77.6"
   },
   "devDependencies": {

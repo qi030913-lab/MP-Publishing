@@ -18,3 +18,15 @@ MP-Publishing is a multi-platform content adaptation and publishing workspace fo
 pnpm install
 pnpm build
 ```
+
+## Development
+
+The publishing flow now uses a lightweight shared runtime plus an async worker loop.
+
+Run these services during local development:
+
+```bash
+pnpm --filter @mp-publishing/api dev
+pnpm --filter @mp-publishing/worker dev
+pnpm --filter @mp-publishing/web dev
+```

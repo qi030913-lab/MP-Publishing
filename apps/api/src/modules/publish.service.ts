@@ -1,17 +1,20 @@
 import { Injectable, NotFoundException } from "@nestjs/common";
 import { adapterRegistry } from "@mp-publishing/adapter-core";
 import { createDocumentFromInput } from "@mp-publishing/content-model";
-
 import {
-  findPlatformAccountById,
-  platformAccounts,
-  publishTasks,
+  findAccountById,
+  findTaskById,
+  listAccounts,
+  listTasks,
   type PlatformAccountRecord,
   type PublishTaskLog,
   type PublishTaskMode,
   type PublishTaskRecord,
   type PublishTaskTargetRecord,
-} from "./publish.data.js";
+  upsertTask,
+  updateAccount,
+} from "@mp-publishing/task-runtime";
+
 import type {
   PublishMockDto,
   RetryPublishTaskDto,
@@ -20,8 +23,6 @@ import type {
 
 @Injectable()
 export class PublishService {
-  private readonly progressDelayMs = 1500;
-
   private createTimestamp() {
     return new Date().toISOString();
   }
@@ -33,14 +34,6 @@ export class PublishService {
       level,
       message,
     };
-  }
-
-  private resolveRuntimeAccount(target: PublishTaskTargetRecord) {
-    if (!target.account) {
-      return null;
-    }
-
-    return findPlatformAccountById(target.account.id) ?? target.account;
   }
 
   private summarizeTaskStatus(targets: PublishTaskTargetRecord[]): PublishTaskRecord["status"] {
@@ -77,56 +70,6 @@ export class PublishService {
     return "queued";
   }
 
-  private progressTask(task: PublishTaskRecord) {
-    const now = Date.now();
-    let changed = false;
-
-    task.targets.forEach((target) => {
-      target.account = this.resolveRuntimeAccount(target);
-
-      if (target.status === "queued") {
-        target.status = "running";
-        target.startedAt = this.createTimestamp();
-        target.logs.push(this.createLog("info", `${target.platform} 已进入执行队列。`));
-        changed = true;
-        return;
-      }
-
-      if (target.status !== "running" || !target.startedAt) {
-        return;
-      }
-
-      const elapsed = now - new Date(target.startedAt).getTime();
-      if (elapsed < this.progressDelayMs) {
-        return;
-      }
-
-      if (!target.account || target.account.health === "needs-login") {
-        target.status = "needs_manual_action";
-        target.logs.push(this.createLog("warning", `${target.platform} 需要人工登录后才能继续发布。`));
-        changed = true;
-        return;
-      }
-
-      if (target.account.health === "expiring" && target.attemptCount === 1) {
-        target.status = "needs_retry";
-        target.logs.push(this.createLog("warning", `${target.platform} 账号凭证接近过期，建议执行重试。`));
-        changed = true;
-        return;
-      }
-
-      target.status = "succeeded";
-      target.completedAt = this.createTimestamp();
-      target.logs.push(this.createLog("info", `${target.platform} 任务执行完成。`));
-      changed = true;
-    });
-
-    if (changed) {
-      task.status = this.summarizeTaskStatus(task.targets);
-      task.updatedAt = this.createTimestamp();
-    }
-  }
-
   private createBaseDocument(input: SimulatePublishDto | PublishMockDto) {
     return createDocumentFromInput({
       title: input.document.title,
@@ -137,11 +80,61 @@ export class PublishService {
     });
   }
 
+  private async refreshTaskAccounts(task: PublishTaskRecord) {
+    const accounts = await listAccounts();
+    task.targets = task.targets.map((target) => {
+      if (!target.account) {
+        return target;
+      }
+
+      const nextAccount = accounts.find((account) => account.id === target.account?.id) ?? target.account;
+      return {
+        ...target,
+        account: nextAccount,
+      };
+    });
+    task.status = this.summarizeTaskStatus(task.targets);
+    return task;
+  }
+
+  private mapTaskForResponse(task: PublishTaskRecord) {
+    return {
+      id: task.id,
+      mode: task.mode,
+      overallStatus:
+        task.mode === "simulate"
+          ? task.status === "succeeded"
+            ? "ready"
+            : "needs_attention"
+          : task.status === "succeeded"
+            ? "published"
+            : "partial",
+      documentTitle: task.documentTitle,
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
+      status: task.status,
+      results: task.targets.map((target) => ({
+        platform: target.platform,
+        account: target.account,
+        ok: target.status === "succeeded",
+        screenshots: target.screenshots,
+        remoteId: target.remoteId,
+        url: target.url,
+        issues: target.issues,
+        status: target.status,
+        attemptCount: target.attemptCount,
+        logs: target.logs,
+        startedAt: target.startedAt,
+        completedAt: target.completedAt,
+      })),
+    };
+  }
+
   private async createTaskFromInput(
     mode: PublishTaskMode,
     input: SimulatePublishDto | PublishMockDto,
   ): Promise<PublishTaskRecord> {
-    const accounts = platformAccounts.filter((account) => input.accountIds.includes(account.id));
+    const accounts = (await listAccounts()).filter((account) => input.accountIds.includes(account.id));
     const taskCreatedAt = this.createTimestamp();
 
     const document = this.createBaseDocument(input);
@@ -152,6 +145,7 @@ export class PublishService {
         const matchedAccount = accounts.find((account) => account.platform === platform) ?? null;
         const baseLogs = [
           this.createLog("info", mode === "simulate" ? `已创建 ${platform} 模拟发布任务。` : `已创建 ${platform} mock 发布任务。`),
+          this.createLog("info", `${platform} 等待 worker 执行。`),
         ];
 
         if (mode === "simulate") {
@@ -201,43 +195,8 @@ export class PublishService {
       targets,
     };
 
-    publishTasks.unshift(task);
+    await upsertTask(task);
     return task;
-  }
-
-  private mapTaskForResponse(task: PublishTaskRecord) {
-    this.progressTask(task);
-
-    return {
-      id: task.id,
-      mode: task.mode,
-      overallStatus:
-        task.mode === "simulate"
-          ? task.status === "succeeded"
-            ? "ready"
-            : "needs_attention"
-          : task.status === "succeeded"
-            ? "published"
-            : "partial",
-      documentTitle: task.documentTitle,
-      createdAt: task.createdAt,
-      updatedAt: task.updatedAt,
-      status: task.status,
-      results: task.targets.map((target) => ({
-        platform: target.platform,
-        account: this.resolveRuntimeAccount(target),
-        ok: target.status === "succeeded",
-        screenshots: target.screenshots,
-        remoteId: target.remoteId,
-        url: target.url,
-        issues: target.issues,
-        status: target.status,
-        attemptCount: target.attemptCount,
-        logs: target.logs,
-        startedAt: target.startedAt,
-        completedAt: target.completedAt,
-      })),
-    };
   }
 
   async simulate(input: SimulatePublishDto) {
@@ -250,45 +209,48 @@ export class PublishService {
     return this.mapTaskForResponse(task);
   }
 
-  listTasks() {
+  async listTasks() {
+    const tasks = await listTasks();
+
     return {
-      items: publishTasks.map((task) => {
-        this.progressTask(task);
-        return {
-          id: task.id,
-          mode: task.mode,
-          status: task.status,
-          documentTitle: task.documentTitle,
-          createdAt: task.createdAt,
-          updatedAt: task.updatedAt,
-          targetCount: task.targets.length,
-          issueCount: task.targets.reduce((count, target) => count + target.issues.length, 0),
-        };
-      }),
+      items: tasks.map((task) => ({
+        id: task.id,
+        mode: task.mode,
+        status: task.status,
+        documentTitle: task.documentTitle,
+        createdAt: task.createdAt,
+        updatedAt: task.updatedAt,
+        targetCount: task.targets.length,
+        issueCount: task.targets.reduce((count, target) => count + target.issues.length, 0),
+      })),
     };
   }
 
-  getTask(taskId: string) {
-    const task = publishTasks.find((item) => item.id === taskId);
+  async getTask(taskId: string) {
+    const task = await findTaskById(taskId);
     if (!task) {
       throw new NotFoundException("publish task not found");
     }
 
-    return this.mapTaskForResponse(task);
+    const refreshedTask = await this.refreshTaskAccounts(task);
+    await upsertTask(refreshedTask);
+    return this.mapTaskForResponse(refreshedTask);
   }
 
-  retryTask(taskId: string, input: RetryPublishTaskDto) {
-    const task = publishTasks.find((item) => item.id === taskId);
+  async retryTask(taskId: string, input: RetryPublishTaskDto) {
+    const task = await findTaskById(taskId);
     if (!task) {
       throw new NotFoundException("publish task not found");
     }
 
-    const targets = task.targets.filter((target) =>
+    const refreshedTask = await this.refreshTaskAccounts(task);
+    const targets = refreshedTask.targets.filter((target) =>
       input.platform ? target.platform === input.platform : target.status !== "succeeded",
     );
 
-    targets.forEach((target) => {
-      target.account = this.resolveRuntimeAccount(target);
+    for (const target of targets) {
+      const runtimeAccount = target.account?.id ? await findAccountById(target.account.id) : null;
+      target.account = runtimeAccount ?? target.account;
       target.attemptCount += 1;
       target.status = this.resolveInitialTargetStatus(target.account);
       target.startedAt = undefined;
@@ -299,20 +261,23 @@ export class PublishService {
       } else {
         target.logs.push(this.createLog("info", `${target.platform} 已重新排入执行队列。`));
         if (target.account.health === "expiring") {
-          target.account = {
-            ...target.account,
+          const updatedAccount = await updateAccount(target.account.id, {
             health: "healthy",
             lastCheckedAt: this.createTimestamp(),
-          };
-          target.logs.push(this.createLog("info", `${target.platform} 凭证刷新成功，状态已恢复健康。`));
+          });
+
+          if (updatedAccount) {
+            target.account = updatedAccount;
+            target.logs.push(this.createLog("info", `${target.platform} 凭证刷新成功，状态已恢复健康。`));
+          }
         }
       }
-    });
+    }
 
-    task.status = this.summarizeTaskStatus(task.targets);
-    task.updatedAt = this.createTimestamp();
+    refreshedTask.status = this.summarizeTaskStatus(refreshedTask.targets);
+    refreshedTask.updatedAt = this.createTimestamp();
+    await upsertTask(refreshedTask);
 
-    return this.mapTaskForResponse(task);
+    return this.mapTaskForResponse(refreshedTask);
   }
-
 }

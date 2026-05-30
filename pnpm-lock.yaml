@@ -29,6 +29,9 @@ importers:
       '@mp-publishing/platform-sdk':
         specifier: workspace:*
         version: link:../../packages/platform-sdk
+      '@mp-publishing/task-runtime':
+        specifier: workspace:*
+        version: link:../../packages/task-runtime
       '@nestjs/common':
         specifier: ^11.1.24
         version: 11.1.24(reflect-metadata@0.2.2)(rxjs@7.8.2)
@@ -91,6 +94,9 @@ importers:
       '@mp-publishing/content-model':
         specifier: workspace:*
         version: link:../../packages/content-model
+      '@mp-publishing/task-runtime':
+        specifier: workspace:*
+        version: link:../../packages/task-runtime
       bullmq:
         specifier: ^5.77.6
         version: 5.77.6
@@ -172,6 +178,12 @@ importers:
       '@mp-publishing/content-model':
         specifier: workspace:*
         version: link:../content-model
+
+  packages/task-runtime:
+    dependencies:
+      '@mp-publishing/platform-sdk':
+        specifier: workspace:*
+        version: link:../platform-sdk
 
 packages:
 
