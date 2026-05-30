@@ -69,14 +69,18 @@ type DraftSummary = {
 
 type UpstreamDraftConfig = {
   endpoint: string;
+  statusEndpoint?: string;
   healthEndpoint?: string;
   apiKey?: string;
+  statusApiKey?: string;
   includeCredential: boolean;
+  statusIncludeCredential: boolean;
 };
 
 type UpstreamDraftStatus = {
   platform: string;
   draftEndpointConfigured: boolean;
+  statusEndpointConfigured: boolean;
   healthEndpoint?: string;
   status: "unconfigured" | "configured" | "online" | "offline";
   detail?: string;
@@ -302,9 +306,15 @@ function resolveUpstreamDraftConfig(platform: string): UpstreamDraftConfig | nul
 
   return {
     endpoint,
+    statusEndpoint: readEnvValue(`${envPrefix}_STATUS_ENDPOINT`) ?? readEnvValue("DRAFT_CONNECTOR_UPSTREAM_STATUS_ENDPOINT"),
     healthEndpoint: readEnvValue(`${envPrefix}_HEALTH_ENDPOINT`) ?? readEnvValue("DRAFT_CONNECTOR_UPSTREAM_HEALTH_ENDPOINT"),
     apiKey: readEnvValue(`${envPrefix}_DRAFT_API_KEY`) ?? readEnvValue("DRAFT_CONNECTOR_UPSTREAM_API_KEY"),
+    statusApiKey:
+      readEnvValue(`${envPrefix}_STATUS_API_KEY`) ??
+      readEnvValue(`${envPrefix}_DRAFT_API_KEY`) ??
+      readEnvValue("DRAFT_CONNECTOR_UPSTREAM_API_KEY"),
     includeCredential: isEnvEnabled(`${envPrefix}_INCLUDE_CREDENTIAL`),
+    statusIncludeCredential: isEnvEnabled(`${envPrefix}_STATUS_INCLUDE_CREDENTIAL`),
   };
 }
 
@@ -314,6 +324,7 @@ async function probeUpstreamDraftStatus(platform: string): Promise<UpstreamDraft
     return {
       platform,
       draftEndpointConfigured: false,
+      statusEndpointConfigured: false,
       status: "unconfigured",
     };
   }
@@ -322,6 +333,7 @@ async function probeUpstreamDraftStatus(platform: string): Promise<UpstreamDraft
     return {
       platform,
       draftEndpointConfigured: true,
+      statusEndpointConfigured: Boolean(config.statusEndpoint),
       status: "configured",
       detail: "Upstream draft endpoint is configured; no health endpoint is configured.",
     };
@@ -339,6 +351,7 @@ async function probeUpstreamDraftStatus(platform: string): Promise<UpstreamDraft
     return {
       platform,
       draftEndpointConfigured: true,
+      statusEndpointConfigured: Boolean(config.statusEndpoint),
       healthEndpoint: config.healthEndpoint,
       status: response.ok ? "online" : "offline",
       detail: response.ok
@@ -349,6 +362,7 @@ async function probeUpstreamDraftStatus(platform: string): Promise<UpstreamDraft
     return {
       platform,
       draftEndpointConfigured: true,
+      statusEndpointConfigured: Boolean(config.statusEndpoint),
       healthEndpoint: config.healthEndpoint,
       status: "offline",
       detail: error instanceof Error ? error.message : "Upstream draft health check failed.",
@@ -371,6 +385,26 @@ function createUpstreamPayload(
   return {
     ...sanitizeDraftPayload(payload),
     credential: includeCredential ? payload.credential : undefined,
+    connector: {
+      draftId: storedDraft.draftId,
+      draftUrl: createDraftUrl(storedDraft.platform, storedDraft.draftId, request),
+      statusCallbackUrl: createStatusCallbackUrl(storedDraft.platform, storedDraft.draftId, request),
+    },
+  };
+}
+
+function createUpstreamStatusPayload(
+  payload: Record<string, unknown>,
+  storedDraft: StoredDraft,
+  request: IncomingMessage,
+  includeCredential: boolean,
+) {
+  return {
+    platform: storedDraft.platform,
+    accountId: readOptionalString(payload.accountId) ?? storedDraft.accountId,
+    remoteId: storedDraft.externalDraftId ?? readOptionalString(payload.remoteId) ?? storedDraft.draftId,
+    credential: includeCredential ? payload.credential : undefined,
+    requestedAt: new Date().toISOString(),
     connector: {
       draftId: storedDraft.draftId,
       draftUrl: createDraftUrl(storedDraft.platform, storedDraft.draftId, request),
@@ -403,6 +437,34 @@ async function requestUpstreamDraft(
   return upstreamPayload;
 }
 
+async function requestUpstreamDraftStatus(
+  config: UpstreamDraftConfig,
+  payload: Record<string, unknown>,
+  storedDraft: StoredDraft,
+  request: IncomingMessage,
+) {
+  if (!config.statusEndpoint) {
+    return null;
+  }
+
+  const response = await fetch(config.statusEndpoint, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...(config.statusApiKey ? { authorization: `Bearer ${config.statusApiKey}` } : {}),
+    },
+    body: JSON.stringify(createUpstreamStatusPayload(payload, storedDraft, request, config.statusIncludeCredential)),
+  });
+  const body = await response.text();
+  const upstreamPayload = body ? (JSON.parse(body) as UpstreamDraftResponse) : {};
+
+  if (!response.ok) {
+    throw new Error(`Upstream status endpoint HTTP ${response.status}: ${body || response.statusText}`);
+  }
+
+  return upstreamPayload;
+}
+
 function applyUpstreamDraftResponse(storedDraft: StoredDraft, payload: UpstreamDraftResponse): StoredDraft {
   const externalDraftId =
     readOptionalString(payload.externalDraftId) ?? readOptionalString(payload.remoteId) ?? readOptionalString(payload.draftId);
@@ -420,6 +482,62 @@ function applyUpstreamDraftResponse(storedDraft: StoredDraft, payload: UpstreamD
     statusIssues: statusIssues ?? storedDraft.statusIssues,
     updatedAt: new Date().toISOString(),
   };
+}
+
+async function refreshStoredDraftFromUpstreamStatus(
+  storedDraft: StoredDraft,
+  payload: Record<string, unknown>,
+  request: IncomingMessage,
+) {
+  const upstreamConfig = resolveUpstreamDraftConfig(storedDraft.platform);
+  if (!upstreamConfig?.statusEndpoint) {
+    return storedDraft;
+  }
+
+  try {
+    const upstreamPayload = await requestUpstreamDraftStatus(upstreamConfig, payload, storedDraft, request);
+    if (!upstreamPayload) {
+      return storedDraft;
+    }
+
+    const upstreamState = normalizeDraftState(upstreamPayload.state);
+    const upstreamIssues = normalizeIssues(upstreamPayload.issues);
+    const updatedDraft: StoredDraft = {
+      ...applyUpstreamDraftResponse(storedDraft, upstreamPayload),
+      state: upstreamPayload.ok === false ? upstreamState ?? "needs_manual_action" : upstreamState ?? storedDraft.state,
+      statusIssues:
+        upstreamPayload.ok === false
+          ? [
+              ...(upstreamIssues ?? []),
+              createIssue(
+                `${storedDraft.platform.toUpperCase()}_UPSTREAM_STATUS_REJECTED`,
+                upstreamPayload.message ??
+                  upstreamPayload.detail ??
+                  `${storedDraft.platform} upstream status service rejected the status request.`,
+              ),
+            ]
+          : upstreamIssues ?? storedDraft.statusIssues,
+    };
+
+    await writeStoredDraft(updatedDraft);
+    return updatedDraft;
+  } catch (error) {
+    const failedDraft: StoredDraft = {
+      ...storedDraft,
+      state: "needs_manual_action",
+      statusDetail: error instanceof Error ? error.message : `${storedDraft.platform} upstream status service failed.`,
+      statusIssues: [
+        createIssue(
+          `${storedDraft.platform.toUpperCase()}_UPSTREAM_STATUS_FAILED`,
+          error instanceof Error ? error.message : `${storedDraft.platform} upstream status service failed.`,
+          "warning",
+        ),
+      ],
+      updatedAt: new Date().toISOString(),
+    };
+    await writeStoredDraft(failedDraft);
+    return failedDraft;
+  }
 }
 
 async function readStoredDraft(platform: string, draftId: string) {
@@ -850,12 +968,14 @@ async function handleDraftStatus(platform: string, request: IncomingMessage, res
     return;
   }
 
+  const refreshedDraft = await refreshStoredDraftFromUpstreamStatus(storedDraft, payload, request);
+
   sendJson(response, 200, {
-    state: storedDraft.state,
-    detail: storedDraft.statusDetail ?? `${platform} draft is stored in local outbox.`,
-    remoteId: storedDraft.externalDraftId ?? storedDraft.draftId,
-    url: storedDraft.externalUrl ?? createDraftUrl(platform, storedDraft.draftId, request),
-    issues: storedDraft.statusIssues,
+    state: refreshedDraft.state,
+    detail: refreshedDraft.statusDetail ?? `${platform} draft is stored in local outbox.`,
+    remoteId: refreshedDraft.externalDraftId ?? refreshedDraft.draftId,
+    url: refreshedDraft.externalUrl ?? createDraftUrl(platform, refreshedDraft.draftId, request),
+    issues: refreshedDraft.statusIssues,
   });
 }
 

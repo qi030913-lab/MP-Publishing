@@ -38,6 +38,7 @@ type DraftConnectorHealthPayload = {
   upstreamDrafts?: Array<{
     platform?: PlatformName;
     draftEndpointConfigured?: boolean;
+    statusEndpointConfigured?: boolean;
     status?: "unconfigured" | "configured" | "online" | "offline";
     detail?: string;
   }>;

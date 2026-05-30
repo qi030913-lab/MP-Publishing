@@ -119,6 +119,7 @@ async function waitForApi(api) {
 
 async function startFakeUpstreamDraftService(port, expectedApiKey) {
   const requests = [];
+  const statusRequests = [];
   const baseUrl = `http://127.0.0.1:${port}`;
   const server = createServer((request, response) => {
     void (async () => {
@@ -137,7 +138,7 @@ async function startFakeUpstreamDraftService(port, expectedApiKey) {
         return;
       }
 
-      if (request.method !== "POST" || operation !== "drafts") {
+      if (request.method !== "POST" || !["drafts", "status"].includes(operation)) {
         response.writeHead(404, { "content-type": "application/json" });
         response.end(JSON.stringify({ ok: false, message: "upstream route not found" }));
         return;
@@ -150,6 +151,36 @@ async function startFakeUpstreamDraftService(port, expectedApiKey) {
       }
 
       const payload = await readRequestJson(request);
+      if (operation === "status") {
+        const connectorDraftId = payload.connector?.draftId;
+        const remoteId = payload.remoteId;
+        if (!connectorDraftId || !remoteId || !payload.connector?.draftUrl) {
+          response.writeHead(422, { "content-type": "application/json" });
+          response.end(JSON.stringify({ ok: false, message: "upstream status payload is missing connector metadata" }));
+          return;
+        }
+
+        statusRequests.push({
+          platform,
+          connectorDraftId,
+          connectorDraftUrl: payload.connector.draftUrl,
+          remoteId,
+          accountId: payload.accountId,
+          hasCredential: Boolean(payload.credential),
+        });
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            ok: true,
+            state: "succeeded",
+            remoteId,
+            url: `https://upstream.example.test/${platform}/${remoteId}`,
+            detail: `${platform} upstream draft published.`,
+          }),
+        );
+        return;
+      }
+
       const connectorDraftId = payload.connector?.draftId;
       if (!connectorDraftId || !payload.connector?.statusCallbackUrl || !payload.draft?.title) {
         response.writeHead(422, { "content-type": "application/json" });
@@ -186,6 +217,7 @@ async function startFakeUpstreamDraftService(port, expectedApiKey) {
   return {
     baseUrl,
     requests,
+    statusRequests,
     async close() {
       await new Promise((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
@@ -587,10 +619,13 @@ async function runUpstreamDraftForwardingCheck() {
     DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
     DRAFT_CONNECTOR_UPSTREAM_API_KEY: "upstream-secret",
     DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/zhihu/drafts`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_STATUS_ENDPOINT: `${upstream.baseUrl}/zhihu/status`,
     DRAFT_CONNECTOR_ZHIHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
     DRAFT_CONNECTOR_BILIBILI_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/bilibili/drafts`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_STATUS_ENDPOINT: `${upstream.baseUrl}/bilibili/status`,
     DRAFT_CONNECTOR_BILIBILI_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
     DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/xiaohongshu/drafts`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_STATUS_ENDPOINT: `${upstream.baseUrl}/xiaohongshu/status`,
     DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
   };
 
@@ -604,7 +639,11 @@ async function runUpstreamDraftForwardingCheck() {
       platforms.some(
         (platform) =>
           !upstreamHealth.upstreamDrafts?.some(
-            (item) => item.platform === platform && item.draftEndpointConfigured && item.status === "online",
+            (item) =>
+              item.platform === platform &&
+              item.draftEndpointConfigured &&
+              item.statusEndpointConfigured &&
+              item.status === "online",
           ),
       )
     ) {
@@ -689,6 +728,22 @@ async function runUpstreamDraftForwardingCheck() {
       throw new Error(`Upstream draft sync did not preserve succeeded status: ${JSON.stringify(syncedTask)}`);
     }
 
+    if (upstream.statusRequests.length !== platforms.length) {
+      throw new Error(`Upstream status service did not receive every platform status query: ${JSON.stringify(upstream.statusRequests)}`);
+    }
+
+    for (const statusRequest of upstream.statusRequests) {
+      const detail = await requestAbsoluteJson(statusRequest.connectorDraftUrl);
+      if (
+        detail.state !== "succeeded" ||
+        detail.statusDetail !== `${statusRequest.platform} upstream draft published.` ||
+        detail.payload?.credential ||
+        statusRequest.hasCredential
+      ) {
+        throw new Error(`Upstream status sync did not persist correctly for ${statusRequest.platform}: ${JSON.stringify(detail)}`);
+      }
+    }
+
     return {
       taskId: created.id,
       finalStatus: syncedTask.status,
@@ -702,6 +757,11 @@ async function runUpstreamDraftForwardingCheck() {
         platform: request.platform,
         connectorDraftId: request.connectorDraftId,
         statusCallbackUrl: request.statusCallbackUrl,
+      })),
+      upstreamStatusRequests: upstream.statusRequests.map((request) => ({
+        platform: request.platform,
+        connectorDraftId: request.connectorDraftId,
+        remoteId: request.remoteId,
       })),
     };
   } finally {

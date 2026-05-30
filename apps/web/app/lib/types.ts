@@ -176,6 +176,7 @@ export type RuntimeStatus = {
       draftEndpoint?: string;
       statusEndpoint?: string;
       upstreamDraftEndpointConfigured?: boolean;
+      upstreamStatusEndpointConfigured?: boolean;
       upstreamDraftStatus?: "unconfigured" | "configured" | "online" | "offline";
       upstreamDraftDetail?: string;
       upstreamDraftHealthEndpoint?: string;

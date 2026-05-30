@@ -10,6 +10,7 @@ type DraftConnectorPlatformStatus = {
   draftEndpoint?: string;
   statusEndpoint?: string;
   upstreamDraftEndpointConfigured?: boolean;
+  upstreamStatusEndpointConfigured?: boolean;
   upstreamDraftStatus?: "unconfigured" | "configured" | "online" | "offline";
   upstreamDraftDetail?: string;
   upstreamDraftHealthEndpoint?: string;
@@ -21,6 +22,7 @@ type DraftConnectorHealthPayload = {
   upstreamDrafts?: Array<{
     platform?: PlatformName;
     draftEndpointConfigured?: boolean;
+    statusEndpointConfigured?: boolean;
     healthEndpoint?: string;
     status?: "unconfigured" | "configured" | "online" | "offline";
     detail?: string;
@@ -98,6 +100,7 @@ export class RuntimeService {
         return {
           ...platformStatus,
           upstreamDraftEndpointConfigured: upstreamStatus?.draftEndpointConfigured,
+          upstreamStatusEndpointConfigured: upstreamStatus?.statusEndpointConfigured,
           upstreamDraftStatus: upstreamStatus?.status,
           upstreamDraftDetail: upstreamStatus?.detail,
           upstreamDraftHealthEndpoint: upstreamStatus?.healthEndpoint,
