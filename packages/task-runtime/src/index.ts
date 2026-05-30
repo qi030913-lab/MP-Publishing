@@ -290,7 +290,7 @@ function summarizeTaskStatus(targets: Array<{ status: string }>): PublishTaskSta
 }
 
 function createRedisConnection() {
-  const redisUrl = new URL(process.env.REDIS_URL ?? "redis://127.0.0.1:6379");
+  const redisUrl = new URL(process.env.REDIS_URL ?? "redis://127.0.0.1:6380");
 
   return {
     host: redisUrl.hostname,
