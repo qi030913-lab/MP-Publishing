@@ -1000,8 +1000,14 @@ export async function createDraft({ platform, workOrder, runner, platformSession
     workOrder.credential?.summary?.hasStorageStateJson !== true ||
     workOrder.credential?.summary?.accessToken ||
     runner.source !== "draft-connector-upstream-v1" ||
-    !platformSession?.cookies ||
-    !sessionSummary?.hasCookies
+    platformSession?.accessToken !== "zhihu-forwarded-secret-token" ||
+    platformSession?.cookies !== "SESSION=zhihu-forwarded-secret-cookie" ||
+    !platformSession?.storageStateJson?.includes("zhihu-forwarded-storage-secret") ||
+    sessionSummary?.credentialSource !== "connector-forwarded" ||
+    sessionSummary?.hasAccessToken !== true ||
+    sessionSummary?.hasCookies !== true ||
+    sessionSummary?.hasStorageStateJson !== true ||
+    sessionSummary?.accessToken
   ) {
     throw new Error("handler received an incomplete direct upstream work order");
   }
@@ -1024,7 +1030,6 @@ export async function createDraft({ platform, workOrder, runner, platformSession
     DRAFT_AUTOMATION_SERVICE_API_KEY: apiKey,
     DRAFT_AUTOMATION_SERVICE_HANDLER_MODULE: handlerPath,
     DRAFT_AUTOMATION_ZHIHU_REQUIRE_SESSION: "true",
-    DRAFT_AUTOMATION_ZHIHU_COOKIES: "SESSION=zhihu-automation-cookie",
     DRAFT_AUTOMATION_ZHIHU_CREATOR_BASE_URL: "https://creator.zhihu.example.test",
     DRAFT_AUTOMATION_ZHIHU_CREATOR_DRAFT_URL: "https://creator.zhihu.example.test/drafts/new",
   });
@@ -1086,7 +1091,8 @@ export async function createDraft({ platform, workOrder, runner, platformSession
     const detailJson = JSON.stringify(detail);
 
     if (
-      health.status !== "ok" ||
+      health.status !== "needs_session" ||
+      !health.missingRequiredSessions?.includes("zhihu") ||
       contract.routes?.createDraftFromConnector !== "POST /:platform/drafts" ||
       created.remoteId !== "zhihu-real-zhihu-draft-direct-upstream-check" ||
       created.url !== "https://creator.zhihu.example.test/drafts/zhihu-draft-direct-upstream-check" ||

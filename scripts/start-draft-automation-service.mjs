@@ -43,6 +43,8 @@ Session env:
   DRAFT_AUTOMATION_<PLATFORM>_COOKIES
   DRAFT_AUTOMATION_<PLATFORM>_STORAGE_STATE_JSON
   DRAFT_AUTOMATION_<PLATFORM>_STORAGE_STATE_PATH
+  DRAFT_AUTOMATION_<PLATFORM>_APP_ID
+  DRAFT_AUTOMATION_<PLATFORM>_APP_SECRET
   DRAFT_AUTOMATION_<PLATFORM>_CREATOR_BASE_URL
   DRAFT_AUTOMATION_<PLATFORM>_CREATOR_DRAFT_URL`;
 
@@ -87,6 +89,14 @@ function readOption(args, name, envNames = []) {
   }
 
   return undefined;
+}
+
+function isPlainObject(value) {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function definedString(value) {
+  return typeof value === "string" && value.trim() ? value.trim() : undefined;
 }
 
 function readBoolean(args, name, envNames = []) {
@@ -186,25 +196,97 @@ function readPlatformSession(platform, args) {
     platform,
     required,
     accountLabel: readOption(args, `${platform}-account-label`, [`${envPrefix}_ACCOUNT_LABEL`]),
+    authMode: readOption(args, `${platform}-auth-mode`, [`${envPrefix}_AUTH_MODE`]),
+    credentialRef: readOption(args, `${platform}-credential-ref`, [`${envPrefix}_CREDENTIAL_REF`]),
     creatorBaseUrl: readOption(args, `${platform}-creator-base-url`, [`${envPrefix}_CREATOR_BASE_URL`]),
     creatorDraftUrl: readOption(args, `${platform}-creator-draft-url`, [`${envPrefix}_CREATOR_DRAFT_URL`]),
+    appId: readOption(args, `${platform}-app-id`, [`${envPrefix}_APP_ID`]),
+    appSecret: readOption(args, `${platform}-app-secret`, [`${envPrefix}_APP_SECRET`]),
     accessToken: readOption(args, `${platform}-access-token`, [`${envPrefix}_ACCESS_TOKEN`]),
+    refreshToken: readOption(args, `${platform}-refresh-token`, [`${envPrefix}_REFRESH_TOKEN`]),
     cookies: readOption(args, `${platform}-cookies`, [`${envPrefix}_COOKIES`]),
     storageStateJson: readOption(args, `${platform}-storage-state-json`, [`${envPrefix}_STORAGE_STATE_JSON`]),
     storageStatePath: resolveOptionalPath(
       readOption(args, `${platform}-storage-state-path`, [`${envPrefix}_STORAGE_STATE_PATH`, `${envPrefix}_STORAGE_STATE_FILE`]),
     ),
+    expiresAt: readOption(args, `${platform}-expires-at`, [`${envPrefix}_EXPIRES_AT`]),
+    credentialSource: "configured-env",
+  };
+
+  const ready = hasSessionMaterial(session);
+  return {
+    ...session,
+    credentialSource: ready ? session.credentialSource : undefined,
+    ready,
+  };
+}
+
+function hasSessionMaterial(session) {
+  return Boolean(
+    session?.accessToken ||
+      session?.cookies ||
+      session?.storageStateJson ||
+      session?.storageStatePath ||
+      session?.refreshToken ||
+      (session?.appId && session?.appSecret),
+  );
+}
+
+function credentialSessionFromForwardedCredential(platform, credential) {
+  if (!isPlainObject(credential)) {
+    return undefined;
+  }
+
+  const credentialPlatform = definedString(credential.platform);
+  if (credentialPlatform && credentialPlatform !== platform) {
+    throw new Error(`Forwarded credential platform ${credentialPlatform} does not match ${platform}.`);
+  }
+
+  const session = {
+    platform,
+    accountId: definedString(credential.accountId),
+    accountLabel: definedString(credential.credentialRef) ?? definedString(credential.accountId),
+    authMode: definedString(credential.authMode),
+    credentialRef: definedString(credential.credentialRef),
+    appId: definedString(credential.appId),
+    appSecret: definedString(credential.appSecret),
+    accessToken: definedString(credential.accessToken),
+    refreshToken: definedString(credential.refreshToken),
+    cookies: definedString(credential.cookies),
+    storageStateJson: definedString(credential.storageStateJson),
+    storageStatePath: resolveOptionalPath(definedString(credential.storageStatePath)),
+    expiresAt: definedString(credential.expiresAt),
+    credentialSource: "connector-forwarded",
+  };
+
+  return hasSessionMaterial(session) ? session : undefined;
+}
+
+function createHandlerPlatformSession(platformSession, forwardedCredential) {
+  const forwardedSession = credentialSessionFromForwardedCredential(platformSession.platform, forwardedCredential);
+  if (!forwardedSession) {
+    return platformSession;
+  }
+
+  const merged = {
+    ...platformSession,
+    ...Object.fromEntries(Object.entries(forwardedSession).filter(([, value]) => value !== undefined)),
+    required: platformSession.required,
+    creatorBaseUrl: platformSession.creatorBaseUrl,
+    creatorDraftUrl: platformSession.creatorDraftUrl,
   };
 
   return {
-    ...session,
-    ready: Boolean(session.accessToken || session.cookies || session.storageStateJson || session.storageStatePath),
+    ...merged,
+    ready: hasSessionMaterial(merged),
   };
 }
 
 function summarizePlatformSession(session) {
   const authModes = [
+    session.appId && session.appSecret ? "app-secret" : undefined,
     session.accessToken ? "access-token" : undefined,
+    session.refreshToken ? "refresh-token" : undefined,
     session.cookies ? "cookies" : undefined,
     session.storageStateJson ? "storage-state-json" : undefined,
     session.storageStatePath ? "storage-state-path" : undefined,
@@ -215,10 +297,15 @@ function summarizePlatformSession(session) {
     required: session.required,
     ready: session.ready,
     accountLabel: session.accountLabel,
+    authMode: session.authMode,
+    credentialRef: session.credentialRef,
+    credentialSource: session.credentialSource,
     creatorBaseUrl: session.creatorBaseUrl,
     creatorDraftUrl: session.creatorDraftUrl,
     authModes,
+    hasAppCredentials: Boolean(session.appId && session.appSecret),
     hasAccessToken: Boolean(session.accessToken),
+    hasRefreshToken: Boolean(session.refreshToken),
     hasCookies: Boolean(session.cookies),
     hasStorageStateJson: Boolean(session.storageStateJson),
     hasStorageStatePath: Boolean(session.storageStatePath),
@@ -557,7 +644,7 @@ function createContract({ publicBaseUrl, hasHandler, platformSessions }) {
       },
       handlerInput: {
         platformSession:
-          "Sensitive platform session material for the selected platform. Includes accessToken/cookies/storageStateJson/storageStatePath when configured, and is never persisted by the service.",
+          "Sensitive platform session material for the selected platform. Includes configured env session data plus per-request connector-forwarded credentials when present, and is never persisted by the service.",
         sessionSummary: "Redacted session readiness summary safe for logs and health checks.",
       },
     },
@@ -581,6 +668,7 @@ async function createAutomationDraft({
   platform,
   accountId,
   workOrder,
+  forwardedCredential,
   requestedAt,
   runner,
   outboxDir,
@@ -590,15 +678,30 @@ async function createAutomationDraft({
   urlTemplates,
   platformSessions,
 }) {
-  const platformSession = platformSessions.get(platform);
-  if (platformSession?.required && !platformSession.ready) {
+  const platformSession = platformSessions.get(platform) ?? { platform, required: false, ready: false };
+  let handlerPlatformSession;
+  try {
+    handlerPlatformSession = createHandlerPlatformSession(platformSession, forwardedCredential);
+  } catch (error) {
+    return {
+      statusCode: 422,
+      body: {
+        ok: false,
+        state: "needs_manual_action",
+        message: error instanceof Error ? error.message : String(error),
+      },
+    };
+  }
+
+  const sessionSummary = summarizePlatformSession(handlerPlatformSession);
+  if (handlerPlatformSession.required && !handlerPlatformSession.ready) {
     return {
       statusCode: 428,
       body: {
         ok: false,
         state: "needs_manual_action",
         message: `${platform} automation session is required but not configured.`,
-        sessionSummary: summarizePlatformSession(platformSession),
+        sessionSummary,
       },
     };
   }
@@ -622,8 +725,8 @@ async function createAutomationDraft({
           workOrder,
           requestedAt: requestedAt ?? now,
           runner: runner ?? {},
-          platformSession,
-          sessionSummary: platformSession ? summarizePlatformSession(platformSession) : undefined,
+          platformSession: handlerPlatformSession,
+          sessionSummary,
           context: {
             outboxDir,
             publicBaseUrl,
@@ -751,6 +854,7 @@ async function handleCreateConnectorDraft({
     platform,
     accountId: asString(payload.accountId) ?? workOrder.accountId,
     workOrder,
+    forwardedCredential: payload.credential,
     requestedAt: payload.requestedAt ?? now,
     runner: {
       completedBy: "draft-connector-upstream",
