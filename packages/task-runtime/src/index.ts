@@ -1179,7 +1179,7 @@ export async function markPublishTargetNeedsRetry(targetId: string, message: str
   );
 }
 
-export async function markPublishTargetNeedsManualAction(targetId: string, message: string) {
+export async function markPublishTargetNeedsManualAction(targetId: string, message: string, issues: ValidationIssue[] = []) {
   const target = await prisma.publishTarget.findUnique({
     where: { id: targetId },
     select: { attemptCount: true, platform: true },
@@ -1209,6 +1209,7 @@ export async function markPublishTargetNeedsManualAction(targetId: string, messa
     createEvent("needs_manual_action", "warning", message, target.platform as PlatformName),
     {
       status: "needs_manual_action",
+      issues,
       completedAt: new Date(),
     },
   );

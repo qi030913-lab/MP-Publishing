@@ -163,7 +163,7 @@ async function waitForApi(api) {
   throw new Error(`API health check did not become ready.\n${tail(api.stderrPath)}`);
 }
 
-async function startFakeUpstreamDraftService(port, expectedApiKey) {
+async function startFakeUpstreamDraftService(port, expectedApiKey, options = {}) {
   const requests = [];
   const statusRequests = [];
   const baseUrl = `http://127.0.0.1:${port}`;
@@ -263,6 +263,25 @@ async function startFakeUpstreamDraftService(port, expectedApiKey) {
         hasCredential: Boolean(payload.credential),
         credential: summarizeCredential(payload.credential),
       });
+      if (options.rejectDrafts) {
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            ok: false,
+            state: "needs_manual_action",
+            detail: `${platform} upstream draft requires manual review.`,
+            issues: [
+              {
+                code: `${platform.toUpperCase()}_UPSTREAM_POLICY_REVIEW`,
+                message: `${platform} upstream draft requires creator-center review.`,
+                severity: "warning",
+              },
+            ],
+          }),
+        );
+        return;
+      }
+
       response.writeHead(200, { "content-type": "application/json" });
       response.end(
         JSON.stringify({
@@ -1691,6 +1710,156 @@ async function runUpstreamDraftForwardingCheck() {
   }
 }
 
+async function runUpstreamDraftRejectionManualActionCheck() {
+  if (process.env.E2E_API_BASE_URL) {
+    return { skipped: true };
+  }
+
+  const previousApiBaseUrl = apiBaseUrl;
+  const upstreamPort = await getFreePort();
+  const connectorPort = await getFreePort();
+  const apiPort = await getFreePort();
+  const upstream = await startFakeUpstreamDraftService(upstreamPort, "reject-upstream-secret", { rejectDrafts: true });
+  const connectorBaseUrl = `http://127.0.0.1:${connectorPort}`;
+  const outboxDir = path.join(runtimeDir, `draft-connector-upstream-reject-e2e-${Date.now()}`);
+  const queueName = `mp-publishing-draft-upstream-reject-e2e-${Date.now()}`;
+  const platforms = ["zhihu", "bilibili", "xiaohongshu"];
+  fs.rmSync(outboxDir, { recursive: true, force: true });
+  apiBaseUrl = `http://127.0.0.1:${apiPort}`;
+
+  const connectorEnv = {
+    PORT: String(apiPort),
+    PUBLISH_QUEUE_NAME: queueName,
+    DRAFT_CONNECTOR_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    ZHIHU_REAL_PUBLISH_ENABLED: "true",
+    BILIBILI_REAL_PUBLISH_ENABLED: "true",
+    XIAOHONGSHU_REAL_PUBLISH_ENABLED: "true",
+  };
+  const draftConnectorEnv = {
+    PORT: String(connectorPort),
+    DRAFT_CONNECTOR_API_KEY: "draft-secret",
+    DRAFT_CONNECTOR_OUTBOX_DIR: outboxDir,
+    DRAFT_CONNECTOR_PUBLIC_BASE_URL: connectorBaseUrl,
+    DRAFT_CONNECTOR_UPSTREAM_API_KEY: "reject-upstream-secret",
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/zhihu/drafts`,
+    DRAFT_CONNECTOR_ZHIHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/bilibili/drafts`,
+    DRAFT_CONNECTOR_BILIBILI_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_DRAFT_ENDPOINT: `${upstream.baseUrl}/xiaohongshu/drafts`,
+    DRAFT_CONNECTOR_XIAOHONGSHU_UPSTREAM_HEALTH_ENDPOINT: `${upstream.baseUrl}/health`,
+  };
+
+  const api = startService("api-draft-upstream-reject", ["apps/api/dist/main.js"], connectorEnv);
+  const worker = startService("worker-draft-upstream-reject", ["apps/worker/dist/main.js"], connectorEnv);
+  const draftConnector = startService("draft-connector-upstream-reject", ["apps/draft-connector/dist/main.js"], draftConnectorEnv);
+
+  try {
+    const upstreamHealth = await waitForHealth(draftConnector, `${connectorBaseUrl}/health`, "Draft connector upstream reject");
+    if (
+      platforms.some(
+        (platform) =>
+          !upstreamHealth.upstreamDrafts?.some(
+            (item) => item.platform === platform && item.draftEndpointConfigured && item.status === "online",
+          ),
+      )
+    ) {
+      throw new Error(`Draft connector health did not report rejecting upstream as online: ${JSON.stringify(upstreamHealth)}`);
+    }
+
+    await waitForApi(api);
+    await requestJson("/accounts/acct_bilibili_main/refresh", { method: "POST" });
+
+    const accountsResponse = await requestJson("/accounts");
+    const accounts = accountsResponse.items.filter((account) => platforms.includes(account.platform));
+    if (accounts.length !== platforms.length) {
+      throw new Error(`Missing demo accounts for upstream rejection verification: ${JSON.stringify(accountsResponse.items)}`);
+    }
+
+    const created = await requestJson("/publish/real", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        document: {
+          title: "Upstream rejection manual action e2e",
+          summary: "Verify connector/upstream draft rejection is surfaced as manual action.",
+          body: "This content confirms real draft connector execution issues stay visible on the target instead of becoming a generic failed job.",
+          tags: ["draft", "upstream", "manual-action", "e2e"],
+        },
+        platforms,
+        accountIds: accounts.map((account) => account.id),
+        toneMode: "keep",
+        preserveOriginal: true,
+      }),
+    });
+
+    let task = created;
+    for (let i = 0; i < 50; i += 1) {
+      await delay(600);
+      task = await requestJson(`/publish/tasks/${created.id}`);
+      if (!["running", "queued"].includes(task.status)) {
+        break;
+      }
+    }
+
+    if (
+      task.status !== "needs_manual_action" ||
+      platforms.some((platform) => {
+        const target = task.results.find((item) => item.platform === platform);
+        const issueCodes = target?.issues?.map((issue) => issue.code) ?? [];
+        return (
+          target?.status !== "needs_manual_action" ||
+          !issueCodes.includes(`${platform.toUpperCase()}_DRAFT_CONNECTOR_REJECTED`) ||
+          !issueCodes.includes(`${platform.toUpperCase()}_UPSTREAM_DRAFT_REJECTED`) ||
+          !issueCodes.includes(`${platform.toUpperCase()}_UPSTREAM_POLICY_REVIEW`)
+        );
+      })
+    ) {
+      throw new Error(`Upstream draft rejection was not held for manual action: ${JSON.stringify(task)}`);
+    }
+
+    if (upstream.requests.length !== platforms.length) {
+      throw new Error(`Rejecting upstream did not receive every platform draft: ${JSON.stringify(upstream.requests)}`);
+    }
+
+    for (const request of upstream.requests) {
+      const detail = await requestAbsoluteJson(request.connectorDraftUrl);
+      if (detail.state !== "needs_manual_action" || detail.payload?.credential) {
+        throw new Error(`Rejected upstream outbox detail is incorrect for ${request.platform}: ${JSON.stringify(detail)}`);
+      }
+    }
+
+    const runtimeAfterRejection = await requestJson("/runtime/status");
+    if (
+      runtimeAfterRejection.queue.waiting > 0 ||
+      runtimeAfterRejection.queue.active > 0 ||
+      runtimeAfterRejection.queue.delayed > 0 ||
+      runtimeAfterRejection.queue.failed > 0
+    ) {
+      throw new Error(`Rejected upstream draft left unexpected queue work: ${JSON.stringify(runtimeAfterRejection.queue)}`);
+    }
+
+    return {
+      taskId: created.id,
+      finalStatus: task.status,
+      targets: task.results.map((target) => ({
+        platform: target.platform,
+        status: target.status,
+        issueCodes: target.issues.map((issue) => issue.code),
+      })),
+      upstreamRequests: upstream.requests.map((request) => ({
+        platform: request.platform,
+        connectorDraftId: request.connectorDraftId,
+      })),
+      queue: runtimeAfterRejection.queue,
+    };
+  } finally {
+    await Promise.all([stopService(api), stopService(worker), stopService(draftConnector)]);
+    await upstream.close();
+    apiBaseUrl = previousApiBaseUrl;
+  }
+}
+
 async function runCredentialForwardingCheck() {
   if (process.env.E2E_API_BASE_URL) {
     return { skipped: true };
@@ -1902,6 +2071,7 @@ const explicitLocalEndpointPreflight = await runExplicitLocalDraftEndpointPrefli
 const offlineUpstreamPreflight = await runOfflineUpstreamDraftPreflightCheck();
 const offlineUpstreamRecovery = await runOfflineUpstreamDraftRecoveryCheck();
 const upstreamForwarding = await runUpstreamDraftForwardingCheck();
+const upstreamRejectionManualAction = await runUpstreamDraftRejectionManualActionCheck();
 const credentialForwarding = await runCredentialForwardingCheck();
 
 const api = startService("api", ["apps/api/dist/main.js"], connectorEnv);
@@ -2171,6 +2341,7 @@ try {
     offlineUpstreamPreflight,
     offlineUpstreamRecovery,
     upstreamForwarding,
+    upstreamRejectionManualAction,
     credentialForwarding,
     queue: runtime.queue,
   };

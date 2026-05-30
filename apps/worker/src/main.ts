@@ -18,6 +18,14 @@ function createTimestamp() {
   return new Date().toISOString();
 }
 
+function isDraftConnectorExecutionIssue(issue: { code: string }) {
+  return issue.code.endsWith("_DRAFT_CONNECTOR_REJECTED") || issue.code.endsWith("_DRAFT_CONNECTOR_ERROR");
+}
+
+function shouldHoldRealDraftForManualAction(mode: string, issues: Array<{ code: string }>) {
+  return mode === "real-publish" && issues.some(isDraftConnectorExecutionIssue);
+}
+
 async function markWorkerWorking(taskId?: string) {
   await updateWorkerStatus({
     status: "working",
@@ -102,7 +110,19 @@ async function processPublishTarget(job: Job<PublishQueueJobData>) {
       });
 
       if (!result.ok) {
-        await markPublishTargetFailed(context.targetId, `${context.platform} mock 发布失败。`, result.issues);
+        if (shouldHoldRealDraftForManualAction(context.mode, result.issues)) {
+          await markPublishTargetNeedsManualAction(
+            context.targetId,
+            `${context.platform} 真实草稿连接器需要人工处理后继续。`,
+            result.issues,
+          );
+        } else {
+          await markPublishTargetFailed(
+            context.targetId,
+            context.mode === "real-publish" ? `${context.platform} 真实草稿发布失败。` : `${context.platform} mock 发布失败。`,
+            result.issues,
+          );
+        }
       } else {
         await markPublishTargetSucceeded(context.targetId, {
           remoteId: result.remoteId,
